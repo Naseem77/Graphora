@@ -6,9 +6,9 @@ GraphReview Bot is a GitHub App that builds FalkorDB knowledge graphs for reposi
 
 | Event | Behavior |
 | --- | --- |
-| GitHub App installed | Builds `graph:{owner}:{repo}:main` from the current repo code |
-| Push to main | Updates changed files in the main graph |
-| PR opened or updated | Builds/refreshes `graph:{owner}:{repo}:pr:{number}` and posts a review |
+| GitHub App installed | Queues a main graph build for the installed repository |
+| Push to main | Queues changed-file updates in the main graph |
+| PR opened or updated | Queues PR overlay refresh, computes main-vs-PR diff context, and posts one review per head SHA |
 | PR closed or merged | Deletes the temporary PR graph |
 | `@graphreview` comment | Answers using graph context |
 
@@ -44,6 +44,8 @@ graph:{owner}:{repo}:pr:{number}
 | `Function` | Function or method symbol |
 | `Class` | Class, struct, or type symbol |
 | `Module` | Imported module/package |
+| `DocPage` | Markdown or MDX documentation file |
+| `DocSection` | Heading inside a documentation file |
 
 **Important properties**
 
@@ -64,6 +66,19 @@ signature_hash
 ```
 
 These properties allow main-vs-PR comparison by stable symbol identity and hashes, not only by line number.
+
+**Relationship types**
+
+| Relationship | Purpose |
+| --- | --- |
+| `DEFINED_IN` | Connects symbols to their source file |
+| `IMPORTS` | Connects source files to imported modules |
+| `CALLS` | Connects caller functions to callee functions when both are present |
+| `DEPENDS_ON` | Connects source files to imported modules for dependency traversal |
+| `DOCUMENTS` | Connects documentation pages to their backing file |
+| `HAS_SECTION` | Connects documentation pages to heading sections |
+
+GraphReview stores operational state in FalkorDB under the dedicated `graph:graphreview:state` graph. This keeps webhook delivery idempotency, graph build status, and PR review idempotency in the same backend as the knowledge graph while keeping it separate from repository graphs.
 
 ## Requirements
 
