@@ -1,6 +1,7 @@
+import asyncio
+
 from app.config import Settings
 from app.graph.sdk import HashEmbedder, create_source, get_kg, graph_name
-
 
 def test_graph_name_and_source():
     assert graph_name("octo", "repo") == "graph:octo:repo:main"
@@ -13,6 +14,13 @@ def test_hash_embedder_dimension_is_stable():
 
     assert len(embedder.embed_query("hello")) == 256
     assert embedder.embed_query("hello") == embedder.embed_query("hello")
+
+
+def test_hash_embedder_async_methods():
+    embedder = HashEmbedder()
+
+    assert asyncio.run(embedder.aembed_query("hello")) == embedder.embed_query("hello")
+    assert asyncio.run(embedder.aembed_documents(["hello"])) == [embedder.embed_query("hello")]
 
 
 def test_get_kg_instantiates_sdk_client(tmp_path):

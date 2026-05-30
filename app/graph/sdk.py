@@ -61,6 +61,12 @@ class HashEmbedder:
     def embed_documents(self, texts: list[str], **kwargs: object) -> list[list[float]]:
         return [self.embed_query(text, **kwargs) for text in texts]
 
+    async def aembed_query(self, text: str, **kwargs: object) -> list[float]:
+        return self.embed_query(text, **kwargs)
+
+    async def aembed_documents(self, texts: list[str], **kwargs: object) -> list[list[float]]:
+        return self.embed_documents(texts, **kwargs)
+
 
 def graph_name(owner: str, repo: str, suffix: str = "main") -> str:
     return f"graph:{owner}:{repo}:{suffix}"
