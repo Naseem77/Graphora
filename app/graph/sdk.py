@@ -42,7 +42,7 @@ class SDKGraphClient:
         for index, source in enumerate(sources):
             text = _source_text(source)
             document_id = _document_id(text, index)
-            self._rag.ingest_sync(source=document_id, text=text, document_id=document_id)
+            self._rag.ingest_sync(text=text, document_id=document_id)
 
     def chat_session(self) -> SDKChatSession:
         return SDKChatSession(self._rag)

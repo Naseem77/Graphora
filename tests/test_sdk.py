@@ -38,3 +38,17 @@ def test_get_kg_instantiates_sdk_client(tmp_path):
     kg = get_kg("octo", "repo", settings=settings)
 
     assert kg.__class__.__name__ == "SDKGraphClient"
+
+
+def test_sdk_graph_client_ingests_raw_text_only():
+    from app.graph.sdk import SDKGraphClient
+
+    calls = []
+
+    class FakeRag:
+        def ingest_sync(self, **kwargs):
+            calls.append(kwargs)
+
+    SDKGraphClient(FakeRag()).process_sources([create_source("hello")])
+
+    assert calls == [{"text": "hello", "document_id": "hello:2cf24dba5fb0a30e"}]
