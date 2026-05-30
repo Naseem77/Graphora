@@ -156,12 +156,28 @@ def _pull_request_changed_files(repo_obj: object, pr: object) -> list[dict[str, 
         try:
             content_file = repo_obj.get_contents(file.filename, ref=head_sha)
         except GithubException as exc:
-            logger.info("Skipping unavailable PR file %s at %s: %s", file.filename, head_sha, exc)
-            continue
-        changed_files.append(
-            {
-                "path": content_file.path,
-                "content": content_file.decoded_content.decode("utf-8", errors="replace"),
-            }
-        )
+            patch_content = _content_from_patch(getattr(file, "patch", None))
+            if not patch_content:
+                logger.info("Skipping unavailable PR file %s at %s: %s", file.filename, head_sha, exc)
+                continue
+            logger.info("Using PR patch fallback for %s at %s after content fetch failed: %s", file.filename, head_sha, exc)
+            changed_files.append({"path": file.filename, "content": patch_content})
+        else:
+            changed_files.append(
+                {
+                    "path": content_file.path,
+                    "content": content_file.decoded_content.decode("utf-8", errors="replace"),
+                }
+            )
     return changed_files
+
+
+def _content_from_patch(patch: str | None) -> str:
+    if not patch:
+        return ""
+    added_lines = []
+    for line in patch.splitlines():
+        if line.startswith("+++") or not line.startswith("+"):
+            continue
+        added_lines.append(line[1:])
+    return "\n".join(added_lines)
