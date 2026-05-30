@@ -14,10 +14,12 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      GITHUB_PRIVATE_KEY_PATH: /app/private-key.pem
     depends_on:
       - falkordb
     volumes:
-      - ./private-key.pem:/app/private-key.pem:ro
+      - ${GITHUB_PRIVATE_KEY_PATH:-./private-key.pem}:/app/private-key.pem:ro
       - falkordb_data:/data:ro
 
 volumes:
