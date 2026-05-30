@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 
 from app.config import Settings, get_settings
@@ -10,7 +11,11 @@ from app.graph.sdk import get_kg
 
 async def answer_comment(payload: dict, settings: Settings | None = None) -> str | None:
     settings = settings or get_settings()
-    body = payload.get("comment", {}).get("body", "")
+    comment = payload.get("comment", {})
+    if comment.get("user", {}).get("type") == "Bot":
+        return None
+
+    body = comment.get("body", "")
     mention = f"@{settings.bot_login}"
     if mention.lower() not in body.lower():
         return None
@@ -25,7 +30,14 @@ async def answer_comment(payload: dict, settings: Settings | None = None) -> str
     issue_number = payload["issue"]["number"]
     installation_id = payload["installation"]["id"]
 
-    answer = str(get_kg(owner, repo).chat_session().ask(question))
-    github_client = get_github_client(installation_id, settings)
-    post_issue_comment(github_client, owner, repo, issue_number, f"**@{settings.bot_login}** {answer}")
+    answer = await asyncio.to_thread(lambda: str(get_kg(owner, repo).chat_session().ask(question)))
+    github_client = await asyncio.to_thread(get_github_client, installation_id, settings)
+    await asyncio.to_thread(
+        post_issue_comment,
+        github_client,
+        owner,
+        repo,
+        issue_number,
+        f"**@{settings.bot_login}** {answer}",
+    )
     return answer
