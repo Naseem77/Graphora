@@ -1,0 +1,24 @@
+import hashlib
+import hmac
+
+from app.config import get_settings
+from app.github import webhooks
+
+
+def test_verify_signature(monkeypatch):
+    get_settings.cache_clear()
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret")
+    body = b'{"ok":true}'
+    signature = "sha256=" + hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+
+    assert webhooks.verify_signature(body, signature)
+    assert not webhooks.verify_signature(body, "sha256=bad")
+
+
+def test_changed_paths_are_unique():
+    commits = [
+        {"added": ["a.py"], "modified": ["b.py"]},
+        {"added": ["a.py"], "modified": ["c.py"]},
+    ]
+
+    assert webhooks._changed_paths_from_commits(commits) == ["a.py", "b.py", "c.py"]
