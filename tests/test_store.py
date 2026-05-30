@@ -13,7 +13,7 @@ class FakeGraph:
 def test_write_code_graph_creates_files_symbols_and_imports(monkeypatch, tmp_path):
     fake_graph = FakeGraph()
     monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": fake_graph)
-    parsed = parse_code_file("app/example.py", "import os\nclass User:\n    pass\ndef login():\n    pass\n")
+    parsed = parse_code_file("app/example.py", "import os\nclass User:\n    pass\ndef helper():\n    pass\ndef login():\n    return helper()\n")
 
     count = store.write_code_graph("octo", "repo", [parsed])
 
@@ -23,6 +23,8 @@ def test_write_code_graph_creates_files_symbols_and_imports(monkeypatch, tmp_pat
     assert "MERGE (module:Module" in queries
     assert "MERGE (symbol:Class" in queries
     assert "MERGE (symbol:Function" in queries
+    assert "CALLS" in queries
+    assert "DEPENDS_ON" in queries
     assert "content_hash" in queries
     assert "signature_hash" in queries
     assert "stable_key" in queries
@@ -30,11 +32,39 @@ def test_write_code_graph_creates_files_symbols_and_imports(monkeypatch, tmp_pat
     file_params = next(params for query, params in fake_graph.queries if "MERGE (file:File" in query)
     assert file_params["id"] == "octo/repo:file:app/example.py"
     assert file_params["graph_scope"] == "main"
-    assert file_params["symbol_count"] == 2
+    assert file_params["symbol_count"] == 3
 
-    symbol_params = next(params for query, params in fake_graph.queries if "MERGE (symbol:Function" in query)
+    symbol_params = next(
+        params
+        for query, params in fake_graph.queries
+        if "MERGE (symbol:Function" in query and params["name"] == "login"
+    )
     assert symbol_params["id"] == "octo/repo:symbol:app/example.py:Function:login"
     assert symbol_params["stable_key"] == "app/example.py:Function:login"
+
+
+def test_write_code_graph_creates_doc_nodes(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": fake_graph)
+    parsed = parse_code_file("README.md", "# Title\n\n## Usage\n")
+
+    store.write_code_graph("octo", "repo", [parsed])
+
+    queries = "\n".join(query for query, _ in fake_graph.queries)
+    assert "MERGE (doc:DocPage" in queries
+    assert "MERGE (section:DocSection" in queries
+
+
+def test_delete_file_subgraph_removes_file_symbols_and_doc_sections(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": fake_graph)
+
+    store.delete_file_subgraph("octo", "repo", "app/example.py")
+
+    assert any("DETACH DELETE symbol" in query for query, _ in fake_graph.queries)
+    assert any("DETACH DELETE section" in query for query, _ in fake_graph.queries)
+    assert any("MATCH (file:File" in query for query, _ in fake_graph.queries)
+    assert any("MATCH (doc:DocPage" in query for query, _ in fake_graph.queries)
 
 
 def test_select_graph_uses_suffix(monkeypatch, tmp_path):

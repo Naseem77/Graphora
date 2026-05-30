@@ -8,7 +8,8 @@ if TYPE_CHECKING:
 
 from app.graph.sdk import create_source, get_kg
 from app.graph.store import clear_code_graph, write_code_graph
-from app.parser.treesitter import is_supported_code_file, parse_code_file
+from app.state import mark_graph_build
+from app.parser.treesitter import is_supported_source_file, parse_code_file
 
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ def build_repo_graph(owner: str, repo: str, files: list[RepoFile]) -> int:
     parsed_files = [
         parse_code_file(file["path"], file["content"])
         for file in files
-        if is_supported_code_file(file["path"])
+        if is_supported_source_file(file["path"])
     ]
     if not parsed_files:
         logger.info("No supported code files found for %s/%s", owner, repo)
@@ -36,6 +37,7 @@ def build_repo_graph(owner: str, repo: str, files: list[RepoFile]) -> int:
         for parsed_file in parsed_files
     ]
     kg.process_sources(sources)
+    mark_graph_build(owner, repo, "main", "built", len(sources))
     logger.info("Built graph for %s/%s with %s source files", owner, repo, len(sources))
     return len(sources)
 
@@ -50,7 +52,7 @@ def fetch_repository_files(github_client: "Github", owner: str, repo: str, ref: 
         if item.type == "dir":
             queue.extend(repo_obj.get_contents(item.path, ref=ref))
             continue
-        if not is_supported_code_file(item.path):
+        if not is_supported_source_file(item.path):
             continue
         content = item.decoded_content.decode("utf-8", errors="replace")
         files.append({"path": item.path, "content": content})

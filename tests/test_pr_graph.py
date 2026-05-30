@@ -20,6 +20,7 @@ def test_build_pr_graph_uses_pr_suffix(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(pr_graph, "get_kg", lambda owner, repo, suffix, settings: fake)
     monkeypatch.setattr(pr_graph, "create_source", lambda text: text)
+    monkeypatch.setattr(pr_graph, "mark_graph_build", lambda owner, repo, graph_scope, status, source_count, settings: None)
 
     count = pr_graph.build_pr_graph(
         "octo",

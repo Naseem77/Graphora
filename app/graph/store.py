@@ -59,6 +59,13 @@ def write_code_graph(
                     "graph_scope": suffix,
                 },
             )
+            graph.query(
+                """
+                MATCH (file:File {path: $path})-[:IMPORTS]->(module:Module {id: $id})
+                MERGE (file)-[:DEPENDS_ON]->(module)
+                """,
+                {"path": parsed_file.path, "id": _module_id(owner, repo, import_name)},
+            )
         for symbol in parsed_file.symbols:
             label = _symbol_label(symbol.kind)
             stable_id = _symbol_id(owner, repo, parsed_file.path, symbol.kind, symbol.name)
@@ -93,6 +100,67 @@ def write_code_graph(
                     "stable_key": f"{parsed_file.path}:{symbol.kind}:{symbol.name}",
                 },
             )
+        for call in parsed_file.calls:
+            graph.query(
+                """
+                MATCH (caller:Function {stable_key: $caller_key})
+                MATCH (callee:Function {path: $path, name: $callee})
+                MERGE (caller)-[:CALLS {line: $line}]->(callee)
+                MERGE (caller)-[:DEPENDS_ON]->(callee)
+                """,
+                {
+                    "caller_key": f"{parsed_file.path}:Function:{call.caller}",
+                    "path": parsed_file.path,
+                    "callee": call.callee,
+                    "line": call.line,
+                },
+            )
+        if parsed_file.language == "markdown":
+            doc_id = _doc_id(owner, repo, parsed_file.path)
+            graph.query(
+                """
+                MATCH (file:File {path: $path})
+                MERGE (doc:DocPage {id: $id})
+                SET doc.owner = $owner,
+                    doc.repo = $repo,
+                    doc.graph_scope = $graph_scope,
+                    doc.path = $path,
+                    doc.title = $title,
+                    doc.content_hash = $content_hash
+                MERGE (doc)-[:DOCUMENTS]->(file)
+                """,
+                {
+                    "id": doc_id,
+                    "owner": owner,
+                    "repo": repo,
+                    "graph_scope": suffix,
+                    "path": parsed_file.path,
+                    "title": parsed_file.doc_sections[0].title if parsed_file.doc_sections else parsed_file.path,
+                    "content_hash": file_hash,
+                },
+            )
+            for section in parsed_file.doc_sections:
+                graph.query(
+                    """
+                    MATCH (doc:DocPage {id: $doc_id})
+                    MERGE (section:DocSection {id: $id})
+                    SET section.title = $title,
+                        section.level = $level,
+                        section.line = $line,
+                        section.stable_key = $stable_key,
+                        section.graph_scope = $graph_scope
+                    MERGE (doc)-[:HAS_SECTION]->(section)
+                    """,
+                    {
+                        "doc_id": doc_id,
+                        "id": _doc_section_id(owner, repo, section.stable_key),
+                        "title": section.title,
+                        "level": section.level,
+                        "line": section.line,
+                        "stable_key": section.stable_key,
+                        "graph_scope": suffix,
+                    },
+                )
     return len(parsed_files)
 
 
@@ -104,7 +172,7 @@ def clear_code_graph(
 ) -> None:
     settings = settings or get_settings()
     graph = _select_graph(owner, repo, settings, suffix)
-    for label in ("Function", "Class", "File", "Module"):
+    for label in ("Function", "Class", "File", "Module", "DocPage", "DocSection"):
         graph.query(f"MATCH (n:{label}) DETACH DELETE n")
 
 
@@ -134,7 +202,15 @@ def delete_file_subgraph(
         """,
         {"path": path},
     )
+    graph.query(
+        """
+        MATCH (doc:DocPage {path: $path})-[:HAS_SECTION]->(section:DocSection)
+        DETACH DELETE section
+        """,
+        {"path": path},
+    )
     graph.query("MATCH (file:File {path: $path}) DETACH DELETE file", {"path": path})
+    graph.query("MATCH (doc:DocPage {path: $path}) DETACH DELETE doc", {"path": path})
 
 
 def _select_graph(owner: str, repo: str, settings: Settings, suffix: str = "main"):
@@ -163,6 +239,14 @@ def _module_id(owner: str, repo: str, name: str) -> str:
 
 def _symbol_id(owner: str, repo: str, path: str, kind: str, name: str) -> str:
     return f"{owner}/{repo}:symbol:{path}:{kind}:{name}"
+
+
+def _doc_id(owner: str, repo: str, path: str) -> str:
+    return f"{owner}/{repo}:doc:{path}"
+
+
+def _doc_section_id(owner: str, repo: str, stable_key: str) -> str:
+    return f"{owner}/{repo}:doc-section:{stable_key}"
 
 
 def _hash_text(text: str) -> str:

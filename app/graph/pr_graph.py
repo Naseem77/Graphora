@@ -5,7 +5,8 @@ import logging
 from app.config import Settings, get_settings
 from app.graph.sdk import create_source, get_kg
 from app.graph.store import clear_code_graph, delete_code_graph, write_code_graph
-from app.parser.treesitter import is_supported_code_file, parse_code_file
+from app.parser.treesitter import is_supported_source_file, parse_code_file
+from app.state import mark_graph_build
 
 
 logger = logging.getLogger(__name__)
@@ -27,17 +28,19 @@ def build_pr_graph(
     parsed_files = [
         parse_code_file(file["path"], file["content"])
         for file in changed_files
-        if file.get("content") is not None and is_supported_code_file(file["path"])
+        if file.get("content") is not None and is_supported_source_file(file["path"])
     ]
 
     clear_code_graph(owner, repo, settings, suffix)
     if not parsed_files:
         logger.info("No supported PR files found for %s/%s PR #%s", owner, repo, pr_number)
+        mark_graph_build(owner, repo, suffix, "empty", 0, settings)
         return 0
 
     write_code_graph(owner, repo, parsed_files, settings, suffix)
     kg = get_kg(owner, repo, suffix=suffix, settings=settings)
     kg.process_sources([create_source(parsed_file.source_text) for parsed_file in parsed_files])
+    mark_graph_build(owner, repo, suffix, "built", len(parsed_files), settings)
     logger.info("Built PR graph for %s/%s PR #%s with %s files", owner, repo, pr_number, len(parsed_files))
     return len(parsed_files)
 
