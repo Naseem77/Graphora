@@ -34,3 +34,16 @@ def test_pull_request_diff_collects_patches():
             return [File()]
 
     assert webhooks._pull_request_diff(PR()) == "diff --git a/app.py b/app.py\n+print('hi')"
+
+
+def test_content_from_patch_returns_added_lines_only():
+    patch = """@@ -0,0 +1,3 @@
++++ b/app.py
++import os
++def hello():
++    return os.getcwd()
+-removed
+ context
+"""
+
+    assert webhooks._content_from_patch(patch) == "import os\ndef hello():\n    return os.getcwd()"
