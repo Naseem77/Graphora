@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from app.config import Settings, get_settings
 from app.graph.sdk import graph_name
 from app.parser.treesitter import ParsedFile
@@ -16,37 +18,79 @@ def write_code_graph(
     graph = _select_graph(owner, repo, settings, suffix)
     for parsed_file in parsed_files:
         delete_file_subgraph(owner, repo, parsed_file.path, settings, suffix)
+        file_hash = _hash_text(parsed_file.source_text)
         graph.query(
-            "MERGE (file:File {path: $path}) SET file.language = $language",
-            {"path": parsed_file.path, "language": parsed_file.language},
+            """
+            MERGE (file:File {id: $id})
+            SET file.owner = $owner,
+                file.repo = $repo,
+                file.graph_scope = $graph_scope,
+                file.path = $path,
+                file.language = $language,
+                file.content_hash = $content_hash,
+                file.line_count = $line_count,
+                file.symbol_count = $symbol_count
+            """,
+            {
+                "id": _file_id(owner, repo, parsed_file.path),
+                "owner": owner,
+                "repo": repo,
+                "graph_scope": suffix,
+                "path": parsed_file.path,
+                "language": parsed_file.language,
+                "content_hash": file_hash,
+                "line_count": len(parsed_file.source_text.splitlines()),
+                "symbol_count": len(parsed_file.symbols),
+            },
         )
         for import_name in parsed_file.imports:
             graph.query(
                 """
                 MATCH (file:File {path: $path})
-                MERGE (module:Module {name: $name})
+                MERGE (module:Module {id: $id})
+                SET module.name = $name,
+                    module.graph_scope = $graph_scope
                 MERGE (file)-[:IMPORTS]->(module)
                 """,
-                {"path": parsed_file.path, "name": import_name},
+                {
+                    "path": parsed_file.path,
+                    "id": _module_id(owner, repo, import_name),
+                    "name": import_name,
+                    "graph_scope": suffix,
+                },
             )
         for symbol in parsed_file.symbols:
             label = _symbol_label(symbol.kind)
+            stable_id = _symbol_id(owner, repo, parsed_file.path, symbol.kind, symbol.name)
+            signature_hash = _hash_text(symbol.signature)
             graph.query(
                 f"""
                 MATCH (file:File {{path: $path}})
                 MERGE (symbol:{label} {{id: $id}})
-                SET symbol.name = $name,
+                SET symbol.owner = $owner,
+                    symbol.repo = $repo,
+                    symbol.graph_scope = $graph_scope,
+                    symbol.kind = $kind,
+                    symbol.name = $name,
                     symbol.path = $path,
                     symbol.line = $line,
-                    symbol.signature = $signature
+                    symbol.signature = $signature,
+                    symbol.signature_hash = $signature_hash,
+                    symbol.stable_key = $stable_key
                 MERGE (symbol)-[:DEFINED_IN]->(file)
                 """,
                 {
-                    "id": f"{parsed_file.path}:{symbol.kind}:{symbol.name}:{symbol.line}",
+                    "id": stable_id,
+                    "owner": owner,
+                    "repo": repo,
+                    "graph_scope": suffix,
+                    "kind": symbol.kind,
                     "name": symbol.name,
                     "path": parsed_file.path,
                     "line": symbol.line,
                     "signature": symbol.signature,
+                    "signature_hash": signature_hash,
+                    "stable_key": f"{parsed_file.path}:{symbol.kind}:{symbol.name}",
                 },
             )
     return len(parsed_files)
@@ -107,3 +151,19 @@ def _symbol_label(kind: str) -> str:
     if kind not in {"Function", "Class"}:
         raise ValueError(f"Unsupported symbol kind: {kind}")
     return kind
+
+
+def _file_id(owner: str, repo: str, path: str) -> str:
+    return f"{owner}/{repo}:file:{path}"
+
+
+def _module_id(owner: str, repo: str, name: str) -> str:
+    return f"{owner}/{repo}:module:{name}"
+
+
+def _symbol_id(owner: str, repo: str, path: str, kind: str, name: str) -> str:
+    return f"{owner}/{repo}:symbol:{path}:{kind}:{name}"
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

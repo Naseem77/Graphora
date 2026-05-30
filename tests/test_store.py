@@ -23,6 +23,18 @@ def test_write_code_graph_creates_files_symbols_and_imports(monkeypatch, tmp_pat
     assert "MERGE (module:Module" in queries
     assert "MERGE (symbol:Class" in queries
     assert "MERGE (symbol:Function" in queries
+    assert "content_hash" in queries
+    assert "signature_hash" in queries
+    assert "stable_key" in queries
+
+    file_params = next(params for query, params in fake_graph.queries if "MERGE (file:File" in query)
+    assert file_params["id"] == "octo/repo:file:app/example.py"
+    assert file_params["graph_scope"] == "main"
+    assert file_params["symbol_count"] == 2
+
+    symbol_params = next(params for query, params in fake_graph.queries if "MERGE (symbol:Function" in query)
+    assert symbol_params["id"] == "octo/repo:symbol:app/example.py:Function:login"
+    assert symbol_params["stable_key"] == "app/example.py:Function:login"
 
 
 def test_select_graph_uses_suffix(monkeypatch, tmp_path):
