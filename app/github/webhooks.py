@@ -6,6 +6,8 @@ import hmac
 import logging
 from typing import Awaitable, Callable
 
+from fastapi import BackgroundTasks
+
 from app.config import get_settings
 from app.github.app import get_github_client
 from app.graph.builder import build_repo_graph, fetch_repository_files
@@ -13,6 +15,7 @@ from app.graph.pr_graph import build_pr_graph, delete_pr_graph
 from app.graph.updater import update_graph_for_push
 from app.review.chat import answer_comment
 from app.review.reviewer import review_and_post_pr
+from app.state import mark_delivery, mark_review_posted, review_already_processed
 
 
 logger = logging.getLogger(__name__)
@@ -24,14 +27,19 @@ def verify_signature(body: bytes, signature_header: str | None) -> bool:
     secret = get_settings().github_webhook_secret
     if not secret:
         raise RuntimeError("GITHUB_WEBHOOK_SECRET is required to verify webhooks")
-    if not signature_header:
+    if not signature_header or not signature_header.startswith("sha256="):
         return False
 
     expected = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature_header)
 
 
-async def dispatch_webhook(event: str, payload: dict) -> None:
+async def dispatch_webhook(
+    event: str,
+    payload: dict,
+    background_tasks: BackgroundTasks | None = None,
+    delivery_id: str | None = None,
+) -> None:
     handlers: dict[str, WebhookHandler] = {
         "installation": handle_install,
         "push": handle_push,
@@ -42,7 +50,21 @@ async def dispatch_webhook(event: str, payload: dict) -> None:
     if handler is None:
         logger.info("Ignoring unsupported GitHub event: %s", event)
         return
+
+    if delivery_id and not mark_delivery(event, delivery_id):
+        logger.info("Ignoring duplicate GitHub delivery for event=%s delivery_id=%s", event, delivery_id)
+        return
+
+    logger.info("Accepted GitHub event=%s repo=%s", event, _repository_name(payload))
+    if background_tasks is not None:
+        background_tasks.add_task(_run_handler_sync, handler, payload)
+        return
+
     await handler(payload)
+
+
+def _run_handler_sync(handler: WebhookHandler, payload: dict) -> None:
+    asyncio.run(handler(payload))
 
 
 async def handle_install(payload: dict) -> None:
@@ -107,6 +129,11 @@ async def handle_pr(payload: dict) -> None:
     owner = repository["owner"]["login"]
     repo = repository["name"]
     pr_number = payload["pull_request"]["number"]
+    head_sha = payload["pull_request"]["head"]["sha"]
+
+    if review_already_processed(owner, repo, pr_number, head_sha):
+        logger.info("Skipping duplicate review for %s/%s PR #%s at %s", owner, repo, pr_number, head_sha)
+        return
 
     github_client = get_github_client(installation_id)
     repo_obj = github_client.get_repo(f"{owner}/{repo}")
@@ -115,6 +142,7 @@ async def handle_pr(payload: dict) -> None:
     await asyncio.to_thread(build_pr_graph, owner, repo, pr_number, changed_files)
     diff = _pull_request_diff(pr)
     await review_and_post_pr(github_client, owner, repo, pr_number, diff)
+    mark_review_posted(owner, repo, pr_number, head_sha)
 
 
 async def handle_comment(payload: dict) -> None:
@@ -182,3 +210,15 @@ def _content_from_patch(patch: str | None) -> str:
             continue
         added_lines.append(line[1:])
     return "\n".join(added_lines)
+
+
+def _repository_name(payload: dict) -> str:
+    repository = payload.get("repository") or {}
+    full_name = repository.get("full_name")
+    if full_name:
+        return str(full_name)
+    owner = repository.get("owner", {}).get("login")
+    name = repository.get("name")
+    if owner and name:
+        return f"{owner}/{name}"
+    return "unknown"

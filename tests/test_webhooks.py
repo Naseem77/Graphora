@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import asyncio
 
 from app.config import get_settings
 from app.github import webhooks
@@ -47,3 +48,38 @@ def test_content_from_patch_returns_added_lines_only():
 """
 
     assert webhooks._content_from_patch(patch) == "import os\ndef hello():\n    return os.getcwd()"
+
+
+def test_dispatch_skips_duplicate_delivery(monkeypatch):
+    called = False
+
+    async def handler(payload):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(webhooks, "handle_push", handler)
+    monkeypatch.setattr(webhooks, "mark_delivery", lambda event, delivery_id: False)
+
+    asyncio.run(webhooks.dispatch_webhook("push", {}, delivery_id="d1"))
+
+    assert not called
+
+
+def test_dispatch_queues_background_task(monkeypatch):
+    class Tasks:
+        def __init__(self):
+            self.tasks = []
+
+        def add_task(self, func, *args):
+            self.tasks.append((func, args))
+
+    async def handler(payload):
+        return None
+
+    tasks = Tasks()
+    monkeypatch.setattr(webhooks, "handle_push", handler)
+    monkeypatch.setattr(webhooks, "mark_delivery", lambda event, delivery_id: True)
+
+    asyncio.run(webhooks.dispatch_webhook("push", {"repository": {"full_name": "o/r"}}, tasks, "d1"))
+
+    assert len(tasks.tasks) == 1
