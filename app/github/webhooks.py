@@ -8,6 +8,7 @@ from typing import Awaitable, Callable
 from app.config import get_settings
 from app.github.app import get_github_client
 from app.graph.builder import build_repo_graph, fetch_repository_files
+from app.graph.pr_graph import build_pr_graph, delete_pr_graph
 from app.graph.updater import update_graph_for_push
 from app.review.chat import answer_comment
 from app.review.reviewer import review_and_post_pr
@@ -88,7 +89,16 @@ async def handle_push(payload: dict) -> None:
 
 
 async def handle_pr(payload: dict) -> None:
-    if payload.get("action") not in {"opened", "synchronize", "reopened", "ready_for_review"}:
+    action = payload.get("action")
+    if action == "closed":
+        repository = payload["repository"]
+        owner = repository["owner"]["login"]
+        repo = repository["name"]
+        pr_number = payload["pull_request"]["number"]
+        delete_pr_graph(owner, repo, pr_number)
+        return
+
+    if action not in {"opened", "synchronize", "reopened", "ready_for_review"}:
         return
 
     installation_id = payload["installation"]["id"]
@@ -100,6 +110,8 @@ async def handle_pr(payload: dict) -> None:
     github_client = get_github_client(installation_id)
     repo_obj = github_client.get_repo(f"{owner}/{repo}")
     pr = repo_obj.get_pull(pr_number)
+    changed_files = _pull_request_changed_files(repo_obj, pr)
+    build_pr_graph(owner, repo, pr_number, changed_files)
     diff = _pull_request_diff(pr)
     await review_and_post_pr(github_client, owner, repo, pr_number, diff)
 
@@ -131,3 +143,25 @@ def _pull_request_diff(pr: object) -> str:
         if patch:
             parts.append(f"diff --git a/{file.filename} b/{file.filename}\n{patch}")
     return "\n\n".join(parts)
+
+
+def _pull_request_changed_files(repo_obj: object, pr: object) -> list[dict[str, str]]:
+    from github.GithubException import GithubException
+
+    changed_files: list[dict[str, str]] = []
+    head_sha = pr.head.sha
+    for file in pr.get_files():
+        if getattr(file, "status", "") == "removed":
+            continue
+        try:
+            content_file = repo_obj.get_contents(file.filename, ref=head_sha)
+        except GithubException as exc:
+            logger.info("Skipping unavailable PR file %s at %s: %s", file.filename, head_sha, exc)
+            continue
+        changed_files.append(
+            {
+                "path": content_file.path,
+                "content": content_file.decoded_content.decode("utf-8", errors="replace"),
+            }
+        )
+    return changed_files
