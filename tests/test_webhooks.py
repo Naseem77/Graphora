@@ -22,3 +22,15 @@ def test_changed_paths_are_unique():
     ]
 
     assert webhooks._changed_paths_from_commits(commits) == ["a.py", "b.py", "c.py"]
+
+
+def test_pull_request_diff_collects_patches():
+    class File:
+        filename = "app.py"
+        patch = "+print('hi')"
+
+    class PR:
+        def get_files(self):
+            return [File()]
+
+    assert webhooks._pull_request_diff(PR()) == "diff --git a/app.py b/app.py\n+print('hi')"

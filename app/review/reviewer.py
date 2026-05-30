@@ -15,7 +15,7 @@ REVIEW_HEADER = "## GraphReview Analysis"
 
 async def review_pr(owner: str, repo: str, pr_number: int, diff: str, settings: Settings | None = None) -> str:
     settings = settings or get_settings()
-    context = await asyncio.to_thread(build_pr_context, owner, repo, diff)
+    context = await asyncio.to_thread(build_pr_context, owner, repo, diff, pr_number)
     return await asyncio.to_thread(_ask_llm_for_review, diff, context, settings)
 
 

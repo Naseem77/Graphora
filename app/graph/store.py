@@ -10,11 +10,12 @@ def write_code_graph(
     repo: str,
     parsed_files: list[ParsedFile],
     settings: Settings | None = None,
+    suffix: str = "main",
 ) -> int:
     settings = settings or get_settings()
-    graph = _select_graph(owner, repo, settings)
+    graph = _select_graph(owner, repo, settings, suffix)
     for parsed_file in parsed_files:
-        delete_file_subgraph(owner, repo, parsed_file.path, settings)
+        delete_file_subgraph(owner, repo, parsed_file.path, settings, suffix)
         graph.query(
             "MERGE (file:File {path: $path}) SET file.language = $language",
             {"path": parsed_file.path, "language": parsed_file.language},
@@ -51,16 +52,37 @@ def write_code_graph(
     return len(parsed_files)
 
 
-def clear_code_graph(owner: str, repo: str, settings: Settings | None = None) -> None:
+def clear_code_graph(
+    owner: str,
+    repo: str,
+    settings: Settings | None = None,
+    suffix: str = "main",
+) -> None:
     settings = settings or get_settings()
-    graph = _select_graph(owner, repo, settings)
+    graph = _select_graph(owner, repo, settings, suffix)
     for label in ("Function", "Class", "File", "Module"):
         graph.query(f"MATCH (n:{label}) DETACH DELETE n")
 
 
-def delete_file_subgraph(owner: str, repo: str, path: str, settings: Settings | None = None) -> None:
+def delete_code_graph(
+    owner: str,
+    repo: str,
+    settings: Settings | None = None,
+    suffix: str = "main",
+) -> None:
     settings = settings or get_settings()
-    graph = _select_graph(owner, repo, settings)
+    _select_graph(owner, repo, settings, suffix).delete()
+
+
+def delete_file_subgraph(
+    owner: str,
+    repo: str,
+    path: str,
+    settings: Settings | None = None,
+    suffix: str = "main",
+) -> None:
+    settings = settings or get_settings()
+    graph = _select_graph(owner, repo, settings, suffix)
     graph.query(
         """
         MATCH (symbol)-[:DEFINED_IN]->(file:File {path: $path})
@@ -71,14 +93,14 @@ def delete_file_subgraph(owner: str, repo: str, path: str, settings: Settings | 
     graph.query("MATCH (file:File {path: $path}) DETACH DELETE file", {"path": path})
 
 
-def _select_graph(owner: str, repo: str, settings: Settings):
+def _select_graph(owner: str, repo: str, settings: Settings, suffix: str = "main"):
     try:
         from falkordb import FalkorDB
     except ImportError as exc:
         raise RuntimeError("falkordb is required for graph storage") from exc
 
     db = FalkorDB(host=settings.falkordb_host, port=settings.falkordb_port)
-    return db.select_graph(graph_name(owner, repo))
+    return db.select_graph(graph_name(owner, repo, suffix))
 
 
 def _symbol_label(kind: str) -> str:

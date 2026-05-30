@@ -12,7 +12,7 @@ class FakeGraph:
 
 def test_write_code_graph_creates_files_symbols_and_imports(monkeypatch, tmp_path):
     fake_graph = FakeGraph()
-    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings: fake_graph)
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": fake_graph)
     parsed = parse_code_file("app/example.py", "import os\nclass User:\n    pass\ndef login():\n    pass\n")
 
     count = store.write_code_graph("octo", "repo", [parsed])
@@ -23,3 +23,22 @@ def test_write_code_graph_creates_files_symbols_and_imports(monkeypatch, tmp_pat
     assert "MERGE (module:Module" in queries
     assert "MERGE (symbol:Class" in queries
     assert "MERGE (symbol:Function" in queries
+
+
+def test_select_graph_uses_suffix(monkeypatch, tmp_path):
+    selected = {}
+
+    class FakeDB:
+        def __init__(self, host, port):
+            pass
+
+        def select_graph(self, name):
+            selected["name"] = name
+            return FakeGraph()
+
+    monkeypatch.setattr("falkordb.FalkorDB", FakeDB)
+
+    graph = store._select_graph("octo", "repo", type("S", (), {"falkordb_host": "h", "falkordb_port": 1})(), "pr:7")
+
+    assert isinstance(graph, FakeGraph)
+    assert selected["name"] == "graph:octo:repo:pr:7"
