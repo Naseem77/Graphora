@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from github import Github
 
 from app.graph.sdk import create_source, get_kg
+from app.graph.store import clear_code_graph, write_code_graph
 from app.parser.treesitter import is_supported_code_file, parse_code_file
 
 
@@ -17,16 +18,23 @@ RepoFile = dict[str, str]
 
 
 def build_repo_graph(owner: str, repo: str, files: list[RepoFile]) -> int:
-    kg = get_kg(owner, repo)
-    sources = [
-        create_source(parse_code_file(file["path"], file["content"]).source_text)
+    parsed_files = [
+        parse_code_file(file["path"], file["content"])
         for file in files
         if is_supported_code_file(file["path"])
     ]
-    if not sources:
+    if not parsed_files:
         logger.info("No supported code files found for %s/%s", owner, repo)
         return 0
 
+    clear_code_graph(owner, repo)
+    write_code_graph(owner, repo, parsed_files)
+
+    kg = get_kg(owner, repo)
+    sources = [
+        create_source(parsed_file.source_text)
+        for parsed_file in parsed_files
+    ]
     kg.process_sources(sources)
     logger.info("Built graph for %s/%s with %s source files", owner, repo, len(sources))
     return len(sources)
