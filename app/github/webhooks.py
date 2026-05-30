@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -55,8 +56,8 @@ async def handle_install(payload: dict) -> None:
     for repository in repositories:
         owner = repository.get("owner", {}).get("login") or payload["installation"]["account"]["login"]
         repo = repository["name"]
-        files = fetch_repository_files(github_client, owner, repo)
-        build_repo_graph(owner, repo, files)
+        files = await asyncio.to_thread(fetch_repository_files, github_client, owner, repo)
+        await asyncio.to_thread(build_repo_graph, owner, repo, files)
 
 
 async def handle_push(payload: dict) -> None:
@@ -85,7 +86,7 @@ async def handle_push(payload: dict) -> None:
             }
         )
 
-    update_graph_for_push(owner, repo, changed_files)
+    await asyncio.to_thread(update_graph_for_push, owner, repo, changed_files)
 
 
 async def handle_pr(payload: dict) -> None:
@@ -95,7 +96,7 @@ async def handle_pr(payload: dict) -> None:
         owner = repository["owner"]["login"]
         repo = repository["name"]
         pr_number = payload["pull_request"]["number"]
-        delete_pr_graph(owner, repo, pr_number)
+        await asyncio.to_thread(delete_pr_graph, owner, repo, pr_number)
         return
 
     if action not in {"opened", "synchronize", "reopened", "ready_for_review"}:
@@ -111,7 +112,7 @@ async def handle_pr(payload: dict) -> None:
     repo_obj = github_client.get_repo(f"{owner}/{repo}")
     pr = repo_obj.get_pull(pr_number)
     changed_files = _pull_request_changed_files(repo_obj, pr)
-    build_pr_graph(owner, repo, pr_number, changed_files)
+    await asyncio.to_thread(build_pr_graph, owner, repo, pr_number, changed_files)
     diff = _pull_request_diff(pr)
     await review_and_post_pr(github_client, owner, repo, pr_number, diff)
 
