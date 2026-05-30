@@ -13,6 +13,8 @@ def test_build_repo_graph_filters_supported_files(monkeypatch):
     fake = FakeKG()
     monkeypatch.setattr(builder, "get_kg", lambda owner, repo: fake)
     monkeypatch.setattr(builder, "create_source", lambda text: text)
+    monkeypatch.setattr(builder, "clear_code_graph", lambda owner, repo: None)
+    monkeypatch.setattr(builder, "write_code_graph", lambda owner, repo, parsed_files: len(parsed_files))
 
     count = builder.build_repo_graph(
         "octo",
