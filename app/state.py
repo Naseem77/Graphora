@@ -32,6 +32,25 @@ def review_already_processed(owner: str, repo: str, pr_number: int, head_sha: st
     )
 
 
+def ci_debug_already_processed(
+    owner: str,
+    repo: str,
+    workflow_run_id: int,
+    head_sha: str,
+    settings: Settings | None = None,
+) -> bool:
+    graph = _select_state_graph(settings or get_settings())
+    return _exists(
+        graph,
+        """
+        MATCH (debug:CIDebug {id: $id, status: 'posted'})
+        RETURN debug.id
+        LIMIT 1
+        """,
+        {"id": _ci_debug_id(owner, repo, workflow_run_id, head_sha)},
+    )
+
+
 def mark_review_posted(owner: str, repo: str, pr_number: int, head_sha: str, settings: Settings | None = None) -> None:
     graph = _select_state_graph(settings or get_settings())
     graph.query(
@@ -49,6 +68,38 @@ def mark_review_posted(owner: str, repo: str, pr_number: int, head_sha: str, set
             "owner": owner,
             "repo": repo,
             "pr_number": pr_number,
+            "head_sha": head_sha,
+            "updated_at": _now(),
+        },
+    )
+
+
+def mark_ci_debug_posted(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    workflow_run_id: int,
+    head_sha: str,
+    settings: Settings | None = None,
+) -> None:
+    graph = _select_state_graph(settings or get_settings())
+    graph.query(
+        """
+        MERGE (debug:CIDebug {id: $id})
+        SET debug.owner = $owner,
+            debug.repo = $repo,
+            debug.pr_number = $pr_number,
+            debug.workflow_run_id = $workflow_run_id,
+            debug.head_sha = $head_sha,
+            debug.status = 'posted',
+            debug.updated_at = $updated_at
+        """,
+        {
+            "id": _ci_debug_id(owner, repo, workflow_run_id, head_sha),
+            "owner": owner,
+            "repo": repo,
+            "pr_number": pr_number,
+            "workflow_run_id": workflow_run_id,
             "head_sha": head_sha,
             "updated_at": _now(),
         },
@@ -128,6 +179,10 @@ def _exists(graph: Any, query: str, params: dict[str, Any]) -> bool:
 
 def _review_id(owner: str, repo: str, pr_number: int, head_sha: str) -> str:
     return f"{owner}/{repo}:pr:{pr_number}:review:{head_sha}"
+
+
+def _ci_debug_id(owner: str, repo: str, workflow_run_id: int, head_sha: str) -> str:
+    return f"{owner}/{repo}:ci:{workflow_run_id}:debug:{head_sha}"
 
 
 def _graph_build_id(owner: str, repo: str, graph_scope: str) -> str:

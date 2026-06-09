@@ -9,6 +9,7 @@ GraphReview Bot is a GitHub App that builds FalkorDB knowledge graphs for reposi
 | GitHub App installed | Queues a main graph build for the installed repository |
 | Push to main | Queues changed-file updates in the main graph |
 | PR opened or updated | Queues PR overlay refresh, computes main-vs-PR diff context, and posts one review per head SHA |
+| GitHub Actions workflow failed | Uses CI logs plus the PR graph to explain the likely root cause and related files |
 | PR closed or merged | Deletes the temporary PR graph |
 | `@graphreview` comment | Answers using graph context |
 
@@ -140,6 +141,7 @@ Repository permissions:
 | Issues | Read and write |
 | Metadata | Read-only |
 | Pull requests | Read and write |
+| Actions | Read-only |
 
 Subscribe to events:
 
@@ -147,6 +149,7 @@ Subscribe to events:
 Installation
 Push
 Pull request
+Workflow run
 Issue comment
 Pull request review comment
 ```
@@ -194,6 +197,8 @@ https://your-ngrok-domain.ngrok-free.app/webhook
 ## Using the bot
 
 Open or update a pull request. GraphReview will post a `GraphReview Analysis` comment.
+
+If GitHub Actions fails on a pull request, GraphReview posts a `Graphora CI Debug` comment. The CI debugging agent combines failure logs with the repository graph to identify likely dependency paths from the failed test to the changed files.
 
 Ask questions in a PR:
 

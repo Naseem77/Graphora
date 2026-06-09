@@ -24,6 +24,10 @@ class FakeGraph:
             return FakeResult([[params["id"]]] if params["id"] in self.reviews else [])
         if "MERGE (review:PRReview" in query:
             self.reviews.add(params["id"])
+        if "MATCH (debug:CIDebug" in query:
+            return FakeResult([[params["id"]]] if params["id"] in self.reviews else [])
+        if "MERGE (debug:CIDebug" in query:
+            self.reviews.add(params["id"])
         return FakeResult()
 
 
@@ -65,3 +69,13 @@ def test_graph_build_state_uses_falkordb_graph(monkeypatch):
     state.mark_graph_build("o", "r", "main", "built", 3, _settings())
 
     assert any("MERGE (build:GraphBuild" in query for query, _ in fake_graph.queries)
+
+
+def test_ci_debug_idempotency_state(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(state, "_select_state_graph", lambda settings: fake_graph)
+    settings = _settings()
+
+    assert not state.ci_debug_already_processed("o", "r", 123, "sha", settings)
+    state.mark_ci_debug_posted("o", "r", 1, 123, "sha", settings)
+    assert state.ci_debug_already_processed("o", "r", 123, "sha", settings)

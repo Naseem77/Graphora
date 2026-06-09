@@ -9,6 +9,7 @@ from typing import Awaitable, Callable
 from fastapi import BackgroundTasks
 
 from app.config import get_settings
+from app.ci.debugger import debug_workflow_run
 from app.github.app import get_github_client
 from app.graph.builder import build_repo_graph, fetch_repository_files
 from app.graph.pr_graph import build_pr_graph, delete_pr_graph
@@ -45,6 +46,7 @@ async def dispatch_webhook(
         "push": handle_push,
         "pull_request": handle_pr,
         "issue_comment": handle_comment,
+        "workflow_run": handle_workflow_run,
     }
     handler = handlers.get(event)
     if handler is None:
@@ -151,6 +153,10 @@ async def handle_comment(payload: dict) -> None:
     if "pull_request" not in payload.get("issue", {}):
         return
     await answer_comment(payload)
+
+
+async def handle_workflow_run(payload: dict) -> None:
+    await debug_workflow_run(payload)
 
 
 def _changed_paths_from_commits(commits: list[dict]) -> list[str]:

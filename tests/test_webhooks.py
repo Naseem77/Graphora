@@ -83,3 +83,24 @@ def test_dispatch_queues_background_task(monkeypatch):
     asyncio.run(webhooks.dispatch_webhook("push", {"repository": {"full_name": "o/r"}}, tasks, "d1"))
 
     assert len(tasks.tasks) == 1
+
+
+def test_dispatch_supports_workflow_run(monkeypatch):
+    called = False
+
+    async def handler(payload):
+        nonlocal called
+        called = payload["workflow_run"]["id"] == 123
+
+    monkeypatch.setattr(webhooks, "handle_workflow_run", handler)
+    monkeypatch.setattr(webhooks, "mark_delivery", lambda event, delivery_id: True)
+
+    asyncio.run(
+        webhooks.dispatch_webhook(
+            "workflow_run",
+            {"repository": {"full_name": "o/r"}, "workflow_run": {"id": 123}},
+            delivery_id="d1",
+        )
+    )
+
+    assert called
