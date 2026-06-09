@@ -8,7 +8,7 @@ from app.ci.graph_context import GraphEvidence, build_ci_graph_evidence
 from app.ci.logs import extract_failed_tests, extract_paths, fetch_workflow_run_logs, summarize_failure_logs
 from app.config import Settings, get_settings
 from app.github.app import get_github_client
-from app.github.poster import post_pr_review_comment
+from app.github.poster import post_or_update_pr_comment
 from app.state import ci_debug_already_processed, mark_ci_debug_posted
 
 
@@ -60,7 +60,8 @@ async def debug_workflow_run(payload: dict, settings: Settings | None = None) ->
     )
     debug_text = await asyncio.to_thread(_ask_llm_for_ci_debug, workflow_run, log_summary, evidence, settings)
     body = f"{CI_DEBUG_HEADER}\n\n{debug_text}"
-    await asyncio.to_thread(post_pr_review_comment, github_client, owner, repo, pr_number, body)
+    marker = _ci_debug_marker(workflow_run_id, head_sha)
+    await asyncio.to_thread(post_or_update_pr_comment, github_client, owner, repo, pr_number, marker, body)
     mark_ci_debug_posted(owner, repo, pr_number, workflow_run_id, head_sha, settings)
     return debug_text
 
@@ -115,3 +116,7 @@ If graph evidence is missing, say that and fall back to log-based reasoning.
 
 def _pull_request_changed_file_names(pr: object) -> list[str]:
     return [file.filename for file in pr.get_files() if getattr(file, "status", "") != "removed"]
+
+
+def _ci_debug_marker(workflow_run_id: int, head_sha: str) -> str:
+    return f"<!-- graphora-ci-debug:{workflow_run_id}:{head_sha} -->"

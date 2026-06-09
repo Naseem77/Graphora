@@ -66,3 +66,7 @@ def test_pull_request_changed_file_names_skips_removed_files():
             return [File("app/a.py", "modified"), File("app/deleted.py", "removed")]
 
     assert debugger._pull_request_changed_file_names(PR()) == ["app/a.py"]
+
+
+def test_ci_debug_marker_is_stable():
+    assert debugger._ci_debug_marker(123, "abc") == "<!-- graphora-ci-debug:123:abc -->"
