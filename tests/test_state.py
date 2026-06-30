@@ -12,10 +12,18 @@ class FakeGraph:
         self.queries = []
         self.deliveries = set()
         self.reviews = set()
+        self.repo_paused = {}
 
     def query(self, query, params=None):
         params = params or {}
         self.queries.append((query, params))
+        if "MERGE (config:RepoConfig" in query:
+            self.repo_paused[params["id"]] = params["paused"]
+            return FakeResult()
+        if "MATCH (config:RepoConfig" in query:
+            if params["id"] in self.repo_paused:
+                return FakeResult([[self.repo_paused[params["id"]]]])
+            return FakeResult([])
         if "MATCH (delivery:WebhookDelivery" in query:
             return FakeResult([[params["id"]]] if params["id"] in self.deliveries else [])
         if "MERGE (delivery:WebhookDelivery" in query:
@@ -51,6 +59,18 @@ def test_review_idempotency_state(monkeypatch):
     assert not state.review_already_processed("o", "r", 1, "sha", settings)
     state.mark_review_posted("o", "r", 1, "sha", settings)
     assert state.review_already_processed("o", "r", 1, "sha", settings)
+
+
+def test_review_pause_state(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(state, "_select_state_graph", lambda settings: fake_graph)
+    settings = _settings()
+
+    assert not state.is_review_paused("o", "r", settings)
+    state.set_review_paused("o", "r", True, settings)
+    assert state.is_review_paused("o", "r", settings)
+    state.set_review_paused("o", "r", False, settings)
+    assert not state.is_review_paused("o", "r", settings)
 
 
 def test_delivery_idempotency_state(monkeypatch):

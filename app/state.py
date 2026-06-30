@@ -130,6 +130,42 @@ def mark_graph_build(owner: str, repo: str, graph_scope: str, status: str, sourc
     )
 
 
+def set_review_paused(owner: str, repo: str, paused: bool, settings: Settings | None = None) -> None:
+    graph = _select_state_graph(settings or get_settings())
+    graph.query(
+        """
+        MERGE (config:RepoConfig {id: $id})
+        SET config.owner = $owner,
+            config.repo = $repo,
+            config.review_paused = $paused,
+            config.updated_at = $updated_at
+        """,
+        {
+            "id": _repo_config_id(owner, repo),
+            "owner": owner,
+            "repo": repo,
+            "paused": paused,
+            "updated_at": _now(),
+        },
+    )
+
+
+def is_review_paused(owner: str, repo: str, settings: Settings | None = None) -> bool:
+    graph = _select_state_graph(settings or get_settings())
+    result = graph.query(
+        """
+        MATCH (config:RepoConfig {id: $id})
+        RETURN config.review_paused
+        LIMIT 1
+        """,
+        {"id": _repo_config_id(owner, repo)},
+    )
+    rows = getattr(result, "result_set", result) or []
+    if not rows:
+        return False
+    return bool(rows[0][0])
+
+
 def mark_delivery(event: str, delivery_id: str, settings: Settings | None = None) -> bool:
     graph = _select_state_graph(settings or get_settings())
     delivery_key = _delivery_id(event, delivery_id)
@@ -187,6 +223,10 @@ def _ci_debug_id(owner: str, repo: str, workflow_run_id: int, head_sha: str) -> 
 
 def _graph_build_id(owner: str, repo: str, graph_scope: str) -> str:
     return f"{owner}/{repo}:graph:{graph_scope}"
+
+
+def _repo_config_id(owner: str, repo: str) -> str:
+    return f"{owner}/{repo}:config"
 
 
 def _delivery_id(event: str, delivery_id: str) -> str:

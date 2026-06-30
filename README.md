@@ -8,10 +8,10 @@ GraphReview Bot is a GitHub App that builds FalkorDB knowledge graphs for reposi
 | --- | --- |
 | GitHub App installed | Queues a main graph build for the installed repository |
 | Push to main | Queues changed-file updates in the main graph |
-| PR opened or updated | Queues PR overlay refresh, computes main-vs-PR diff context, and posts one review per head SHA |
+| PR opened or updated | Queues PR overlay refresh, computes main-vs-PR diff context, and posts one CodeRabbit-style review (walkthrough + inline comments) per head SHA |
 | GitHub Actions workflow failed | Uses CI logs plus the PR graph to explain the likely root cause and related files |
 | PR closed or merged | Deletes the temporary PR graph |
-| `@graphreview` comment | Answers using graph context |
+| `@graphreview` comment | Runs commands (`review`, `summary`, `pause`, `resume`, `help`) or answers questions using graph context |
 
 ## Architecture
 
@@ -196,17 +196,25 @@ https://your-ngrok-domain.ngrok-free.app/webhook
 
 ## Using the bot
 
-Open or update a pull request. GraphReview will post a `GraphReview Analysis` comment.
+Open or update a pull request. GraphReview posts a `GraphReview Analysis` comment with a summary, a per-file walkthrough table, and line-level inline review comments (CodeRabbit-style), all grounded in the knowledge graph.
 
 If GitHub Actions fails on a pull request, GraphReview posts a `Graphora CI Debug` comment. The CI debugging agent combines failure logs with the repository graph to identify likely dependency paths from the failed test to the changed files.
 
-Ask questions in a PR:
+Commands and questions in a PR comment:
 
 ```text
-@graphreview what changed in this PR?
+@graphreview review                         # re-run a full review now
+@graphreview summary                        # post a summary/walkthrough
+@graphreview pause                          # stop automatic reviews on new commits
+@graphreview resume                         # re-enable automatic reviews
+@graphreview help                           # list commands
+@graphreview what changed in this PR?       # free-form graph question
 @graphreview what could this break?
-@graphreview what files are related to this change?
 ```
+
+## Multi-tenant (per-installation FalkorDB)
+
+By default all installations share one FalkorDB. Set `GRAPHORA_PER_INSTALL_DB=true` to give each GitHub App installation its own FalkorDB instance, provisioned on install and torn down on uninstall. Provisioning sits behind the `GraphProvisioner` interface (`app/provision/`); the included implementation uses the local Docker daemon (mount `/var/run/docker.sock` into the app), and can be swapped for Kubernetes or a cloud orchestrator without touching the rest of the app. A registry in the shared control-plane FalkorDB maps each `installation_id` to its instance host/port.
 
 ## Viewing graphs
 

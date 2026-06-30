@@ -5,9 +5,12 @@ import re
 
 from app.config import Settings, get_settings
 from app.github.app import get_github_client
-from app.github.poster import post_issue_comment
+from app.github.poster import get_pr_diff, post_issue_comment
 from app.graph.sdk import get_kg
 from app.provision.factory import settings_for_installation
+from app.review.commands import help_text, parse_command
+from app.review.reviewer import review_and_post_pr
+from app.state import set_review_paused
 
 
 async def answer_comment(payload: dict, settings: Settings | None = None) -> str | None:
@@ -21,19 +24,38 @@ async def answer_comment(payload: dict, settings: Settings | None = None) -> str
     if mention.lower() not in body.lower():
         return None
 
-    question = re.sub(re.escape(mention), "", body, count=1, flags=re.IGNORECASE).strip()
-    if not question:
-        question = "Summarize the graph context for this pull request."
+    text = re.sub(re.escape(mention), "", body, count=1, flags=re.IGNORECASE).strip()
 
     repository = payload["repository"]
     owner = repository["owner"]["login"]
     repo = repository["name"]
     issue_number = payload["issue"]["number"]
     installation_id = payload["installation"]["id"]
+    github_client = await asyncio.to_thread(get_github_client, installation_id, settings)
     graph_settings = await asyncio.to_thread(settings_for_installation, installation_id)
 
-    answer = await asyncio.to_thread(lambda: str(get_kg(owner, repo, settings=graph_settings).chat_session().ask(question)))
-    github_client = await asyncio.to_thread(get_github_client, installation_id, settings)
+    command = parse_command(text)
+    if command.name == "help":
+        return await _reply(github_client, owner, repo, issue_number, help_text(settings.bot_login))
+    if command.name == "pause":
+        await asyncio.to_thread(set_review_paused, owner, repo, True)
+        return await _reply(
+            github_client, owner, repo, issue_number, "Automatic reviews are now **paused** for this repository."
+        )
+    if command.name == "resume":
+        await asyncio.to_thread(set_review_paused, owner, repo, False)
+        return await _reply(
+            github_client, owner, repo, issue_number, "Automatic reviews are now **resumed** for this repository."
+        )
+    if command.name in {"review", "summary"}:
+        diff = await asyncio.to_thread(get_pr_diff, github_client, owner, repo, issue_number)
+        await review_and_post_pr(github_client, owner, repo, issue_number, diff, graph_settings)
+        return "review"
+
+    question = text or "Summarize the graph context for this pull request."
+    answer = await asyncio.to_thread(
+        lambda: str(get_kg(owner, repo, settings=graph_settings).chat_session().ask(question))
+    )
     await asyncio.to_thread(
         post_issue_comment,
         github_client,
@@ -43,3 +65,8 @@ async def answer_comment(payload: dict, settings: Settings | None = None) -> str
         f"**@{settings.bot_login}** {answer}",
     )
     return answer
+
+
+async def _reply(github_client: object, owner: str, repo: str, issue_number: int, body: str) -> str:
+    await asyncio.to_thread(post_issue_comment, github_client, owner, repo, issue_number, body)
+    return body

@@ -50,3 +50,62 @@ def test_answer_comment_posts_answer(monkeypatch, tmp_path):
 
     assert answer == "answer"
     assert posted["body"] == "**@graphreview** answer"
+
+
+def _command_payload(body):
+    return {
+        "comment": {"user": {"type": "User"}, "body": body},
+        "repository": {"owner": {"login": "octo"}, "name": "repo"},
+        "issue": {"number": 1},
+        "installation": {"id": 123},
+    }
+
+
+def test_help_command_posts_help(monkeypatch, tmp_path):
+    posted = {}
+    monkeypatch.setattr(chat, "settings_for_installation", lambda installation_id: None)
+    monkeypatch.setattr(chat, "get_github_client", lambda installation_id, settings: "client")
+    monkeypatch.setattr(
+        chat,
+        "post_issue_comment",
+        lambda github_client, owner, repo, issue_number, body: posted.update(body=body),
+    )
+
+    result = chat.asyncio.run(chat.answer_comment(_command_payload("@graphreview help"), _settings(tmp_path)))
+
+    assert "commands" in result
+    assert "@graphreview review" in posted["body"]
+
+
+def test_pause_command_sets_state(monkeypatch, tmp_path):
+    calls = {}
+    monkeypatch.setattr(chat, "settings_for_installation", lambda installation_id: None)
+    monkeypatch.setattr(chat, "get_github_client", lambda installation_id, settings: "client")
+    monkeypatch.setattr(chat, "set_review_paused", lambda owner, repo, paused: calls.update(paused=paused))
+    monkeypatch.setattr(
+        chat,
+        "post_issue_comment",
+        lambda github_client, owner, repo, issue_number, body: calls.update(body=body),
+    )
+
+    chat.asyncio.run(chat.answer_comment(_command_payload("@graphreview pause"), _settings(tmp_path)))
+
+    assert calls["paused"] is True
+    assert "paused" in calls["body"].lower()
+
+
+def test_review_command_runs_review(monkeypatch, tmp_path):
+    calls = {}
+    monkeypatch.setattr(chat, "settings_for_installation", lambda installation_id: None)
+    monkeypatch.setattr(chat, "get_github_client", lambda installation_id, settings: "client")
+    monkeypatch.setattr(chat, "get_pr_diff", lambda client, owner, repo, number: "DIFF")
+
+    async def fake_review(github_client, owner, repo, pr_number, diff, settings):
+        calls.update(diff=diff, pr_number=pr_number)
+
+    monkeypatch.setattr(chat, "review_and_post_pr", fake_review)
+
+    result = chat.asyncio.run(chat.answer_comment(_command_payload("@graphreview review"), _settings(tmp_path)))
+
+    assert result == "review"
+    assert calls == {"diff": "DIFF", "pr_number": 1}

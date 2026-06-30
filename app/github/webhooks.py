@@ -20,7 +20,7 @@ from app.graph.updater import update_graph_for_push
 from app.provision.factory import destroy_installation, provision_installation, settings_for_installation
 from app.review.chat import answer_comment
 from app.review.reviewer import review_and_post_pr
-from app.state import mark_delivery, mark_review_posted, review_already_processed
+from app.state import is_review_paused, mark_delivery, mark_review_posted, review_already_processed
 
 
 logger = logging.getLogger(__name__)
@@ -151,6 +151,10 @@ async def handle_pr(payload: dict) -> None:
 
     if review_already_processed(owner, repo, pr_number, head_sha):
         logger.info("Skipping duplicate review for %s/%s PR #%s at %s", owner, repo, pr_number, head_sha)
+        return
+
+    if is_review_paused(owner, repo):
+        logger.info("Automatic reviews paused for %s/%s; skipping PR #%s", owner, repo, pr_number)
         return
 
     settings = await asyncio.to_thread(settings_for_installation, installation_id)
