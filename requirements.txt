@@ -3,7 +3,6 @@ uvicorn[standard]
 PyGithub
 PyJWT
 requests
-graphrag-sdk[litellm]
 falkordb
 docker
 tree-sitter

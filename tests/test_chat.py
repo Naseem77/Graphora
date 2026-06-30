@@ -21,17 +21,13 @@ def test_answer_comment_ignores_bot_comments(tmp_path):
 
 
 def test_answer_comment_posts_answer(monkeypatch, tmp_path):
-    class FakeSession:
-        def ask(self, question):
-            assert question == "what changed?"
-            return "answer"
-
-    class FakeKG:
-        def chat_session(self):
-            return FakeSession()
-
     posted = {}
-    monkeypatch.setattr(chat, "get_kg", lambda owner, repo, settings=None: FakeKG())
+
+    def fake_answer(owner, repo, question, settings=None):
+        assert question == "what changed?"
+        return "answer"
+
+    monkeypatch.setattr(chat, "answer_repo_question", fake_answer)
     monkeypatch.setattr(chat, "settings_for_installation", lambda installation_id: None)
     monkeypatch.setattr(chat, "get_github_client", lambda installation_id, settings: "client")
     monkeypatch.setattr(

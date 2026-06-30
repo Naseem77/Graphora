@@ -4,7 +4,6 @@ import logging
 
 from app.config import Settings, get_settings
 from app.graph.locks import graph_write_lock
-from app.graph.sdk import create_source, get_kg
 from app.graph.store import delete_file_subgraph, write_code_graph
 from app.parser.treesitter import is_supported_source_file, parse_code_file
 from app.state import mark_graph_build
@@ -26,13 +25,9 @@ def update_graph_for_push(owner: str, repo: str, changed_files: list[dict[str, s
     with graph_write_lock(owner, repo, "main", settings):
         _delete_stale_file_nodes(owner, repo, changed_files, settings)
         write_code_graph(owner, repo, parsed_files, settings)
-
-        kg = get_kg(owner, repo, settings=settings)
-        sources = [create_source(parsed_file.source_text) for parsed_file in parsed_files]
-        kg.process_sources(sources)
-        mark_graph_build(owner, repo, "main", "updated", len(sources), settings)
-    logger.info("Updated graph for %s/%s with %s changed files", owner, repo, len(sources))
-    return len(sources)
+        mark_graph_build(owner, repo, "main", "updated", len(parsed_files), settings)
+    logger.info("Updated graph for %s/%s with %s changed files", owner, repo, len(parsed_files))
+    return len(parsed_files)
 
 
 def _delete_stale_file_nodes(

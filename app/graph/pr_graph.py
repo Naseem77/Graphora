@@ -5,7 +5,6 @@ from typing import Callable
 
 from app.config import Settings, get_settings
 from app.graph.locks import graph_write_lock
-from app.graph.sdk import create_source, get_kg
 from app.graph.store import clear_code_graph, delete_code_graph, write_code_graph
 from app.parser.treesitter import is_supported_source_file, parse_code_file
 from app.state import mark_graph_build
@@ -50,10 +49,6 @@ def build_pr_graph(
         for index, parsed_file in enumerate(parsed_files, start=1):
             write_code_graph(owner, repo, [parsed_file], settings, suffix)
             _report_progress(on_progress, "writing structural graph", index, total, parsed_file.path)
-        kg = get_kg(owner, repo, suffix=suffix, settings=settings)
-        for index, parsed_file in enumerate(parsed_files, start=1):
-            _report_progress(on_progress, "ingesting GraphRAG", index, total, parsed_file.path)
-            kg.process_sources([create_source(parsed_file.source_text)])
         mark_graph_build(owner, repo, suffix, "built", len(parsed_files), settings)
     _report_progress(on_progress, "complete", total, total, "")
     logger.info("Built PR graph for %s/%s PR #%s with %s files", owner, repo, pr_number, len(parsed_files))

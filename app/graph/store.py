@@ -201,6 +201,121 @@ def code_graph_has_files(
     return int(rows[0][0] or 0) > 0
 
 
+def symbol_impact(
+    owner: str,
+    repo: str,
+    symbols: list[str],
+    settings: Settings | None = None,
+    suffix: str = "main",
+    symbol_limit: int = 25,
+    row_limit: int = 15,
+) -> list[dict]:
+    """Return structural impact for changed symbols, queried from the code graph.
+
+    For each symbol name this reports where it is defined, which functions call
+    it (callers), which functions it calls (callees), and any tests that exercise
+    it. This replaces GraphRAG retrieval with deterministic Cypher traversals.
+    """
+    settings = settings or get_settings()
+    graph = _select_graph(owner, repo, settings, suffix)
+
+    def rows(query: str, params: dict) -> list[list]:
+        result = graph.query(query, params)
+        return getattr(result, "result_set", result) or []
+
+    impacts: list[dict] = []
+    for name in list(dict.fromkeys(symbols))[:symbol_limit]:
+        params = {"name": name, "limit": row_limit}
+        definitions = [
+            {"kind": r[0], "path": r[1], "line": r[2], "signature": r[3]}
+            for r in rows(
+                """
+                MATCH (symbol)-[:DEFINED_IN]->(file:File)
+                WHERE (symbol:Function OR symbol:Class) AND symbol.name = $name
+                RETURN symbol.kind, symbol.path, symbol.line, symbol.signature
+                LIMIT $limit
+                """,
+                params,
+            )
+        ]
+        callers = [
+            {"name": r[0], "path": r[1]}
+            for r in rows(
+                """
+                MATCH (caller:Function)-[:CALLS]->(callee:Function {name: $name})
+                RETURN DISTINCT caller.name, caller.path
+                LIMIT $limit
+                """,
+                params,
+            )
+        ]
+        callees = [
+            {"name": r[0], "path": r[1]}
+            for r in rows(
+                """
+                MATCH (symbol:Function {name: $name})-[:CALLS]->(callee:Function)
+                RETURN DISTINCT callee.name, callee.path
+                LIMIT $limit
+                """,
+                params,
+            )
+        ]
+        tests = [
+            {"name": r[0], "path": r[1]}
+            for r in rows(
+                """
+                MATCH (test:Function)-[:CALLS]->(callee:Function {name: $name})
+                WHERE test.name STARTS WITH 'test' OR test.path CONTAINS 'test'
+                RETURN DISTINCT test.name, test.path
+                LIMIT $limit
+                """,
+                params,
+            )
+        ]
+        if definitions or callers or callees or tests:
+            impacts.append(
+                {
+                    "name": name,
+                    "definitions": definitions,
+                    "callers": callers,
+                    "callees": callees,
+                    "tests": tests,
+                }
+            )
+    return impacts
+
+
+def code_graph_stats(
+    owner: str,
+    repo: str,
+    settings: Settings | None = None,
+    suffix: str = "main",
+) -> dict:
+    settings = settings or get_settings()
+    graph = _select_graph(owner, repo, settings, suffix)
+
+    label_counts: dict[str, int] = {}
+    node_result = graph.query("MATCH (n) RETURN labels(n), count(n)")
+    for row in getattr(node_result, "result_set", node_result) or []:
+        labels = row[0] or []
+        label = labels[0] if isinstance(labels, list) and labels else "Unlabeled"
+        label_counts[label] = label_counts.get(label, 0) + int(row[1] or 0)
+
+    rel_result = graph.query("MATCH ()-[r]->() RETURN count(r)")
+    rel_rows = getattr(rel_result, "result_set", rel_result) or []
+    relationship_count = int(rel_rows[0][0] or 0) if rel_rows else 0
+
+    file_result = graph.query("MATCH (file:File) RETURN file.path ORDER BY file.path")
+    files = [row[0] for row in (getattr(file_result, "result_set", file_result) or []) if row[0]]
+
+    return {
+        "node_counts": label_counts,
+        "node_total": sum(label_counts.values()),
+        "relationship_count": relationship_count,
+        "files": files,
+    }
+
+
 def delete_file_subgraph(
     owner: str,
     repo: str,

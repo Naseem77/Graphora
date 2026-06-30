@@ -6,9 +6,9 @@ import re
 from app.config import Settings, get_settings
 from app.github.app import get_github_client
 from app.github.poster import get_pr_diff, post_issue_comment
-from app.graph.sdk import get_kg
 from app.provision.factory import settings_for_installation
 from app.review.commands import help_text, parse_command
+from app.review.qa import answer_repo_question
 from app.review.reviewer import review_and_post_pr
 from app.state import set_review_paused
 
@@ -52,10 +52,8 @@ async def answer_comment(payload: dict, settings: Settings | None = None) -> str
         await review_and_post_pr(github_client, owner, repo, issue_number, diff, graph_settings)
         return "review"
 
-    question = text or "Summarize the graph context for this pull request."
-    answer = await asyncio.to_thread(
-        lambda: str(get_kg(owner, repo, settings=graph_settings).chat_session().ask(question))
-    )
+    question = text or "Summarize the repository structure from the code graph."
+    answer = await asyncio.to_thread(answer_repo_question, owner, repo, question, graph_settings)
     await asyncio.to_thread(
         post_issue_comment,
         github_client,

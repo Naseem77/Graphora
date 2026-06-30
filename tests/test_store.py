@@ -98,3 +98,57 @@ def test_code_graph_has_files_checks_file_count(monkeypatch):
     fake_graph.file_count = 2
 
     assert store.code_graph_has_files("octo", "repo")
+
+
+def test_code_graph_stats_aggregates_nodes_and_files(monkeypatch):
+    class StatsGraph:
+        def query(self, query, params=None):
+            if "labels(n), count(n)" in query:
+                rows = [[["File"], 2], [["Function"], 5]]
+            elif "count(r)" in query:
+                rows = [[7]]
+            elif "file.path" in query:
+                rows = [["a.py"], ["b.py"]]
+            else:
+                rows = []
+            return type("Result", (), {"result_set": rows})()
+
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": StatsGraph())
+
+    stats = store.code_graph_stats("octo", "repo", suffix="pr:5")
+
+    assert stats["node_counts"] == {"File": 2, "Function": 5}
+    assert stats["node_total"] == 7
+    assert stats["relationship_count"] == 7
+    assert stats["files"] == ["a.py", "b.py"]
+
+
+def test_symbol_impact_collects_callers_callees_tests(monkeypatch):
+    class ImpactGraph:
+        def query(self, query, params=None):
+            name = (params or {}).get("name")
+            if name != "login":
+                return type("R", (), {"result_set": []})()
+            if "DEFINED_IN" in query:
+                rows = [["Function", "app/auth.py", 10, "def login()"]]
+            elif "caller:Function)-[:CALLS]" in query and "test" not in query:
+                rows = [["handler", "app/api.py"]]
+            elif "{name: $name})-[:CALLS]->(callee:Function)" in query:
+                rows = [["hash_pw", "app/crypto.py"]]
+            elif "test.name STARTS WITH" in query:
+                rows = [["test_login", "tests/test_auth.py"]]
+            else:
+                rows = []
+            return type("R", (), {"result_set": rows})()
+
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": ImpactGraph())
+
+    impacts = store.symbol_impact("o", "r", ["login", "missing"])
+
+    assert len(impacts) == 1
+    impact = impacts[0]
+    assert impact["name"] == "login"
+    assert impact["definitions"][0]["path"] == "app/auth.py"
+    assert impact["callers"] == [{"name": "handler", "path": "app/api.py"}]
+    assert impact["callees"] == [{"name": "hash_pw", "path": "app/crypto.py"}]
+    assert impact["tests"] == [{"name": "test_login", "path": "tests/test_auth.py"}]
