@@ -16,6 +16,28 @@ def test_verify_signature(monkeypatch):
     assert not webhooks.verify_signature(body, "sha256=bad")
 
 
+def test_verify_signature_rejects_malformed_headers(monkeypatch):
+    get_settings.cache_clear()
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret")
+    body = b'{"ok":true}'
+    valid = hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+
+    assert not webhooks.verify_signature(body, None)
+    assert not webhooks.verify_signature(body, "")
+    assert not webhooks.verify_signature(body, valid)  # missing sha256= prefix
+    assert not webhooks.verify_signature(body, "sha1=" + valid)
+    assert not webhooks.verify_signature(body, "sha256=" + valid[:-1])  # wrong length
+
+
+def test_verify_signature_is_case_insensitive_on_hex(monkeypatch):
+    get_settings.cache_clear()
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret")
+    body = b'{"ok":true}'
+    digest = hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+
+    assert webhooks.verify_signature(body, "sha256=" + digest.upper())
+
+
 def test_changed_paths_are_unique():
     commits = [
         {"added": ["a.py"], "modified": ["b.py"]},
