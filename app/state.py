@@ -130,6 +130,32 @@ def mark_graph_build(owner: str, repo: str, graph_scope: str, status: str, sourc
     )
 
 
+def list_graph_builds(settings: Settings | None = None) -> list[dict]:
+    graph = _select_state_graph(settings or get_settings())
+    result = graph.query(
+        """
+        MATCH (build:GraphBuild)
+        RETURN build.owner, build.repo, build.graph_scope,
+               build.status, build.source_count, build.updated_at
+        ORDER BY build.updated_at DESC
+        """
+    )
+    rows = getattr(result, "result_set", result) or []
+    builds = []
+    for row in rows:
+        builds.append(
+            {
+                "owner": row[0],
+                "repo": row[1],
+                "graph_scope": row[2],
+                "status": row[3],
+                "source_count": row[4],
+                "updated_at": row[5],
+            }
+        )
+    return builds
+
+
 def set_review_paused(owner: str, repo: str, paused: bool, settings: Settings | None = None) -> None:
     graph = _select_state_graph(settings or get_settings())
     graph.query(

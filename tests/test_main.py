@@ -25,3 +25,43 @@ def test_webhook_rejects_bad_signature(monkeypatch):
     )
 
     assert response.status_code == 401
+
+
+def test_status_endpoint(monkeypatch):
+    import app.main as main
+
+    monkeypatch.setattr(
+        main,
+        "list_graph_builds",
+        lambda: [{"owner": "o", "repo": "r", "graph_scope": "main", "status": "built", "source_count": 3, "updated_at": "2026-01-01T00:00:00"}],
+    )
+    client = TestClient(app)
+
+    response = client.get("/status")
+
+    assert response.status_code == 200
+    assert response.json()["builds"][0]["repo"] == "r"
+
+
+def test_status_endpoint_survives_db_error(monkeypatch):
+    import app.main as main
+
+    def _boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(main, "list_graph_builds", _boom)
+    client = TestClient(app)
+
+    response = client.get("/status")
+
+    assert response.status_code == 200
+    assert response.json() == {"builds": []}
+
+
+def test_dashboard_served():
+    client = TestClient(app)
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    assert "Graph Build Status" in response.text

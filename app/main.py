@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse
 
 from app.github.webhooks import dispatch_webhook, verify_signature
-from app.state import init_state
+from app.state import init_state, list_graph_builds
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_STATIC_DIR = Path(__file__).parent / "static"
 
 
 @asynccontextmanager
@@ -25,6 +29,21 @@ app = FastAPI(title="GraphReview Bot", version="0.1.0", lifespan=lifespan)
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/status")
+async def status() -> dict[str, list]:
+    try:
+        builds = list_graph_builds()
+    except Exception as exc:  # noqa: BLE001 - dashboard must not crash on DB issues
+        logger.warning("Failed to read graph build status: %s", exc)
+        builds = []
+    return {"builds": builds}
+
+
+@app.get("/dashboard")
+async def dashboard() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "dashboard.html")
 
 
 @app.post("/webhook")

@@ -36,6 +36,8 @@ class FakeGraph:
             return FakeResult([[params["id"]]] if params["id"] in self.reviews else [])
         if "MERGE (debug:CIDebug" in query:
             self.reviews.add(params["id"])
+        if "MATCH (build:GraphBuild" in query:
+            return FakeResult([["o", "r", "main", "built", 3, "2026-01-01T00:00:00"]])
         return FakeResult()
 
 
@@ -89,6 +91,24 @@ def test_graph_build_state_uses_falkordb_graph(monkeypatch):
     state.mark_graph_build("o", "r", "main", "built", 3, _settings())
 
     assert any("MERGE (build:GraphBuild" in query for query, _ in fake_graph.queries)
+
+
+def test_list_graph_builds(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(state, "_select_state_graph", lambda settings: fake_graph)
+
+    builds = state.list_graph_builds(_settings())
+
+    assert builds == [
+        {
+            "owner": "o",
+            "repo": "r",
+            "graph_scope": "main",
+            "status": "built",
+            "source_count": 3,
+            "updated_at": "2026-01-01T00:00:00",
+        }
+    ]
 
 
 def test_ci_debug_idempotency_state(monkeypatch):
