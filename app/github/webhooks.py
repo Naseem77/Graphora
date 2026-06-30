@@ -17,6 +17,7 @@ from app.graph.builder import build_repo_graph, fetch_repository_files
 from app.graph.pr_graph import build_pr_graph, delete_pr_graph
 from app.graph.store import code_graph_has_files
 from app.graph.updater import update_graph_for_push
+from app.provision.factory import destroy_installation, provision_installation, settings_for_installation
 from app.review.chat import answer_comment
 from app.review.reviewer import review_and_post_pr
 from app.state import mark_delivery, mark_review_posted, review_already_processed
@@ -46,6 +47,7 @@ async def dispatch_webhook(
 ) -> None:
     handlers: dict[str, WebhookHandler] = {
         "installation": handle_install,
+        "installation_repositories": handle_install,
         "push": handle_push,
         "pull_request": handle_pr,
         "issue_comment": handle_comment,
@@ -74,21 +76,30 @@ def _run_handler_sync(handler: WebhookHandler, payload: dict) -> None:
 
 async def handle_install(payload: dict) -> None:
     action = payload.get("action")
+    installation_id = payload["installation"]["id"]
+
+    if action in {"deleted", "removed"}:
+        if action == "deleted":
+            await asyncio.to_thread(destroy_installation, installation_id)
+            logger.info("Destroyed FalkorDB instance for installation %s", installation_id)
+        return
+
     if action not in {"created", "added"}:
         return
 
-    installation_id = payload["installation"]["id"]
+    settings = await asyncio.to_thread(provision_installation, installation_id)
     github_client = get_github_client(installation_id)
     repositories = payload.get("repositories") or payload.get("repositories_added") or []
     for repository in repositories:
         owner = repository.get("owner", {}).get("login") or payload["installation"]["account"]["login"]
         repo = repository["name"]
         files = await asyncio.to_thread(fetch_repository_files, github_client, owner, repo)
-        await asyncio.to_thread(build_repo_graph, owner, repo, files)
+        await asyncio.to_thread(build_repo_graph, owner, repo, files, None, settings)
 
 
 async def handle_push(payload: dict) -> None:
     installation_id = payload["installation"]["id"]
+    settings = await asyncio.to_thread(settings_for_installation, installation_id)
     repository = payload["repository"]
     owner = repository["owner"]["login"]
     repo = repository["name"]
@@ -113,23 +124,24 @@ async def handle_push(payload: dict) -> None:
             }
         )
 
-    await asyncio.to_thread(update_graph_for_push, owner, repo, changed_files)
+    await asyncio.to_thread(update_graph_for_push, owner, repo, changed_files, settings)
 
 
 async def handle_pr(payload: dict) -> None:
     action = payload.get("action")
+    installation_id = payload["installation"]["id"]
     if action == "closed":
         repository = payload["repository"]
         owner = repository["owner"]["login"]
         repo = repository["name"]
         pr_number = payload["pull_request"]["number"]
-        await asyncio.to_thread(delete_pr_graph, owner, repo, pr_number)
+        settings = await asyncio.to_thread(settings_for_installation, installation_id)
+        await asyncio.to_thread(delete_pr_graph, owner, repo, pr_number, settings)
         return
 
     if action not in {"opened", "synchronize", "reopened", "ready_for_review"}:
         return
 
-    installation_id = payload["installation"]["id"]
     repository = payload["repository"]
     owner = repository["owner"]["login"]
     repo = repository["name"]
@@ -141,11 +153,12 @@ async def handle_pr(payload: dict) -> None:
         logger.info("Skipping duplicate review for %s/%s PR #%s at %s", owner, repo, pr_number, head_sha)
         return
 
+    settings = await asyncio.to_thread(settings_for_installation, installation_id)
     github_client = get_github_client(installation_id)
     try:
         logger.info("Checking main graph for %s/%s before PR #%s", owner, repo, pr_number)
         main_progress = _LogProgressReporter(owner, repo, "Main graph")
-        main_source_count = await _ensure_main_graph(github_client, owner, repo, base_sha, main_progress)
+        main_source_count = await _ensure_main_graph(github_client, owner, repo, base_sha, main_progress, settings)
         if main_source_count is None:
             logger.info("Main graph already available for %s/%s", owner, repo)
         else:
@@ -161,7 +174,7 @@ async def handle_pr(payload: dict) -> None:
             repo,
             pr_number,
             changed_files,
-            None,
+            settings,
             pr_progress,
         )
         await _post_pr_status_comment(
@@ -173,7 +186,7 @@ async def handle_pr(payload: dict) -> None:
             f"PR graph ready with {pr_source_count} changed files; running review",
         )
         diff = _pull_request_diff(pr)
-        await review_and_post_pr(github_client, owner, repo, pr_number, diff)
+        await review_and_post_pr(github_client, owner, repo, pr_number, diff, settings)
         mark_review_posted(owner, repo, pr_number, head_sha)
         await _post_pr_status_comment(github_client, owner, repo, pr_number, head_sha, "Review complete")
     except Exception as exc:
@@ -207,12 +220,13 @@ async def _ensure_main_graph(
     repo: str,
     base_ref: str,
     on_progress: Callable[[str, int, int, str], None] | None = None,
+    settings: object | None = None,
 ) -> int | None:
-    if await asyncio.to_thread(code_graph_has_files, owner, repo):
+    if await asyncio.to_thread(code_graph_has_files, owner, repo, settings):
         return None
     logger.info("Main graph missing for %s/%s; bootstrapping from PR base %s", owner, repo, base_ref)
     files = await asyncio.to_thread(fetch_repository_files, github_client, owner, repo, base_ref)
-    return await asyncio.to_thread(build_repo_graph, owner, repo, files, on_progress)
+    return await asyncio.to_thread(build_repo_graph, owner, repo, files, on_progress, settings)
 
 
 async def _post_pr_status_comment(

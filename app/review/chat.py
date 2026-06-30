@@ -7,6 +7,7 @@ from app.config import Settings, get_settings
 from app.github.app import get_github_client
 from app.github.poster import post_issue_comment
 from app.graph.sdk import get_kg
+from app.provision.factory import settings_for_installation
 
 
 async def answer_comment(payload: dict, settings: Settings | None = None) -> str | None:
@@ -29,8 +30,9 @@ async def answer_comment(payload: dict, settings: Settings | None = None) -> str
     repo = repository["name"]
     issue_number = payload["issue"]["number"]
     installation_id = payload["installation"]["id"]
+    graph_settings = await asyncio.to_thread(settings_for_installation, installation_id)
 
-    answer = await asyncio.to_thread(lambda: str(get_kg(owner, repo).chat_session().ask(question)))
+    answer = await asyncio.to_thread(lambda: str(get_kg(owner, repo, settings=graph_settings).chat_session().ask(question)))
     github_client = await asyncio.to_thread(get_github_client, installation_id, settings)
     await asyncio.to_thread(
         post_issue_comment,

@@ -21,6 +21,9 @@ services:
     volumes:
       - ${GITHUB_PRIVATE_KEY_PATH:-./private-key.pem}:/app/private-key.pem:ro
       - falkordb_data:/data:ro
+      # Enable per-installation FalkorDB provisioning (GRAPHORA_PER_INSTALL_DB=true)
+      # by giving the app access to the host Docker daemon:
+      # - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   falkordb_data:

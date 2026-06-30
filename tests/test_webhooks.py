@@ -109,7 +109,7 @@ def test_dispatch_supports_workflow_run(monkeypatch):
 def test_ensure_main_graph_skips_existing_graph(monkeypatch):
     calls = []
 
-    monkeypatch.setattr(webhooks, "code_graph_has_files", lambda owner, repo: True)
+    monkeypatch.setattr(webhooks, "code_graph_has_files", lambda owner, repo, settings=None: True)
     monkeypatch.setattr(webhooks, "fetch_repository_files", lambda *args: calls.append("fetch"))
     monkeypatch.setattr(webhooks, "build_repo_graph", lambda *args: calls.append("build"))
 
@@ -122,13 +122,13 @@ def test_ensure_main_graph_skips_existing_graph(monkeypatch):
 def test_ensure_main_graph_bootstraps_missing_graph(monkeypatch):
     calls = []
 
-    monkeypatch.setattr(webhooks, "code_graph_has_files", lambda owner, repo: False)
+    monkeypatch.setattr(webhooks, "code_graph_has_files", lambda owner, repo, settings=None: False)
     monkeypatch.setattr(
         webhooks,
         "fetch_repository_files",
         lambda client, owner, repo, ref: calls.append(("fetch", ref)) or [{"path": "app.py", "content": "def a(): pass"}],
     )
-    monkeypatch.setattr(webhooks, "build_repo_graph", lambda owner, repo, files, on_progress=None: calls.append(("build", files)) or 1)
+    monkeypatch.setattr(webhooks, "build_repo_graph", lambda owner, repo, files, on_progress=None, settings=None: calls.append(("build", files)) or 1)
 
     result = asyncio.run(webhooks._ensure_main_graph("client", "octo", "repo", "base-sha"))
 

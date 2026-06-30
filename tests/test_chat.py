@@ -31,7 +31,8 @@ def test_answer_comment_posts_answer(monkeypatch, tmp_path):
             return FakeSession()
 
     posted = {}
-    monkeypatch.setattr(chat, "get_kg", lambda owner, repo: FakeKG())
+    monkeypatch.setattr(chat, "get_kg", lambda owner, repo, settings=None: FakeKG())
+    monkeypatch.setattr(chat, "settings_for_installation", lambda installation_id: None)
     monkeypatch.setattr(chat, "get_github_client", lambda installation_id, settings: "client")
     monkeypatch.setattr(
         chat,

@@ -5,6 +5,7 @@ PyJWT
 requests
 graphrag-sdk[litellm]
 falkordb
+docker
 tree-sitter
 tree-sitter-python
 tree-sitter-javascript
