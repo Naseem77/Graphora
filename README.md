@@ -1,6 +1,6 @@
 # GraphReview Bot
 
-GraphReview Bot is a GitHub App that builds FalkorDB knowledge graphs for repositories and uses GraphRAG context to review pull requests. It indexes the main branch, creates temporary PR overlay graphs, posts review summaries, and answers `@graphreview` questions in PR comments.
+GraphReview Bot is a GitHub App that builds FalkorDB knowledge graphs for repositories and uses the structural code graph to review pull requests. It indexes the main branch, creates temporary PR overlay graphs, posts review summaries, and answers `@graphreview` questions in PR comments.
 
 ## What it does
 
