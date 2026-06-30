@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from github import Github
 
+from app.config import Settings
+from app.graph.locks import graph_write_lock
 from app.graph.sdk import create_source, get_kg
 from app.graph.store import clear_code_graph, write_code_graph
 from app.state import mark_graph_build
@@ -16,30 +18,40 @@ logger = logging.getLogger(__name__)
 
 
 RepoFile = dict[str, str]
+ProgressCallback = Callable[[str, int, int, str], None]
 
 
-def build_repo_graph(owner: str, repo: str, files: list[RepoFile]) -> int:
-    parsed_files = [
-        parse_code_file(file["path"], file["content"])
-        for file in files
-        if is_supported_source_file(file["path"])
-    ]
+def build_repo_graph(
+    owner: str,
+    repo: str,
+    files: list[RepoFile],
+    on_progress: ProgressCallback | None = None,
+    settings: Settings | None = None,
+) -> int:
+    supported_files = [file for file in files if is_supported_source_file(file["path"])]
+    total = len(supported_files)
+    parsed_files = []
+    for index, file in enumerate(supported_files, start=1):
+        _report_progress(on_progress, "parsing", index, total, file["path"])
+        parsed_files.append(parse_code_file(file["path"], file["content"]))
     if not parsed_files:
         logger.info("No supported code files found for %s/%s", owner, repo)
         return 0
 
-    clear_code_graph(owner, repo)
-    write_code_graph(owner, repo, parsed_files)
+    with graph_write_lock(owner, repo, "main", settings):
+        clear_code_graph(owner, repo)
+        for index, parsed_file in enumerate(parsed_files, start=1):
+            write_code_graph(owner, repo, [parsed_file])
+            _report_progress(on_progress, "writing structural graph", index, total, parsed_file.path)
 
-    kg = get_kg(owner, repo)
-    sources = [
-        create_source(parsed_file.source_text)
-        for parsed_file in parsed_files
-    ]
-    kg.process_sources(sources)
-    mark_graph_build(owner, repo, "main", "built", len(sources))
-    logger.info("Built graph for %s/%s with %s source files", owner, repo, len(sources))
-    return len(sources)
+        kg = get_kg(owner, repo)
+        for index, parsed_file in enumerate(parsed_files, start=1):
+            _report_progress(on_progress, "ingesting GraphRAG", index, total, parsed_file.path)
+            kg.process_sources([create_source(parsed_file.source_text)])
+        mark_graph_build(owner, repo, "main", "built", len(parsed_files))
+    _report_progress(on_progress, "complete", total, total, "")
+    logger.info("Built graph for %s/%s with %s source files", owner, repo, len(parsed_files))
+    return len(parsed_files)
 
 
 def fetch_repository_files(github_client: "Github", owner: str, repo: str, ref: str | None = None) -> list[RepoFile]:
@@ -58,3 +70,14 @@ def fetch_repository_files(github_client: "Github", owner: str, repo: str, ref: 
         files.append({"path": item.path, "content": content})
 
     return files
+
+
+def _report_progress(
+    on_progress: ProgressCallback | None,
+    stage: str,
+    current: int,
+    total: int,
+    path: str,
+) -> None:
+    if on_progress is not None:
+        on_progress(stage, current, total, path)
