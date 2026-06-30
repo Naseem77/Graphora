@@ -13,12 +13,19 @@ logger = logging.getLogger(__name__)
 _provisioner: GraphProvisioner | None = None
 
 
-def get_provisioner(settings: Settings | None = None) -> GraphProvisioner | None:
-    """Return the configured provisioner, or None when per-installation DBs are off."""
+def get_provisioner(settings: Settings | None = None, force_refresh: bool = False) -> GraphProvisioner | None:
+    """Return the configured provisioner, or None when per-installation DBs are off.
+
+    When ``force_refresh`` is True the cached provisioner is discarded and a new
+    one is built from the supplied settings. This is useful after the FalkorDB
+    endpoint or credentials change at runtime.
+    """
     global _provisioner
     settings = settings or get_settings()
     if not settings.per_installation_db:
         return None
+    if force_refresh:
+        _provisioner = None
     if _provisioner is None:
         from app.provision.docker_provisioner import DockerProvisioner
 
