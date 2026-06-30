@@ -186,6 +186,21 @@ def delete_code_graph(
     _select_graph(owner, repo, settings, suffix).delete()
 
 
+def code_graph_has_files(
+    owner: str,
+    repo: str,
+    settings: Settings | None = None,
+    suffix: str = "main",
+) -> bool:
+    settings = settings or get_settings()
+    graph = _select_graph(owner, repo, settings, suffix)
+    result = graph.query("MATCH (file:File) RETURN count(file) LIMIT 1")
+    rows = getattr(result, "result_set", result) or []
+    if not rows:
+        return False
+    return int(rows[0][0] or 0) > 0
+
+
 def delete_file_subgraph(
     owner: str,
     repo: str,

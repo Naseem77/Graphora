@@ -5,9 +5,12 @@ from app.parser.treesitter import parse_code_file
 class FakeGraph:
     def __init__(self):
         self.queries = []
+        self.file_count = 0
 
     def query(self, query, params=None):
         self.queries.append((query, params or {}))
+        if "RETURN count(file)" in query:
+            return type("Result", (), {"result_set": [[self.file_count]]})()
 
 
 def test_write_code_graph_creates_files_symbols_and_imports(monkeypatch, tmp_path):
@@ -84,3 +87,14 @@ def test_select_graph_uses_suffix(monkeypatch, tmp_path):
 
     assert isinstance(graph, FakeGraph)
     assert selected["name"] == "graph:octo:repo:pr:7"
+
+
+def test_code_graph_has_files_checks_file_count(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": fake_graph)
+
+    assert not store.code_graph_has_files("octo", "repo")
+
+    fake_graph.file_count = 2
+
+    assert store.code_graph_has_files("octo", "repo")
