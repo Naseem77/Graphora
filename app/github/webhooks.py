@@ -20,7 +20,7 @@ from app.graph.updater import update_graph_for_push
 from app.provision.factory import destroy_installation, provision_installation, settings_for_installation
 from app.review.chat import answer_comment
 from app.review.reviewer import review_and_post_pr
-from app.state import is_review_paused, mark_delivery, mark_review_posted, review_already_processed
+from app.state import append_build_log, is_review_paused, mark_delivery, mark_review_posted, review_already_processed
 
 
 logger = logging.getLogger(__name__)
@@ -313,6 +313,13 @@ def _status_progress_text(status: str) -> str:
     return status.split(":", 1)[1].strip() if ":" in status else "-"
 
 
+def _safe_append_build_log(owner: str, repo: str, graph_scope: str, line: str) -> None:
+    try:
+        append_build_log(owner, repo, graph_scope, line)
+    except Exception as exc:  # noqa: BLE001 - logging must never break a build
+        logger.debug("Failed to persist build log for %s/%s %s: %s", owner, repo, graph_scope, exc)
+
+
 class _LogProgressReporter:
     """Reports graph build progress to the server terminal logs only.
 
@@ -330,6 +337,7 @@ class _LogProgressReporter:
     def __call__(self, stage: str, current: int, total: int, path: str) -> None:
         if stage == "complete":
             logger.info("%s build complete for %s/%s (%s files)", self.label, self.owner, self.repo, total)
+            _safe_append_build_log(self.owner, self.repo, "main", f"{stage} ({total} files)")
             return
         if current - self.last_logged < self.file_interval and current not in (1, total):
             return
@@ -344,6 +352,7 @@ class _LogProgressReporter:
             stage,
             path,
         )
+        _safe_append_build_log(self.owner, self.repo, "main", f"{current}/{total} {stage} {path}".strip())
 
 
 class _PrProgressReporter:
@@ -381,6 +390,7 @@ class _PrProgressReporter:
         marker = _pr_status_marker(self.pr_number, self.head_sha)
         body = _pr_status_body(f"{label} progress: {progress}")
         _post_pr_status_comment_sync(self.github_client, self.owner, self.repo, self.pr_number, marker, body)
+        _safe_append_build_log(self.owner, self.repo, f"pr:{self.pr_number}", f"{current}/{total} {stage} {path}".strip())
         self.last_update_at = time.monotonic()
         self.last_file_count = current
 

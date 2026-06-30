@@ -156,6 +156,58 @@ def list_graph_builds(settings: Settings | None = None) -> list[dict]:
     return builds
 
 
+def append_build_log(owner: str, repo: str, graph_scope: str, line: str, settings: Settings | None = None, max_lines: int = 100) -> None:
+    graph = _select_state_graph(settings or get_settings())
+    entry = f"{_now()} {line}"
+    graph.query(
+        """
+        MERGE (build:GraphBuild {id: $id})
+        SET build.owner = $owner,
+            build.repo = $repo,
+            build.graph_scope = $graph_scope,
+            build.updated_at = $updated_at
+        WITH build,
+             (CASE WHEN build.logs IS NULL THEN [] ELSE build.logs END) + [$entry] AS combined
+        SET build.logs = CASE WHEN size(combined) > $max_lines THEN combined[-$max_lines..] ELSE combined END
+        """,
+        {
+            "id": _graph_build_id(owner, repo, graph_scope),
+            "owner": owner,
+            "repo": repo,
+            "graph_scope": graph_scope,
+            "updated_at": _now(),
+            "entry": entry,
+            "max_lines": max_lines,
+        },
+    )
+
+
+def get_build_detail(owner: str, repo: str, graph_scope: str, settings: Settings | None = None) -> dict | None:
+    graph = _select_state_graph(settings or get_settings())
+    result = graph.query(
+        """
+        MATCH (build:GraphBuild {id: $id})
+        RETURN build.owner, build.repo, build.graph_scope,
+               build.status, build.source_count, build.updated_at, build.logs
+        LIMIT 1
+        """,
+        {"id": _graph_build_id(owner, repo, graph_scope)},
+    )
+    rows = getattr(result, "result_set", result) or []
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "owner": row[0],
+        "repo": row[1],
+        "graph_scope": row[2],
+        "status": row[3],
+        "source_count": row[4],
+        "updated_at": row[5],
+        "logs": row[6] or [],
+    }
+
+
 def set_review_paused(owner: str, repo: str, paused: bool, settings: Settings | None = None) -> None:
     graph = _select_state_graph(settings or get_settings())
     graph.query(

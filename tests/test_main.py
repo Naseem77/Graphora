@@ -58,6 +58,45 @@ def test_status_endpoint_survives_db_error(monkeypatch):
     assert response.json() == {"builds": []}
 
 
+def test_status_detail_endpoint(monkeypatch):
+    import app.main as main
+
+    monkeypatch.setattr(
+        main,
+        "get_build_detail",
+        lambda owner, repo, scope: {"owner": owner, "repo": repo, "graph_scope": scope, "status": "built", "source_count": 2, "updated_at": "t", "logs": ["1/2 parsing"]},
+    )
+    monkeypatch.setattr(
+        main,
+        "code_graph_stats",
+        lambda owner, repo, suffix: {"node_counts": {"File": 2}, "node_total": 2, "relationship_count": 1, "files": ["a.py"]},
+    )
+    client = TestClient(app)
+
+    response = client.get("/status/detail", params={"owner": "o", "repo": "r", "scope": "pr:5"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["build"]["logs"] == ["1/2 parsing"]
+    assert data["stats"]["files"] == ["a.py"]
+
+
+def test_status_detail_survives_errors(monkeypatch):
+    import app.main as main
+
+    def _boom(*a, **k):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(main, "get_build_detail", _boom)
+    monkeypatch.setattr(main, "code_graph_stats", _boom)
+    client = TestClient(app)
+
+    response = client.get("/status/detail", params={"owner": "o", "repo": "r", "scope": "main"})
+
+    assert response.status_code == 200
+    assert response.json() == {"build": None, "stats": None}
+
+
 def test_dashboard_served():
     client = TestClient(app)
 

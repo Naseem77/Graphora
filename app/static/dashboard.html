@@ -66,6 +66,31 @@
     .empty { color: var(--muted); padding: 40px; text-align: center; }
     .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background: var(--done); margin-right:6px; animation: pulse 2s infinite; }
     @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+    tr.build-row { cursor: pointer; }
+    tr.build-row:hover td { background: #1c2330; }
+    .caret { display:inline-block; width:12px; color: var(--muted); transition: transform 0.15s; }
+    tr.build-row.open .caret { transform: rotate(90deg); }
+    .detail td { background: #0b0f14; padding: 0; }
+    .detail-inner { padding: 16px 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .detail-inner h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+    .stat-grid { display: grid; grid-template-columns: auto auto; gap: 2px 16px; font-size: 13px; }
+    .stat-grid .k { color: var(--muted); }
+    .logs {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      background: #010409;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      max-height: 240px;
+      overflow: auto;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+    .files { font-size: 12px; max-height: 160px; overflow: auto; }
+    .files div { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); padding: 1px 0; }
+    .loading-detail { color: var(--muted); padding: 8px 0; }
+    @media (max-width: 720px) { .detail-inner { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -77,6 +102,7 @@
   <table>
     <thead>
       <tr>
+        <th style="width:24px"></th>
         <th>Repository</th>
         <th>Scope</th>
         <th>Status</th>
@@ -85,14 +111,16 @@
       </tr>
     </thead>
     <tbody id="rows">
-      <tr><td class="empty" colspan="5">Loading…</td></tr>
+      <tr><td class="empty" colspan="6">Loading…</td></tr>
     </tbody>
   </table>
 
   <script>
+    const openRows = new Set();
+
     function badgeClass(status) {
       const s = (status || "").toLowerCase();
-      if (s.includes("done") || s.includes("ready") || s.includes("complete")) return "done";
+      if (s.includes("done") || s.includes("ready") || s.includes("complete") || s.includes("built")) return "done";
       if (s.includes("run") || s.includes("build") || s.includes("progress")) return "running";
       if (s.includes("fail") || s.includes("error")) return "failed";
       return "pending";
@@ -105,24 +133,93 @@
       return d.toLocaleString();
     }
 
+    function esc(s) {
+      return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+    }
+
+    function rowKey(b) { return `${b.owner}/${b.repo}/${b.graph_scope}`; }
+
+    async function loadDetail(b, container) {
+      const params = new URLSearchParams({ owner: b.owner, repo: b.repo, scope: b.graph_scope });
+      container.innerHTML = '<div class="loading-detail">Loading details…</div>';
+      try {
+        const res = await fetch("/status/detail?" + params.toString(), { cache: "no-store" });
+        const data = await res.json();
+        const stats = data.stats || {};
+        const build = data.build || {};
+        const counts = stats.node_counts || {};
+        const countRows = Object.keys(counts).sort().map(k => `<span class="k">${esc(k)}</span><span>${counts[k]}</span>`).join("");
+        const logs = (build.logs || []).join("\n") || "No logs recorded.";
+        const files = (stats.files || []);
+        const filesHtml = files.length ? files.map(f => `<div>${esc(f)}</div>`).join("") : '<div class="k">No files.</div>';
+        container.innerHTML = `
+          <div class="detail-inner">
+            <div>
+              <h3>Graph stats (${esc(b.graph_scope)})</h3>
+              <div class="stat-grid">
+                <span class="k">Nodes total</span><span>${stats.node_total ?? "—"}</span>
+                <span class="k">Relationships</span><span>${stats.relationship_count ?? "—"}</span>
+                ${countRows}
+              </div>
+              <h3 style="margin-top:14px">Files (${files.length})</h3>
+              <div class="files">${filesHtml}</div>
+            </div>
+            <div>
+              <h3>Build log</h3>
+              <div class="logs">${esc(logs)}</div>
+            </div>
+          </div>`;
+      } catch (e) {
+        container.innerHTML = '<div class="loading-detail">Failed to load details.</div>';
+      }
+    }
+
+    function toggleRow(b, tr) {
+      const key = rowKey(b);
+      const detail = tr.nextElementSibling;
+      if (openRows.has(key)) {
+        openRows.delete(key);
+        tr.classList.remove("open");
+        detail.style.display = "none";
+      } else {
+        openRows.add(key);
+        tr.classList.add("open");
+        detail.style.display = "table-row";
+        loadDetail(b, detail.querySelector(".detail-content"));
+      }
+    }
+
     async function refresh() {
       try {
         const res = await fetch("/status", { cache: "no-store" });
         const data = await res.json();
         const builds = data.builds || [];
         const tbody = document.getElementById("rows");
+        tbody.innerHTML = "";
         if (builds.length === 0) {
-          tbody.innerHTML = '<tr><td class="empty" colspan="5">No graph builds yet. Trigger an install or open a PR.</td></tr>';
+          tbody.innerHTML = '<tr><td class="empty" colspan="6">No graph builds yet. Trigger an install or open a PR.</td></tr>';
         } else {
-          tbody.innerHTML = builds.map(b => `
-            <tr>
-              <td>${b.owner || "?"}/${b.repo || "?"}</td>
-              <td class="scope">${b.graph_scope || "—"}</td>
-              <td><span class="badge ${badgeClass(b.status)}">${b.status || "—"}</span></td>
+          builds.forEach(b => {
+            const key = rowKey(b);
+            const isOpen = openRows.has(key);
+            const tr = document.createElement("tr");
+            tr.className = "build-row" + (isOpen ? " open" : "");
+            tr.innerHTML = `
+              <td><span class="caret">▶</span></td>
+              <td>${esc(b.owner)}/${esc(b.repo)}</td>
+              <td class="scope">${esc(b.graph_scope)}</td>
+              <td><span class="badge ${badgeClass(b.status)}">${esc(b.status) || "—"}</span></td>
               <td>${b.source_count ?? "—"}</td>
-              <td>${fmtTime(b.updated_at)}</td>
-            </tr>
-          `).join("");
+              <td>${fmtTime(b.updated_at)}</td>`;
+            const detail = document.createElement("tr");
+            detail.className = "detail";
+            detail.style.display = isOpen ? "table-row" : "none";
+            detail.innerHTML = '<td colspan="6"><div class="detail-content"></div></td>';
+            tr.addEventListener("click", () => toggleRow(b, tr));
+            tbody.appendChild(tr);
+            tbody.appendChild(detail);
+            if (isOpen) loadDetail(b, detail.querySelector(".detail-content"));
+          });
         }
         document.getElementById("updated").textContent = "as of " + new Date().toLocaleTimeString();
       } catch (e) {

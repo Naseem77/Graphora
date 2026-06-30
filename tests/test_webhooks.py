@@ -173,10 +173,10 @@ def test_pr_status_marker_and_body():
 
 
 def test_pr_status_body_shows_pr_progress():
-    body = webhooks._pr_status_body("PR graph progress: 5 / 42 files - ingesting GraphRAG: `app/main.py`")
+    body = webhooks._pr_status_body("PR graph progress: 5 / 42 files - writing structural graph: `app/main.py`")
 
     assert "Main repository graph" not in body
-    assert "| PR overlay graph | **RUNNING** | 5 / 42 files - ingesting GraphRAG: `app/main.py` |" in body
+    assert "| PR overlay graph | **RUNNING** | 5 / 42 files - writing structural graph: `app/main.py` |" in body
     assert "| Review agent | **PENDING** | - |" in body
 
 

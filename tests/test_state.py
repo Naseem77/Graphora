@@ -13,6 +13,7 @@ class FakeGraph:
         self.deliveries = set()
         self.reviews = set()
         self.repo_paused = {}
+        self.build_logs = {}
 
     def query(self, query, params=None):
         params = params or {}
@@ -36,6 +37,12 @@ class FakeGraph:
             return FakeResult([[params["id"]]] if params["id"] in self.reviews else [])
         if "MERGE (debug:CIDebug" in query:
             self.reviews.add(params["id"])
+        if "MERGE (build:GraphBuild" in query and "build.logs" in query:
+            self.build_logs.setdefault(params["id"], []).append(params["entry"])
+            return FakeResult()
+        if "MATCH (build:GraphBuild {id: $id})" in query:
+            logs = self.build_logs.get(params["id"], [])
+            return FakeResult([["o", "r", "main", "built", 3, "2026-01-01T00:00:00", logs]])
         if "MATCH (build:GraphBuild" in query:
             return FakeResult([["o", "r", "main", "built", 3, "2026-01-01T00:00:00"]])
         return FakeResult()
@@ -109,6 +116,29 @@ def test_list_graph_builds(monkeypatch):
             "updated_at": "2026-01-01T00:00:00",
         }
     ]
+
+
+def test_append_and_get_build_detail(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(state, "_select_state_graph", lambda settings: fake_graph)
+    settings = _settings()
+
+    assert state.get_build_detail("o", "r", "main", settings)["logs"] == []
+    state.append_build_log("o", "r", "main", "1/2 parsing a.py", settings)
+    state.append_build_log("o", "r", "main", "complete", settings)
+
+    detail = state.get_build_detail("o", "r", "main", settings)
+    assert detail["graph_scope"] == "main"
+    assert any("parsing a.py" in line for line in detail["logs"])
+    assert any("complete" in line for line in detail["logs"])
+
+
+def test_get_build_detail_missing_returns_none(monkeypatch):
+    fake_graph = FakeGraph()
+    fake_graph.query = lambda q, p=None: FakeResult([])
+    monkeypatch.setattr(state, "_select_state_graph", lambda settings: fake_graph)
+
+    assert state.get_build_detail("o", "r", "pr:9", _settings()) is None
 
 
 def test_ci_debug_idempotency_state(monkeypatch):

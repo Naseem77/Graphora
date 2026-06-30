@@ -8,7 +8,8 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from app.github.webhooks import dispatch_webhook, verify_signature
-from app.state import init_state, list_graph_builds
+from app.graph.store import code_graph_stats
+from app.state import get_build_detail, init_state, list_graph_builds
 
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +40,21 @@ async def status() -> dict[str, list]:
         logger.warning("Failed to read graph build status: %s", exc)
         builds = []
     return {"builds": builds}
+
+
+@app.get("/status/detail")
+async def status_detail(owner: str, repo: str, scope: str) -> dict:
+    try:
+        build = get_build_detail(owner, repo, scope)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to read build detail for %s/%s %s: %s", owner, repo, scope, exc)
+        build = None
+    try:
+        stats = code_graph_stats(owner, repo, suffix=scope)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to read graph stats for %s/%s %s: %s", owner, repo, scope, exc)
+        stats = None
+    return {"build": build, "stats": stats}
 
 
 @app.get("/dashboard")
