@@ -47,8 +47,8 @@ def build_pr_graph(
             return 0
 
         for index, parsed_file in enumerate(parsed_files, start=1):
-            write_code_graph(owner, repo, [parsed_file], settings, suffix)
             _report_progress(on_progress, "writing structural graph", index, total, parsed_file.path)
+        write_code_graph(owner, repo, parsed_files, settings, suffix)
         mark_graph_build(owner, repo, suffix, "built", len(parsed_files), settings)
     _report_progress(on_progress, "complete", total, total, "")
     logger.info("Built PR graph for %s/%s PR #%s with %s files", owner, repo, pr_number, len(parsed_files))

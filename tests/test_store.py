@@ -123,6 +123,90 @@ def test_code_graph_stats_aggregates_nodes_and_files(monkeypatch):
     assert stats["files"] == ["a.py", "b.py"]
 
 
+def test_module_candidate_paths_resolves_python_dotted_imports():
+    assert "app/graph/store.py" in store._module_candidate_paths("app.graph.store")
+    assert "app/provision/__init__.py" in store._module_candidate_paths("app.provision")
+
+
+def test_module_candidate_paths_resolves_relative_path_imports():
+    candidates = store._module_candidate_paths("./utils")
+    assert "utils.ts" in candidates
+    assert "utils.js" in candidates
+    assert "utils/index.js" in candidates
+
+
+def test_module_candidate_paths_empty_for_blank_import():
+    assert store._module_candidate_paths("") == []
+
+
+def test_write_code_graph_resolves_calls_across_files(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": fake_graph)
+
+    caller = parse_code_file(
+        "app/api.py",
+        "from app.auth import login\n\ndef handler():\n    return login()\n",
+    )
+    callee = parse_code_file(
+        "app/auth.py",
+        "def login():\n    return True\n",
+    )
+
+    store.write_code_graph("octo", "repo", [caller, callee])
+
+    call_queries = [(q, p) for q, p in fake_graph.queries if "CALLS" in q and "MERGE (caller" in q]
+    assert len(call_queries) == 1
+    query, params = call_queries[0]
+    assert params["callee"] == "login"
+    assert "app/auth.py" in params["import_paths"]
+    assert "CASE WHEN callee.path = $path THEN 'same_file' ELSE 'import'" in query
+
+
+def test_write_code_graph_writes_all_symbols_before_any_calls(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": fake_graph)
+
+    caller = parse_code_file(
+        "app/api.py",
+        "from app.auth import login\n\ndef handler():\n    return login()\n",
+    )
+    callee = parse_code_file(
+        "app/auth.py",
+        "def login():\n    return True\n",
+    )
+
+    # caller listed first: if calls were resolved per-file (old behavior) the
+    # callee's Function node would not exist yet when handler's CALLS edge is
+    # written. The fix defers all CALLS writes to a second pass.
+    store.write_code_graph("octo", "repo", [caller, callee])
+
+    query_order = [q for q, _ in fake_graph.queries]
+    last_symbol_index = max(i for i, q in enumerate(query_order) if "MERGE (symbol:Function" in q)
+    first_calls_index = min(i for i, q in enumerate(query_order) if "MERGE (caller" in q)
+    assert first_calls_index > last_symbol_index
+
+
+def test_write_code_graph_reports_progress_per_file(monkeypatch):
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(store, "_select_graph", lambda owner, repo, settings, suffix="main": fake_graph)
+    progress = []
+
+    parsed_a = parse_code_file("a.py", "def a():\n    pass\n")
+    parsed_b = parse_code_file("b.py", "def b():\n    pass\n")
+
+    store.write_code_graph(
+        "octo",
+        "repo",
+        [parsed_a, parsed_b],
+        on_progress=lambda stage, current, total, path: progress.append((stage, current, total, path)),
+    )
+
+    assert progress == [
+        ("writing structural graph", 1, 2, "a.py"),
+        ("writing structural graph", 2, 2, "b.py"),
+    ]
+
+
 def test_symbol_impact_collects_callers_callees_tests(monkeypatch):
     class ImpactGraph:
         def query(self, query, params=None):

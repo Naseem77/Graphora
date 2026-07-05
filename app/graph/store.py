@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Callable
 
 from app.config import Settings, get_settings
 from app.graph.sdk import graph_name
 from app.parser.treesitter import ParsedFile
+
+
+ProgressCallback = Callable[[str, int, int, str], None]
+
+_CANDIDATE_EXTENSIONS = (".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java")
 
 
 def write_code_graph(
@@ -13,10 +19,16 @@ def write_code_graph(
     parsed_files: list[ParsedFile],
     settings: Settings | None = None,
     suffix: str = "main",
+    on_progress: ProgressCallback | None = None,
 ) -> int:
     settings = settings or get_settings()
     graph = _select_graph(owner, repo, settings, suffix)
-    for parsed_file in parsed_files:
+    total = len(parsed_files)
+
+    # Phase 1: write files, modules, and symbols for the whole batch first. CALLS
+    # resolution (phase 2) needs every symbol in this batch to already exist,
+    # otherwise a caller processed before its callee's file would never resolve.
+    for index, parsed_file in enumerate(parsed_files, start=1):
         delete_file_subgraph(owner, repo, parsed_file.path, settings, suffix)
         file_hash = _hash_text(parsed_file.source_text)
         graph.query(
@@ -100,21 +112,6 @@ def write_code_graph(
                     "stable_key": f"{parsed_file.path}:{symbol.kind}:{symbol.name}",
                 },
             )
-        for call in parsed_file.calls:
-            graph.query(
-                """
-                MATCH (caller:Function {stable_key: $caller_key})
-                MATCH (callee:Function {path: $path, name: $callee})
-                MERGE (caller)-[:CALLS {line: $line}]->(callee)
-                MERGE (caller)-[:DEPENDS_ON]->(callee)
-                """,
-                {
-                    "caller_key": f"{parsed_file.path}:Function:{call.caller}",
-                    "path": parsed_file.path,
-                    "callee": call.callee,
-                    "line": call.line,
-                },
-            )
         if parsed_file.language == "markdown":
             doc_id = _doc_id(owner, repo, parsed_file.path)
             graph.query(
@@ -161,6 +158,50 @@ def write_code_graph(
                         "graph_scope": suffix,
                     },
                 )
+        if on_progress is not None:
+            on_progress("writing structural graph", index, total, parsed_file.path)
+
+    # Phase 2: resolve CALLS edges now that every symbol in the batch (plus
+    # anything already persisted from earlier builds) exists. A callee is
+    # resolved either in the caller's own file, or in a file that the caller's
+    # file imports (import name -> candidate file path). This intentionally
+    # does NOT fall back to matching a function name anywhere in the repo,
+    # since that would create false-positive cross-file edges between
+    # unrelated same-named functions.
+    for parsed_file in parsed_files:
+        import_paths = _import_candidate_paths(parsed_file.imports)
+        for import_name in parsed_file.imports:
+            for target_path in _module_candidate_paths(import_name):
+                graph.query(
+                    """
+                    MATCH (module:Module {id: $module_id})
+                    MATCH (target:File {path: $target_path})
+                    MERGE (module)-[:RESOLVES_TO]->(target)
+                    """,
+                    {
+                        "module_id": _module_id(owner, repo, import_name),
+                        "target_path": target_path,
+                    },
+                )
+        for call in parsed_file.calls:
+            graph.query(
+                """
+                MATCH (caller:Function {stable_key: $caller_key})
+                MATCH (callee:Function {name: $callee})
+                WHERE callee.path = $path OR callee.path IN $import_paths
+                MERGE (caller)-[r:CALLS]->(callee)
+                SET r.line = $line,
+                    r.resolution = CASE WHEN callee.path = $path THEN 'same_file' ELSE 'import' END
+                MERGE (caller)-[:DEPENDS_ON]->(callee)
+                """,
+                {
+                    "caller_key": f"{parsed_file.path}:Function:{call.caller}",
+                    "path": parsed_file.path,
+                    "callee": call.callee,
+                    "line": call.line,
+                    "import_paths": import_paths,
+                },
+            )
     return len(parsed_files)
 
 
@@ -377,6 +418,35 @@ def _doc_id(owner: str, repo: str, path: str) -> str:
 
 def _doc_section_id(owner: str, repo: str, stable_key: str) -> str:
     return f"{owner}/{repo}:doc-section:{stable_key}"
+
+
+def _module_candidate_paths(import_name: str) -> list[str]:
+    """Best-effort mapping from an import string to candidate internal file paths.
+
+    Handles Python dotted imports (``app.graph.store`` -> ``app/graph/store.py``)
+    and path-style imports (``./utils`` -> ``utils.ts``/``utils.js``/...). This is
+    intentionally conservative: candidates are only used to MATCH an existing
+    ``File`` node, so an import that doesn't resolve to a real file in the repo
+    simply yields no match instead of a false positive.
+    """
+    normalized = import_name.strip().lstrip("./")
+    if not normalized:
+        return []
+    base = normalized.replace(".", "/") if "." in normalized and "/" not in normalized else normalized
+
+    candidates: set[str] = set()
+    for ext in _CANDIDATE_EXTENSIONS:
+        candidates.add(f"{base}{ext}")
+        candidates.add(f"{base}/__init__{ext}")
+        candidates.add(f"{base}/index{ext}")
+    return sorted(candidates)
+
+
+def _import_candidate_paths(import_names: list[str]) -> list[str]:
+    paths: set[str] = set()
+    for import_name in import_names:
+        paths.update(_module_candidate_paths(import_name))
+    return sorted(paths)
 
 
 def _hash_text(text: str) -> str:

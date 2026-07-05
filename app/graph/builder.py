@@ -40,8 +40,8 @@ def build_repo_graph(
     with graph_write_lock(owner, repo, "main", settings):
         clear_code_graph(owner, repo)
         for index, parsed_file in enumerate(parsed_files, start=1):
-            write_code_graph(owner, repo, [parsed_file])
             _report_progress(on_progress, "writing structural graph", index, total, parsed_file.path)
+        write_code_graph(owner, repo, parsed_files)
         mark_graph_build(owner, repo, "main", "built", len(parsed_files))
     _report_progress(on_progress, "complete", total, total, "")
     logger.info("Built graph for %s/%s with %s source files", owner, repo, len(parsed_files))
