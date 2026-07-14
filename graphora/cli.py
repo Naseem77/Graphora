@@ -128,6 +128,22 @@ def cmd_serve_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_skill(args: argparse.Namespace) -> int:
+    from graphora.skills import install_skill, list_agents
+
+    if args.list:
+        print("\n".join(list_agents()))
+        return 0
+    agents = None if not args.agents or args.agents == ["all"] else args.agents
+    try:
+        written = install_skill(args.repo, agents)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps({"repo": str(Path(args.repo).resolve()), "written": written}, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="graphora", description="Deterministic code knowledge graph tool")
     parser.add_argument("--version", action="version", version=f"graphora {__version__}")
@@ -185,6 +201,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_mcp = sub.add_parser("serve-mcp", parents=[common], help="Serve the graph as an MCP stdio server")
     p_mcp.set_defaults(func=cmd_serve_mcp)
+
+    p_skill = sub.add_parser("install-skill", help="Install the Graphora skill/rule for AI coding agents")
+    p_skill.add_argument("agents", nargs="*", help="Agent names, or 'all' (default: all)")
+    p_skill.add_argument("--repo", default=".", help="Repository root to install into (default: cwd)")
+    p_skill.add_argument("--list", action="store_true", help="List supported agents")
+    p_skill.set_defaults(func=cmd_install_skill)
 
     return parser
 
