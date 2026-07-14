@@ -20,11 +20,11 @@ import sys
 from pathlib import Path
 
 from graphora import __version__
-from graphora.store import GraphStore
+from graphora.store import open_store
 
 
-def _store(args: argparse.Namespace) -> GraphStore:
-    return GraphStore(args.project, host=args.host, port=args.port)
+def _store(args: argparse.Namespace):
+    return open_store(args.project, backend=args.backend, host=args.host, port=args.port)
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -36,9 +36,10 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     root = Path(args.path).resolve()
     project = args.project or root.name
-    store = index_repository(root, project=project, host=args.host, port=args.port, on_progress=progress)
+    store = open_store(project, backend=args.backend, host=args.host, port=args.port)
+    index_repository(root, project=project, store=store, on_progress=progress)
     sys.stderr.write("\n")
-    print(json.dumps({"project": project, "graph": store.graph_name, **store.stats()}, indent=2))
+    print(json.dumps({"project": project, "graph": store.graph_name, "backend": store.backend, **store.stats()}, indent=2))
     return 0
 
 
@@ -81,7 +82,7 @@ def cmd_risk_mine(args: argparse.Namespace) -> int:
 
     root = Path(args.path).resolve()
     project = args.project or root.name
-    store = GraphStore(project, host=args.host, port=args.port)
+    store = open_store(project, backend=args.backend, host=args.host, port=args.port)
     stats = mine_risk_memory(store, root, since=args.since, max_commits=args.max_commits)
     print(json.dumps(stats.__dict__, indent=2))
     return 0
@@ -111,7 +112,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
 
     root = Path(args.path).resolve()
     project = args.project or root.name
-    store = GraphStore(project, host=args.host, port=args.port)
+    store = open_store(project, backend=args.backend, host=args.host, port=args.port)
     symbols = [s for s in (args.symbols or "").split(",") if s] or None
     result = run_benchmark(store, root, symbols=symbols)
     print(result.render())
@@ -123,7 +124,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
 def cmd_serve_mcp(args: argparse.Namespace) -> int:
     from graphora.mcp_server import serve
 
-    serve(project=args.project, host=args.host, port=args.port)
+    serve(project=args.project, host=args.host, port=args.port, backend=args.backend)
     return 0
 
 
@@ -135,6 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--project", default=None, help="Graph project name (default: directory name)")
     common.add_argument("--host", default="localhost", help="FalkorDB host")
     common.add_argument("--port", type=int, default=6379, help="FalkorDB port")
+    common.add_argument(
+        "--backend",
+        choices=["auto", "falkordb", "embedded"],
+        default="auto",
+        help="Graph storage: FalkorDB server, embedded JSON (no Docker), or auto-detect (default)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 

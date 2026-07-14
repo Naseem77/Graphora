@@ -50,7 +50,7 @@ def mine_risk_memory(
     """Mine fix/revert history from git into the graph. Idempotent per commit."""
     repo_root = Path(repo_root).resolve()
     commits = _list_fix_commits(repo_root, since, max_commits)
-    known = {row[0] for row in store.query("MATCH (c:FixCommit) RETURN c.sha")}
+    known = store.known_fix_shas()
 
     symbols_annotated = 0
     files_touched = 0
@@ -58,36 +58,12 @@ def mine_risk_memory(
         if sha in known:
             continue
         kind = "revert" if _REVERT_RE.search(subject) else "fix"
-        store.query(
-            "MERGE (c:FixCommit {sha: $sha}) SET c.date = $date, c.subject = $subject, c.kind = $kind",
-            {"sha": sha, "date": date, "subject": subject[:300], "kind": kind},
-        )
+        store.upsert_fix_commit(sha, date, subject, kind)
         diff = _commit_diff(repo_root, sha)
         for path, symbol_names in _attribute_diff(diff).items():
-            touched = store.query(
-                """
-                MATCH (f:File {path: $path}), (c:FixCommit {sha: $sha})
-                MERGE (c)-[:TOUCHED]->(f)
-                RETURN f.path
-                """,
-                {"path": path, "sha": sha},
-            )
-            files_touched += len(touched)
+            files_touched += store.touch_file(sha, path)
             for name in symbol_names:
-                rows = store.query(
-                    """
-                    MATCH (s {path: $path, name: $name}), (c:FixCommit {sha: $sha})
-                    WHERE s:Function OR s:Class
-                    MERGE (c)-[:FIXED]->(s)
-                    SET s.fix_count = coalesce(s.fix_count, 0) + 1,
-                        s.last_broke_at =
-                            CASE WHEN coalesce(s.last_broke_at, '') < $date THEN $date
-                                 ELSE s.last_broke_at END
-                    RETURN s.name
-                    """,
-                    {"path": path, "name": name, "sha": sha, "date": date},
-                )
-                symbols_annotated += len(rows)
+                symbols_annotated += store.record_symbol_fix(path, name, sha, date)
 
     _recompute_risk_scores(store)
     return RiskStats(
@@ -100,19 +76,7 @@ def mine_risk_memory(
 
 def risk_report(store: GraphStore, limit: int = 15) -> list[dict]:
     """The riskiest symbols in the graph, with caller counts for blast context."""
-    rows = store.query(
-        """
-        MATCH (s)
-        WHERE (s:Function OR s:Class) AND coalesce(s.fix_count, 0) > 0
-        OPTIONAL MATCH (caller:Function)-[:CALLS]->(s)
-        WITH s, count(DISTINCT caller) AS caller_count
-        RETURN s.name, s.path, s.line, coalesce(s.fix_count, 0),
-               coalesce(s.last_broke_at, ''), coalesce(s.risk_score, 0.0), caller_count
-        ORDER BY coalesce(s.risk_score, 0.0) DESC, coalesce(s.fix_count, 0) DESC
-        LIMIT $limit
-        """,
-        {"limit": limit},
-    )
+    rows = store.risky_symbols(limit=limit)
     return [
         {
             "name": r[0],
@@ -145,23 +109,8 @@ def compute_risk_score(fix_count: int, last_broke_at: str, now: datetime | None 
 
 
 def _recompute_risk_scores(store: GraphStore) -> None:
-    rows = store.query(
-        """
-        MATCH (s)
-        WHERE (s:Function OR s:Class) AND coalesce(s.fix_count, 0) > 0
-        RETURN s.path, s.name, s.fix_count, coalesce(s.last_broke_at, '')
-        """
-    )
-    for path, name, fix_count, last_broke_at in rows:
-        score = compute_risk_score(int(fix_count), str(last_broke_at))
-        store.query(
-            """
-            MATCH (s {path: $path, name: $name})
-            WHERE s:Function OR s:Class
-            SET s.risk_score = $score
-            """,
-            {"path": path, "name": name, "score": score},
-        )
+    for path, name, fix_count, last_broke_at in store.symbols_with_fixes():
+        store.set_risk_score(path, name, compute_risk_score(int(fix_count), str(last_broke_at)))
 
 
 # --- git plumbing (read-only, deterministic) ---------------------------------

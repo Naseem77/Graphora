@@ -16,6 +16,8 @@ _LAZY = {
     "extract_symbols_from_diff": "graphora.parser",
     "ParsedFile": "graphora.parser",
     "GraphStore": "graphora.store",
+    "open_store": "graphora.store",
+    "EmbeddedGraphStore": "graphora.embedded",
     "index_repository": "graphora.indexer",
     "update_files": "graphora.indexer",
     "blast_radius": "graphora.blast",

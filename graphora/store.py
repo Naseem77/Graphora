@@ -17,6 +17,8 @@ from graphora.parser import AMBIGUOUS, EXTRACTED, INFERRED, ParsedFile
 class GraphStore:
     """A named code graph for one project inside FalkorDB."""
 
+    backend = "falkordb"
+
     def __init__(self, project: str, host: str = "localhost", port: int = 6379, graph: Any | None = None):
         self.project = project
         if graph is not None:
@@ -121,6 +123,172 @@ class GraphStore:
         rows = self.query("MATCH (f:File) RETURN count(f)")
         return bool(rows and int(rows[0][0]) > 0)
 
+    def save(self) -> None:
+        """No-op for FalkorDB (writes are already persistent)."""
+
+    # --- named reads (shared surface with EmbeddedGraphStore) ---------------
+
+    def find_definitions(self, name: str) -> list[list]:
+        return self.query(
+            """
+            MATCH (s)
+            WHERE (s:Function OR s:Class) AND s.name = $name
+            RETURN s.name, labels(s)[0], s.path, s.line, s.signature,
+                   coalesce(s.risk_score, 0.0), coalesce(s.fix_count, 0),
+                   coalesce(s.last_broke_at, '')
+            """,
+            {"name": name},
+        )
+
+    def callers_of(self, name: str, path: str) -> list[tuple[str, str, str]]:
+        return [
+            (r[0], r[1], r[2])
+            for r in self.query(
+                """
+                MATCH (caller:Function)-[r:CALLS]->(s:Function {name: $name, path: $path})
+                WHERE coalesce(caller.is_test, false) = false
+                RETURN DISTINCT caller.name, caller.path, r.confidence
+                """,
+                {"name": name, "path": path},
+            )
+        ]
+
+    def callees_of(self, name: str, path: str) -> list[tuple[str, str, str]]:
+        return [
+            (r[0], r[1], r[2])
+            for r in self.query(
+                """
+                MATCH (s:Function {name: $name, path: $path})-[r:CALLS]->(callee:Function)
+                RETURN DISTINCT callee.name, callee.path, r.confidence
+                """,
+                {"name": name, "path": path},
+            )
+        ]
+
+    def tests_covering(self, name: str, path: str) -> list[tuple[str, str, str]]:
+        return [
+            (r[0], r[1], r[2])
+            for r in self.query(
+                """
+                MATCH (t:Function {is_test: true})-[r:CALLS]->(s:Function {name: $name, path: $path})
+                RETURN DISTINCT t.name, t.path, r.confidence
+                """,
+                {"name": name, "path": path},
+            )
+        ]
+
+    def importers_of_module(self, module_hint: str, exclude_path: str) -> list[str]:
+        return [
+            r[0]
+            for r in self.query(
+                """
+                MATCH (f:File)-[:IMPORTS]->(m:Module)
+                WHERE m.name ENDS WITH $module_hint AND f.path <> $path
+                RETURN DISTINCT f.path
+                """,
+                {"module_hint": module_hint, "path": exclude_path},
+            )
+        ]
+
+    def top_connected_symbols(self, count: int = 3) -> list[str]:
+        rows = self.query(
+            """
+            MATCH (caller:Function)-[:CALLS]->(s:Function)
+            WHERE coalesce(s.is_test, false) = false
+            WITH s.name AS name, count(caller) AS degree
+            WITH name, sum(degree) AS total_degree
+            ORDER BY total_degree DESC, name ASC
+            RETURN name LIMIT $count
+            """,
+            {"count": count},
+        )
+        return [r[0] for r in rows]
+
+    def find_symbol(self, name: str) -> list[dict]:
+        rows = self.query(
+            """
+            MATCH (s) WHERE (s:Function OR s:Class) AND s.name = $name
+            RETURN s.name, labels(s)[0], s.path, s.line, s.signature
+            """,
+            {"name": name},
+        )
+        return [
+            {"name": r[0], "kind": r[1], "path": r[2], "line": int(r[3] or 0), "signature": r[4]}
+            for r in rows
+        ]
+
+    # --- risk memory surface -------------------------------------------------
+
+    def known_fix_shas(self) -> set[str]:
+        return {row[0] for row in self.query("MATCH (c:FixCommit) RETURN c.sha")}
+
+    def upsert_fix_commit(self, sha: str, date: str, subject: str, kind: str) -> None:
+        self.query(
+            "MERGE (c:FixCommit {sha: $sha}) SET c.date = $date, c.subject = $subject, c.kind = $kind",
+            {"sha": sha, "date": date, "subject": subject[:300], "kind": kind},
+        )
+
+    def touch_file(self, sha: str, path: str) -> int:
+        rows = self.query(
+            """
+            MATCH (f:File {path: $path}), (c:FixCommit {sha: $sha})
+            MERGE (c)-[:TOUCHED]->(f)
+            RETURN f.path
+            """,
+            {"path": path, "sha": sha},
+        )
+        return len(rows)
+
+    def record_symbol_fix(self, path: str, name: str, sha: str, date: str) -> int:
+        rows = self.query(
+            """
+            MATCH (s {path: $path, name: $name}), (c:FixCommit {sha: $sha})
+            WHERE s:Function OR s:Class
+            MERGE (c)-[:FIXED]->(s)
+            SET s.fix_count = coalesce(s.fix_count, 0) + 1,
+                s.last_broke_at =
+                    CASE WHEN coalesce(s.last_broke_at, '') < $date THEN $date
+                         ELSE s.last_broke_at END
+            RETURN s.name
+            """,
+            {"path": path, "name": name, "sha": sha, "date": date},
+        )
+        return len(rows)
+
+    def risky_symbols(self, limit: int = 15) -> list[list]:
+        return self.query(
+            """
+            MATCH (s)
+            WHERE (s:Function OR s:Class) AND coalesce(s.fix_count, 0) > 0
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(s)
+            WITH s, count(DISTINCT caller) AS caller_count
+            RETURN s.name, s.path, s.line, coalesce(s.fix_count, 0),
+                   coalesce(s.last_broke_at, ''), coalesce(s.risk_score, 0.0), caller_count
+            ORDER BY coalesce(s.risk_score, 0.0) DESC, coalesce(s.fix_count, 0) DESC
+            LIMIT $limit
+            """,
+            {"limit": limit},
+        )
+
+    def symbols_with_fixes(self) -> list[list]:
+        return self.query(
+            """
+            MATCH (s)
+            WHERE (s:Function OR s:Class) AND coalesce(s.fix_count, 0) > 0
+            RETURN s.path, s.name, s.fix_count, coalesce(s.last_broke_at, '')
+            """
+        )
+
+    def set_risk_score(self, path: str, name: str, score: float) -> None:
+        self.query(
+            """
+            MATCH (s {path: $path, name: $name})
+            WHERE s:Function OR s:Class
+            SET s.risk_score = $score
+            """,
+            {"path": path, "name": name, "score": score},
+        )
+
     # --- internals ----------------------------------------------------------
 
     def _write_file_node(self, parsed: ParsedFile) -> None:
@@ -215,3 +383,49 @@ class GraphStore:
 
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def falkordb_available(host: str = "localhost", port: int = 6379, timeout: float = 0.5) -> bool:
+    """Fast reachability probe (TCP connect), no client dependency."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def open_store(
+    project: str,
+    backend: str = "auto",
+    host: str = "localhost",
+    port: int = 6379,
+    data_dir: str | None = None,
+):
+    """Open a graph store.
+
+    backend:
+    - "falkordb": live FalkorDB graph (server required)
+    - "embedded": pure-Python JSON store, zero Docker
+    - "auto": FalkorDB if reachable, otherwise embedded
+    """
+    if backend == "falkordb":
+        return GraphStore(project, host=host, port=port)
+    if backend == "embedded":
+        from graphora.embedded import EmbeddedGraphStore
+
+        return EmbeddedGraphStore(project, data_dir=data_dir)
+    if backend == "auto":
+        if falkordb_available(host, port):
+            return GraphStore(project, host=host, port=port)
+        import sys
+
+        from graphora.embedded import EmbeddedGraphStore
+
+        print(
+            f"graphora: FalkorDB not reachable at {host}:{port}, using embedded backend",
+            file=sys.stderr,
+        )
+        return EmbeddedGraphStore(project, data_dir=data_dir)
+    raise ValueError(f"Unknown backend: {backend!r} (use auto, falkordb, or embedded)")

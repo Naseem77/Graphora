@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import sys
 
-from graphora.store import GraphStore
+from graphora.store import open_store
 
 _INSTRUCTIONS = (
     "Graphora exposes a deterministic code knowledge graph (built with "
@@ -26,11 +26,11 @@ _INSTRUCTIONS = (
 )
 
 
-def build_server(project: str, host: str = "localhost", port: int = 6379):
+def build_server(project: str, host: str = "localhost", port: int = 6379, backend: str = "auto"):
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP("graphora", instructions=_INSTRUCTIONS)
-    store = GraphStore(project, host=host, port=port)
+    store = open_store(project, backend=backend, host=host, port=port)
 
     @mcp.tool()
     def graph_stats() -> str:
@@ -65,25 +65,13 @@ def build_server(project: str, host: str = "localhost", port: int = 6379):
     @mcp.tool()
     def find_symbol(name: str) -> str:
         """Locate a function or class definition by name."""
-        rows = store.query(
-            """
-            MATCH (s) WHERE (s:Function OR s:Class) AND s.name = $name
-            RETURN s.name, labels(s)[0], s.path, s.line, s.signature
-            """,
-            {"name": name},
-        )
-        return json.dumps(
-            [
-                {"name": r[0], "kind": r[1], "path": r[2], "line": int(r[3] or 0), "signature": r[4]}
-                for r in rows
-            ]
-        )
+        return json.dumps(store.find_symbol(name))
 
     return mcp
 
 
-def serve(project: str, host: str = "localhost", port: int = 6379) -> None:
-    build_server(project, host=host, port=port).run(transport="stdio")
+def serve(project: str, host: str = "localhost", port: int = 6379, backend: str = "auto") -> None:
+    build_server(project, host=host, port=port, backend=backend).run(transport="stdio")
 
 
 if __name__ == "__main__":

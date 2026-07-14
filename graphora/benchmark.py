@@ -82,18 +82,7 @@ class BenchmarkResult:
 
 def pick_symbols(store: GraphStore, count: int = 3) -> list[str]:
     """Deterministically pick the most-connected non-test functions."""
-    rows = store.query(
-        """
-        MATCH (caller:Function)-[:CALLS]->(s:Function)
-        WHERE coalesce(s.is_test, false) = false
-        WITH s.name AS name, count(caller) AS degree
-        WITH name, sum(degree) AS total_degree
-        ORDER BY total_degree DESC, name ASC
-        RETURN name LIMIT $count
-        """,
-        {"count": count},
-    )
-    return [r[0] for r in rows]
+    return store.top_connected_symbols(count)
 
 
 def run_benchmark(

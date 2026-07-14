@@ -92,16 +92,7 @@ def blast_radius(store: GraphStore, symbol_names: list[str]) -> BlastRadius:
     impacts: list[SymbolImpact] = []
     unresolved: list[str] = []
     for name in symbol_names:
-        definitions = store.query(
-            """
-            MATCH (s)
-            WHERE (s:Function OR s:Class) AND s.name = $name
-            RETURN s.name, labels(s)[0], s.path, s.line, s.signature,
-                   coalesce(s.risk_score, 0.0), coalesce(s.fix_count, 0),
-                   coalesce(s.last_broke_at, '')
-            """,
-            {"name": name},
-        )
+        definitions = store.find_definitions(name)
         if not definitions:
             unresolved.append(name)
             continue
@@ -123,48 +114,10 @@ def blast_radius_for_diff(store: GraphStore, diff: str) -> BlastRadius:
 
 def _impact_for(store: GraphStore, row: list) -> SymbolImpact:
     name, kind, path, line, signature, risk_score, fix_count, last_broke_at = row
-    callers = [
-        (r[0], r[1], r[2])
-        for r in store.query(
-            """
-            MATCH (caller:Function)-[r:CALLS]->(s:Function {name: $name, path: $path})
-            WHERE coalesce(caller.is_test, false) = false
-            RETURN DISTINCT caller.name, caller.path, r.confidence
-            """,
-            {"name": name, "path": path},
-        )
-    ]
-    callees = [
-        (r[0], r[1], r[2])
-        for r in store.query(
-            """
-            MATCH (s:Function {name: $name, path: $path})-[r:CALLS]->(callee:Function)
-            RETURN DISTINCT callee.name, callee.path, r.confidence
-            """,
-            {"name": name, "path": path},
-        )
-    ]
-    tests = [
-        (r[0], r[1], r[2])
-        for r in store.query(
-            """
-            MATCH (t:Function {is_test: true})-[r:CALLS]->(s:Function {name: $name, path: $path})
-            RETURN DISTINCT t.name, t.path, r.confidence
-            """,
-            {"name": name, "path": path},
-        )
-    ]
-    importers = [
-        r[0]
-        for r in store.query(
-            """
-            MATCH (f:File)-[:IMPORTS]->(m:Module)
-            WHERE m.name ENDS WITH $module_hint AND f.path <> $path
-            RETURN DISTINCT f.path
-            """,
-            {"module_hint": _module_hint(path), "path": path},
-        )
-    ]
+    callers = sorted(store.callers_of(name, path))
+    callees = sorted(store.callees_of(name, path))
+    tests = sorted(store.tests_covering(name, path))
+    importers = sorted(store.importers_of_module(_module_hint(path), path))
     return SymbolImpact(
         name=name,
         kind=kind,
