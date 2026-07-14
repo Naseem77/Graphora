@@ -26,7 +26,13 @@ INFERRED = "INFERRED"
 AMBIGUOUS = "AMBIGUOUS"
 
 DOC_EXTENSIONS = {".md", ".mdx"}
-CODE_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java"}
+CODE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java",
+    ".rs", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".rb", ".php",
+}
+
+# Languages with regex symbol patterns; used for diff attribution too.
+REGEX_LANGUAGES = ("python", "typescript", "go", "java", "rust", "c", "cpp", "ruby", "php")
 
 _TEST_PATH_PATTERN = re.compile(r"(^|/)(tests?|__tests__|spec)(/|_)|(_test\.|\.test\.|\.spec\.|^test_)")
 
@@ -84,6 +90,16 @@ def language_for_path(path: str) -> str:
         ".tsx": "typescript",
         ".go": "go",
         ".java": "java",
+        ".rs": "rust",
+        ".c": "c",
+        ".h": "c",
+        ".cpp": "cpp",
+        ".cc": "cpp",
+        ".cxx": "cpp",
+        ".hpp": "cpp",
+        ".hh": "cpp",
+        ".rb": "ruby",
+        ".php": "php",
     }.get(suffix, "text")
 
 
@@ -104,7 +120,7 @@ def extract_symbols_from_diff(diff: str) -> list[str]:
         if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
             continue
         stripped = line[1:].strip()
-        for language in ("python", "typescript", "go", "java"):
+        for language in REGEX_LANGUAGES:
             for _, name in _extract_symbols(language, stripped):
                 if name not in seen:
                     seen.add(name)
@@ -184,6 +200,11 @@ def _tree_sitter_parser(language: str) -> Any | None:
         "typescript": ("tree_sitter_typescript", "language_typescript"),
         "go": ("tree_sitter_go", "language"),
         "java": ("tree_sitter_java", "language"),
+        "rust": ("tree_sitter_rust", "language"),
+        "c": ("tree_sitter_c", "language"),
+        "cpp": ("tree_sitter_cpp", "language"),
+        "ruby": ("tree_sitter_ruby", "language"),
+        "php": ("tree_sitter_php", "language_php"),
     }.get(language, (None, None))
     if not module_name:
         return None
@@ -219,6 +240,21 @@ def _tree_sitter_import(language: str, node: Any, content: bytes) -> str | None:
     if language == "java" and node.type == "import_declaration":
         text = _node_text(node, content).strip()
         return text.removeprefix("import ").removesuffix(";").strip()
+    if language == "rust" and node.type == "use_declaration":
+        text = _node_text(node, content).strip()
+        return text.removeprefix("use ").removesuffix(";").strip()
+    if language in {"c", "cpp"} and node.type == "preproc_include":
+        path_node = node.child_by_field_name("path")
+        return _node_text(path_node, content).strip('"<>') or None
+    if language == "ruby" and node.type == "call":
+        method = _node_text(node.child_by_field_name("method"), content)
+        if method in {"require", "require_relative"}:
+            args = node.child_by_field_name("arguments")
+            return _node_text(args, content).strip("()\"' ") or None
+        return None
+    if language == "php" and node.type == "namespace_use_declaration":
+        text = _node_text(node, content).strip()
+        return text.removeprefix("use ").removesuffix(";").strip() or None
     return None
 
 
@@ -241,18 +277,54 @@ def _tree_sitter_symbol(language: str, node: Any, content_bytes: bytes, content:
         kind, name_node = "Function", node.child_by_field_name("name")
     elif language == "java" and node.type == "class_declaration":
         kind, name_node = "Class", node.child_by_field_name("name")
+    elif language == "rust" and node.type == "function_item":
+        kind, name_node = "Function", node.child_by_field_name("name")
+    elif language == "rust" and node.type in {"struct_item", "enum_item", "trait_item"}:
+        kind, name_node = "Class", node.child_by_field_name("name")
+    elif language in {"c", "cpp"} and node.type == "function_definition":
+        kind = "Function"
+        name_node = _c_declarator_name(node)
+    elif language == "c" and node.type == "struct_specifier":
+        kind, name_node = "Class", node.child_by_field_name("name")
+    elif language == "cpp" and node.type in {"class_specifier", "struct_specifier"}:
+        kind, name_node = "Class", node.child_by_field_name("name")
+    elif language == "ruby" and node.type == "method":
+        kind, name_node = "Function", node.child_by_field_name("name")
+    elif language == "ruby" and node.type in {"class", "module"}:
+        kind, name_node = "Class", node.child_by_field_name("name")
+    elif language == "php" and node.type in {"function_definition", "method_declaration"}:
+        kind, name_node = "Function", node.child_by_field_name("name")
+    elif language == "php" and node.type == "class_declaration":
+        kind, name_node = "Class", node.child_by_field_name("name")
 
     if not kind or name_node is None:
         return None
     line = node.start_point.row + 1
     signature = content.splitlines()[line - 1].strip()
+    name = _node_text(name_node, content_bytes).split("::")[-1]
+    if not re.match(r"^[A-Za-z_][\w$]*$", name):
+        return None
     return ParsedSymbol(
         kind=kind,
-        name=_node_text(name_node, content_bytes),
+        name=name,
         line=line,
         signature=signature,
         confidence=EXTRACTED,
     )
+
+
+def _c_declarator_name(node: Any) -> Any | None:
+    """Descend C/C++ declarators to the identifier that names the function."""
+    declarator = node.child_by_field_name("declarator")
+    depth = 0
+    while declarator is not None and depth < 10:
+        if declarator.type in {"identifier", "field_identifier"}:
+            return declarator
+        if declarator.type == "qualified_identifier":
+            return declarator.child_by_field_name("name") or declarator
+        declarator = declarator.child_by_field_name("declarator")
+        depth += 1
+    return None
 
 
 def _tree_sitter_call(language: str, node: Any, content: bytes) -> str | None:
@@ -265,13 +337,24 @@ def _tree_sitter_call(language: str, node: Any, content: bytes) -> str | None:
     if language == "java" and node.type == "method_invocation":
         name = _node_text(node.child_by_field_name("name"), content)
         return name or None
+    if language in {"rust", "c", "cpp"} and node.type == "call_expression":
+        return _call_function_name(_node_text(node.child_by_field_name("function"), content))
+    if language == "ruby" and node.type == "call":
+        method = _node_text(node.child_by_field_name("method"), content)
+        if method in {"require", "require_relative", "new"}:
+            return None
+        return _call_function_name(method)
+    if language == "php" and node.type == "function_call_expression":
+        return _call_function_name(_node_text(node.child_by_field_name("function"), content))
+    if language == "php" and node.type == "member_call_expression":
+        return _call_function_name(_node_text(node.child_by_field_name("name"), content))
     return None
 
 
 def _call_function_name(text: str) -> str | None:
     if not text:
         return None
-    name = text.split(".")[-1]
+    name = text.split(".")[-1].split("::")[-1].split("->")[-1].lstrip("$&")
     return name if re.match(r"^[A-Za-z_][\w$]*$", name) else None
 
 
@@ -339,6 +422,18 @@ def _extract_import(language: str, line: str) -> str | None:
     if language == "java":
         match = re.match(r"import\s+([\w.]+);", line)
         return _first_group(match)
+    if language == "rust":
+        match = re.match(r"use\s+([\w:]+)", line)
+        return _first_group(match)
+    if language in {"c", "cpp"}:
+        match = re.match(r"#include\s+[<\"]([^>\"]+)[>\"]", line)
+        return _first_group(match)
+    if language == "ruby":
+        match = re.match(r"require(?:_relative)?\s+['\"]([^'\"]+)['\"]", line)
+        return _first_group(match)
+    if language == "php":
+        match = re.match(r"use\s+([\w\\]+)", line)
+        return _first_group(match)
     return None
 
 
@@ -366,6 +461,26 @@ def _extract_symbols(language: str, line: str) -> list[tuple[str, str]]:
             ("Class", r"^(?:public\s+|private\s+|protected\s+)?(?:final\s+)?class\s+([A-Za-z_]\w*)"),
             ("Function", r"^(?:public|private|protected)\s+[\w<>\[\]]+\s+([A-Za-z_]\w*)\s*\("),
         ],
+        "rust": [
+            ("Class", r"^(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_]\w*)"),
+            ("Function", r"^(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)"),
+        ],
+        "c": [
+            ("Class", r"^(?:typedef\s+)?struct\s+([A-Za-z_]\w*)"),
+            ("Function", r"^(?:static\s+|inline\s+)*[\w*]+\s+\**([A-Za-z_]\w*)\s*\([^;]*$"),
+        ],
+        "cpp": [
+            ("Class", r"^(?:class|struct)\s+([A-Za-z_]\w*)"),
+            ("Function", r"^(?:static\s+|inline\s+|virtual\s+)*[\w:<>*&]+\s+\**(?:\w+::)?([A-Za-z_]\w*)\s*\([^;]*$"),
+        ],
+        "ruby": [
+            ("Class", r"^(?:class|module)\s+([A-Z]\w*)"),
+            ("Function", r"^def\s+(?:self\.)?([A-Za-z_]\w*[?!]?)"),
+        ],
+        "php": [
+            ("Class", r"^(?:abstract\s+|final\s+)?class\s+([A-Za-z_]\w*)"),
+            ("Function", r"^(?:public\s+|private\s+|protected\s+|static\s+)*function\s+([A-Za-z_]\w*)\s*\("),
+        ],
     }
     found: list[tuple[str, str]] = []
     for kind, pattern in patterns.get(language, []):
@@ -376,7 +491,7 @@ def _extract_symbols(language: str, line: str) -> list[tuple[str, str]]:
 
 
 def _extract_calls(language: str, line: str) -> list[str]:
-    if language not in {"python", "javascript", "typescript", "go", "java"}:
+    if language not in REGEX_LANGUAGES and language != "javascript":
         return []
     ignored = {"if", "for", "while", "switch", "return", "class", "def", "function", "catch", "new"}
     calls = []

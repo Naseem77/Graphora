@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from graphora.parser import _extract_symbols  # deterministic symbol regexes
+from graphora.parser import REGEX_LANGUAGES, _extract_symbols  # deterministic symbol regexes
 from graphora.parser import extract_symbols_from_diff
 from graphora.store import GraphStore
 
@@ -174,13 +174,13 @@ def _attribute_diff(diff: str) -> dict[str, set[str]]:
         hunk_match = _HUNK_HEADER_RE.match(line)
         if hunk_match:
             context = hunk_match.group(1).strip()
-            for language in ("python", "typescript", "go", "java"):
+            for language in REGEX_LANGUAGES:
                 for _, name in _extract_symbols(language, context):
                     attribution[current_file].add(name)
             continue
         if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
             stripped = line[1:].strip()
-            for language in ("python", "typescript", "go", "java"):
+            for language in REGEX_LANGUAGES:
                 for _, name in _extract_symbols(language, stripped):
                     attribution[current_file].add(name)
     return attribution
