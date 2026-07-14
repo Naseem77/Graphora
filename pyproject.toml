@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphora"
+version = "0.2.0"
+description = "Deterministic code knowledge graph: index with tree-sitter, query blast radius, mine risk memory from git, review diffs grounded in structure. No LLM required to build."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Naseem77" }]
+keywords = ["knowledge-graph", "code-review", "falkordb", "tree-sitter", "blast-radius", "mcp"]
+dependencies = [
+    "falkordb>=1.0",
+    "tree-sitter>=0.23",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-go>=0.23",
+    "tree-sitter-java>=0.23",
+]
+
+[project.optional-dependencies]
+llm = ["litellm>=1.40"]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+graphora = "graphora.cli:main"
+
+[tool.setuptools]
+packages = ["graphora"]
