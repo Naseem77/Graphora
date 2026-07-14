@@ -180,15 +180,19 @@ Test-first at every phase; the full suite had to pass before the next phase star
 | 4. CLI + review | 6 | Every command end-to-end via `main()`, JSON output, facts-mode review, risk warnings surfaced |
 | 5. MCP server | 4 | All 5 tools listed and invoked on the real server object, JSON payloads validated |
 | 6. Benchmark | 5 | Savings hold on a realistic fixture, grounded-fact counts, determinism (two runs byte-identical), report rendering |
+| 7. Embedded backend | 12 | JSON persistence across instances, blast/risk/CLI end-to-end without a server, auto-fallback, byte-identical output parity with FalkorDB |
+| 8. Skill installer | 11 | 22 agents supported, frontmatter formats, idempotent marked blocks, existing files preserved, CLI end-to-end |
+| 9. Languages | 14 | Rust/C/C++/Ruby/PHP symbols, imports, calls via tree-sitter; qualified-name resolution; 4-language end-to-end index; diff attribution |
+| 10. Public benchmark | 3 | Deterministic rows, markdown rendering, all repos pinned to full 40-char SHAs |
 
 Final state:
 
 ```
 $ python3 -m pytest tests -q
-41 passed in 3.07s
+80 passed in 3.4s
 ```
 
-All 41 core tests, green. Integration tests run against a live FalkorDB and real
+All 80 core tests, green. Integration tests run against a live FalkorDB and real
 per-test git repositories, and skip
 cleanly when FalkorDB is not running.
 

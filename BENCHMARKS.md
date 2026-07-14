@@ -8,8 +8,8 @@ Last updated: 2026-07-14. Environment: macOS, Python 3.11, FalkorDB (Docker `fal
 
 ## Summary
 
-- **93.4% fewer prompt tokens** than a whole-repo dump on falkordb-py, **94.4%** on Graphora itself.
-- **90 to 92% fewer tokens** even against the honest baseline of reading only the relevant files.
+- **82 to 94% fewer prompt tokens** than a whole-repo dump on 4 pinned real OSS repos (flask, requests, click, falkordb-py), reproducible with one script.
+- **79 to 92% fewer tokens** even against the honest baseline of reading only the relevant files.
 - **$0 LLM credits to build the graph**, on every run, by construction: the index path is tree-sitter plus Cypher, nothing else.
 - The blast-radius context is not just smaller, it is *more* informative: caller counts, covering tests, and risk history are stated as explicit facts instead of left for the model to infer from raw text.
 
@@ -33,6 +33,25 @@ Rules that keep it fair and reproducible:
 - **Determinism is tested**: the suite asserts two consecutive runs produce identical results (`tests/core/test_core_benchmark.py::test_benchmark_is_deterministic`).
 
 ## Results
+
+### Public benchmark: pinned OSS repositories (reproducible by anyone)
+
+Run on real open-source repos at exact pinned commits, embedded backend
+(no server), symbols auto-picked deterministically. Two consecutive runs
+produce byte-identical reports.
+
+```bash
+python3 scripts/public_benchmark.py
+```
+
+| Repository | Commit | Files | Whole repo | Relevant files | Blast radius | Savings vs repo | vs relevant |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| flask | `36e4a824f3` | 83 | 147,390 | 124,205 | **21,534** | **85.4%** | 82.7% |
+| requests | `f361ead047` | 37 | 101,739 | 80,360 | **10,331** | **89.8%** | 87.1% |
+| click | `b67832c216` | 76 | 225,373 | 190,236 | **39,534** | **82.5%** | 79.2% |
+| falkordb-py | `971f1d124e` | 40 | 59,866 | 40,638 | **3,550** | **94.1%** | 91.3% |
+
+Symbols queried: flask `get, route, register_blueprint` · requests `get, post, prepare` · click `invoke, command, echo` · falkordb-py `query, select_graph, list_indices`.
 
 ### falkordb-py (real client library: 39 files, 310 functions, 943 call edges)
 
