@@ -8,7 +8,7 @@ Setup used for all of them:
 ```bash
 docker run -d --name graphora-falkordb -p 6379:6379 falkordb/falkordb:latest
 pip install -e .
-graphora index . --project graphora          # 71 files, 478 functions, 1,327 call edges
+graphora index . --project graphora          # 17 files, 148 functions, 251 call edges
 graphora risk mine . --project graphora
 ```
 
@@ -16,7 +16,7 @@ graphora risk mine . --project graphora
 
 ## Use case 1: cross-file impact review with zero LLM <a name="use-case-1"></a>
 
-**Scenario**: a one-line diff adds a `force_refresh` parameter to `get_provisioner()`.
+**Scenario**: a one-line diff adds a `decay` parameter to `compute_risk_score()`.
 A diff-only reviewer sees one file and has to guess the impact.
 
 ```bash
@@ -28,28 +28,25 @@ Captured output:
 ```
 # Graphora Review
 
-`get_provisioner` has 3 caller(s) and 0 covering test(s). No test coverage on a symbol with callers.
-
-## Findings
-- **warning** `app/provision/factory.py`:16: `get_provisioner` has 3 caller(s) but zero covering tests in the graph.
+`compute_risk_score` has 1 caller(s) and 1 covering test(s).
 
 ## Grounded facts (from the graph)
 
 Blast radius (from code graph, deterministic):
 
-### get_provisioner (Function)
-- defined at app/provision/factory.py:16 `def get_provisioner(settings: Settings | None = None) -> GraphProvisioner | None:`
-- callers (3): settings_for_installation [app/provision/factory.py] (EXTRACTED), provision_installation [app/provision/factory.py] (EXTRACTED), destroy_installation [app/provision/factory.py] (EXTRACTED)
-- calls (1): get_settings [app/config.py] (INFERRED)
-- tests (0): none
-- imported by (2): app/github/webhooks.py, app/review/chat.py
+### compute_risk_score (Function)
+- defined at graphora/risk.py:130 `def compute_risk_score(fix_count: int, last_broke_at: str, now: datetime | None = None) -> float:`
+- callers (1): _recompute_risk_scores [graphora/risk.py] (EXTRACTED)
+- calls (0): none
+- tests (1): test_risk_score_decays_over_time [tests/core/test_core_risk.py] (INFERRED)
+- imported by (3): graphora/cli.py, graphora/mcp_server.py, tests/core/test_core_risk.py
 
-_Context sent to model: ~190 tokens (graph blast radius, not the repo)._
+_Context sent to model: ~197 tokens (graph blast radius, not the repo)._
 ```
 
-**Why it matters**: ~190 tokens of context instead of a ~62,000-token repo dump, no LLM
-call at all, and both conclusions (backward compatible for 3 known callers, zero test
-coverage) are read from the graph, not guessed. Add `--llm` with `REVIEW_MODEL` set and
+**Why it matters**: ~197 tokens of context instead of a ~22,200-token repo dump, no LLM
+call at all, and every conclusion (one known caller, one covering test, three importing
+files) is read from the graph, not guessed. Add `--llm` with `REVIEW_MODEL` set and
 the same tiny context feeds a full model-written review.
 
 ---
@@ -94,7 +91,7 @@ on a repository, the smarter it gets. No stateless reviewer can offer this.
 to the graph, so agents check impact *before* editing.
 
 ```bash
-graphora serve-mcp --project graphora
+graphora serve-mcp --project falkordb-py
 ```
 
 A real captured stdio session (MCP Python client):
@@ -102,14 +99,14 @@ A real captured stdio session (MCP Python client):
 ```
 TOOLS: ['graph_stats', 'blast_radius', 'review_diff', 'risk_top', 'find_symbol']
 
-blast_radius(build_pr_context): confidence-tagged JSON of callers/callees/tests/risk
+blast_radius(query): confidence-tagged JSON of callers/callees/tests/risk
 
 risk_top(3):
-  0.25 aembed_documents (app/graph/sdk.py) fixes=1
-  0.25 test_sdk_graph_client_ingests_raw_text_only (tests/test_sdk.py) fixes=1
-  0.25 test_get_kg_instantiates_sdk_client (tests/test_sdk.py) fixes=1
+  0.14 test_graph_creation (tests/test_async_graph.py) fixes=3
+  0.08 Is_Cluster (falkordb/asyncio/cluster.py) fixes=2, callers=2
+  0.07 QueryResult (falkordb/query_result.py) fixes=1
 
-find_symbol(mine_risk_memory): graphora/risk.py
+find_symbol(Is_Cluster): falkordb/asyncio/cluster.py:9 `def Is_Cluster(conn: redis.Redis):`
 ```
 
 **Why it matters**: the server's instructions tell agents to call `blast_radius` before
@@ -137,13 +134,13 @@ The same library API drove two more workflows in the same session:
 
 ```python
 # Refactor planning: all call sites of a function, confidence-tagged
-blast_radius(store, ["parse_code_file"])   # returned all 5 call sites
+blast_radius(store, ["parse_code_file"])   # returned every call site
 
 # Incremental re-index after editing one file (no full rebuild)
 update_files(repo_root, ["graphora/benchmark.py"], store=store)
 ```
 
-**Why it matters**: no webhook, no GitHub App, no server. Import and query. This is the
+**Why it matters**: no webhook, no bot, no server. Import and query. This is the
 "tool usable in code" mode: CI gates, pre-refactor checks, custom dashboards, editor
 plugins all build on the same three functions.
 
@@ -154,13 +151,13 @@ plugins all build on the same three functions.
 **Scenario**: while querying its own graph, Graphora hit a genuinely ambiguous case, and
 told the truth about it.
 
-The repository contains *two* functions named `parse_code_file` (the legacy
-`app/parser/treesitter.py` and the new `graphora/parser.py`). A name-based caller match
-cannot know which one a call refers to. Captured output:
+The repository defines *two* functions named `blast_radius` (the core implementation in
+`graphora/blast.py` and the MCP tool wrapper in `graphora/mcp_server.py`). A name-based
+caller match cannot know which one a call refers to. Captured output:
 
 ```
-parse_code_file @ app/parser/treesitter.py:89 -> 5 callers: build_repo_graph(AMBIGUOUS), build_pr_graph(AMBIGUOUS), ...
-parse_code_file @ graphora/parser.py:90      -> 5 callers: build_repo_graph(AMBIGUOUS), build_pr_graph(AMBIGUOUS), ...
+blast_radius @ graphora/blast.py:90       -> callers: run_benchmark(AMBIGUOUS), cmd_blast(AMBIGUOUS), blast_radius_for_diff(EXTRACTED)
+blast_radius @ graphora/mcp_server.py:41  -> callers: run_benchmark(AMBIGUOUS), cmd_blast(AMBIGUOUS)
 ```
 
 **Why it matters**: instead of silently picking one candidate (and being wrong half the
@@ -188,11 +185,11 @@ Final state:
 
 ```
 $ python3 -m pytest tests -q
-126 passed, 1 warning in 4.5s
+41 passed in 3.07s
 ```
 
-That is 41 new core tests plus all 85 pre-existing GitHub App tests, untouched and green.
-Integration tests run against a live FalkorDB and real per-test git repositories, and skip
+All 41 core tests, green. Integration tests run against a live FalkorDB and real
+per-test git repositories, and skip
 cleanly when FalkorDB is not running.
 
 Two bugs were caught by the tests themselves during development and fixed on the spot:

@@ -8,8 +8,8 @@ Last updated: 2026-07-14. Environment: macOS, Python 3.11, FalkorDB (Docker `fal
 
 ## Summary
 
-- **93.4% fewer prompt tokens** than a whole-repo dump on falkordb-py, **90.5%** on Graphora itself.
-- **87 to 90% fewer tokens** even against the honest baseline of reading only the relevant files.
+- **93.4% fewer prompt tokens** than a whole-repo dump on falkordb-py, **94.4%** on Graphora itself.
+- **90 to 92% fewer tokens** even against the honest baseline of reading only the relevant files.
 - **$0 LLM credits to build the graph**, on every run, by construction: the index path is tree-sitter plus Cypher, nothing else.
 - The blast-radius context is not just smaller, it is *more* informative: caller counts, covering tests, and risk history are stated as explicit facts instead of left for the model to infer from raw text.
 
@@ -52,41 +52,44 @@ Savings: **93.4%** vs whole-repo dump, **90.0%** vs relevant files.
 Grounded facts stated explicitly in the blast-radius context: 8 caller relationships,
 4 callee relationships, 248 covering tests identified.
 
-### Graphora itself (71 files, 478 functions, 1,327 call edges)
+### Graphora itself (17 files, 148 functions, 251 call edges)
 
 ```bash
 graphora index . --project graphora
-graphora benchmark . --project graphora --symbols get,query,get_settings
+graphora benchmark . --project graphora --symbols query,blast_radius,render
 ```
 
 | Context strategy | Prompt tokens | Relative |
 | --- | ---: | ---: |
-| Whole-repo dump | 62,437 | 100% |
-| Relevant files (changed + callers + tests) | 49,443 | 79.2% |
-| **Graphora blast radius** | **5,941** | **9.52%** |
+| Whole-repo dump | 22,160 | 100% |
+| Relevant files (changed + callers + tests) | 16,603 | 74.9% |
+| **Graphora blast radius** | **1,237** | **5.58%** |
 
-Savings: **90.5%** vs whole-repo dump, **88.0%** vs relevant files.
+Savings: **94.4%** vs whole-repo dump, **92.5%** vs relevant files.
+
+Grounded facts stated explicitly in the blast-radius context: 27 caller relationships,
+3 callee relationships, 28 covering tests identified.
 
 ### Single-change review (the flagship scenario)
 
-A one-line diff adding a parameter to `get_provisioner()` in this repository:
+A one-line diff adding a parameter to `compute_risk_score()` in this repository:
 
 | Approach | Context to the model |
 | --- | ---: |
-| Whole-repo dump | ~62,400 tokens |
-| **Graphora** (diff + blast radius) | **~190 tokens** |
+| Whole-repo dump | ~22,200 tokens |
+| **Graphora** (diff + blast radius) | **~197 tokens** |
 
-That 190-token context contained everything a correct review needed: 3 callers
-identified by name and file, the callee, zero covering tests flagged, and 2 importing
-files. Both review claims (backward compatibility, missing coverage) were *read* from
-the graph, not guessed. See [USECASES.md](./USECASES.md#use-case-1) for the full output.
+That 197-token context contained everything a correct review needed: the single caller
+identified by name and file, the covering test, and 3 importing files, each fact
+confidence-tagged. The review claims were *read* from the graph, not guessed.
+See [USECASES.md](./USECASES.md#use-case-1) for the full output.
 
 ## Why the "relevant files" baseline matters
 
 Most published token-savings numbers compare against repo dumping, which flatters any
 tool. The fair question is: *what would it cost to learn the same facts without the graph?*
 The answer is reading every file that contains a caller or a covering test. Graphora beats
-that baseline by 88 to 90% because the graph states relationships in one line each
+that baseline by 90 to 92% because the graph states relationships in one line each
 ("callers (3): a, b, c") that otherwise hide across thousands of lines of source.
 
 The baseline also *understates* Graphora's advantage: a file dump still leaves the model
@@ -100,7 +103,7 @@ none of the alternatives carry risk memory at all, at any token price.
 | Graph build | **$0** (tree-sitter + Cypher) | per-document LLM extraction |
 | Embeddings | **none** (no vector store) | per-chunk embedding calls |
 | Re-index on push | only changed files | often full re-ingest |
-| Review context | ~190 to ~6,000 tokens | 30,000+ tokens or external context services |
+| Review context | ~200 to ~3,500 tokens | 30,000+ tokens or external context services |
 | Risk memory build | **$0** (git log parsing) | not available |
 
 ## Reproducing

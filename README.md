@@ -10,10 +10,10 @@
 [![FalkorDB](https://img.shields.io/badge/FalkorDB-graph-FF4438?logo=redis&logoColor=white)](https://www.falkordb.com/)
 [![tree--sitter](https://img.shields.io/badge/tree--sitter-parsing-2C2C2C)](https://tree-sitter.github.io/tree-sitter/)
 [![MCP](https://img.shields.io/badge/MCP-server-6E56CF)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-126%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-41%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-`pip install` it as a library · run it as a CLI · plug it into any AI agent as an MCP server · or deploy it as a GitHub App
+`pip install` it as a library · run it as a CLI · plug it into any AI agent as an MCP server
 
 </div>
 
@@ -62,7 +62,7 @@ graphora review --git-range main...HEAD --repo /path/to/repo
 graphora benchmark /path/to/repo           # reproduce the token-cost numbers yourself
 ```
 
-## Four ways to consume it
+## Three ways to consume it
 
 ### 1. CLI
 
@@ -101,10 +101,6 @@ graphora serve-mcp --project myrepo
 
 Exposes `blast_radius`, `review_diff`, `risk_top`, `find_symbol`, and `graph_stats` to Copilot CLI, Claude Code, Cursor, or any MCP client. The server instructs agents to check the blast radius *before* editing a symbol, which turns Graphora into a guardrail for AI-generated changes.
 
-### 4. GitHub App (optional adapter)
-
-The original webhook-driven bot still ships under `app/`: automatic PR reviews, PR overlay graphs, CI failure root-causing, and `@graphreview` commands. See [docs-legacy-github-app-README.md](./docs-legacy-github-app-README.md). It is now one adapter on top of the tool, not the product.
-
 ## Risk memory: the graph learns where the codebase breaks
 
 Graphora mines git history (deterministically, zero LLM) for fix, hotfix, bugfix, and revert commits, and attributes each one to the exact functions and classes it touched, using both diff lines and hunk-header context.
@@ -126,7 +122,7 @@ Measured on real repositories, fully deterministic, zero network. Full methodolo
 | Repository | Whole-repo dump | Relevant files | **Graphora blast radius** | Savings |
 | --- | ---: | ---: | ---: | ---: |
 | falkordb-py (39 files) | 52,432 tokens | 34,224 tokens | **3,439 tokens** | **93.4%** |
-| Graphora itself (71 files) | 62,437 tokens | 49,443 tokens | **5,941 tokens** | **90.5%** |
+| Graphora itself (17 files) | 22,160 tokens | 16,603 tokens | **1,237 tokens** | **94.4%** |
 
 Graph build cost in LLM credits: **$0**, by construction. The "relevant files" column is the honest baseline: every file a reviewer would have to read to learn what the blast radius states directly.
 
@@ -134,7 +130,7 @@ Graph build cost in LLM credits: **$0**, by construction. The "relevant files" c
 
 Five real, captured scenarios in [USECASES.md](./USECASES.md):
 
-1. **Cross-file impact review with zero LLM**: a one-line diff, three callers found, missing tests flagged, ~190 tokens of context.
+1. **Cross-file impact review with zero LLM**: a one-line diff, callers and covering tests read straight from the graph, ~197 tokens of context.
 2. **Risk hotspot mining on a real codebase**: 231 commits of falkordb-py history, the async cluster code correctly surfaced as the trouble spot.
 3. **AI agents over MCP**: a live stdio session calling `blast_radius`, `risk_top`, `find_symbol`.
 4. **A CI gate in three lines** of library code, plus incremental re-indexing.
@@ -152,10 +148,10 @@ Five real, captured scenarios in [USECASES.md](./USECASES.md):
                  File · Function · Class · Module · FixCommit
               CALLS / DEFINED_IN / IMPORTS / FIXED  (confidence-tagged)
                                             │
-              ┌──────────────┬──────────────┼───────────────┬─────────────┐
-              ▼              ▼              ▼               ▼             ▼
-           CLI           library API     MCP server     benchmark     GitHub App
-        (terminal)      (CI gates,      (AI agents)    (reproducible)  (adapter)
+              ┌──────────────┬──────────────┼───────────────┐
+              ▼              ▼              ▼               ▼
+           CLI           library API     MCP server     benchmark
+        (terminal)      (CI gates,      (AI agents)    (reproducible)
                          refactors)
 ```
 
@@ -171,10 +167,10 @@ Graph model per project: `graphora:{project}`. Incremental updates re-parse only
 
 ## Testing
 
-126 tests, all passing: 41 core tests (parser, store, blast, risk, CLI, MCP, benchmark) plus 85 legacy GitHub App tests. Integration tests run against a live FalkorDB and real scripted git repositories, and skip cleanly when FalkorDB is absent.
+41 tests, all passing: parser, store, blast radius, risk memory, CLI, MCP server, and benchmark. Integration tests run against a live FalkorDB and real scripted git repositories, and skip cleanly when FalkorDB is absent.
 
 ```bash
-python3 -m pytest tests -q        # 126 passed
+python3 -m pytest tests -q        # 41 passed
 ```
 
 The test-per-phase methodology and the bugs the suite caught are documented in [USECASES.md](./USECASES.md#how-it-was-tested).
