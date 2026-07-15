@@ -7,6 +7,7 @@
 **Deterministic indexing · Blast-radius analysis · Risk memory · Zero Docker required · $0 LLM cost to build**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyPI](https://img.shields.io/pypi/v/graphora-kg?color=3775A9&logo=pypi&logoColor=white)](https://pypi.org/project/graphora-kg/)
 [![FalkorDB](https://img.shields.io/badge/FalkorDB-graph-FF4438?logo=redis&logoColor=white)](https://www.falkordb.com/)
 [![tree--sitter](https://img.shields.io/badge/tree--sitter-parsing-2C2C2C)](https://tree-sitter.github.io/tree-sitter/)
 [![MCP](https://img.shields.io/badge/MCP-server-6E56CF)](https://modelcontextprotocol.io/)
