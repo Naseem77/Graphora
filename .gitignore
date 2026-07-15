@@ -6,7 +6,6 @@ __pycache__/
 *.pem
 arch/
 *.egg-info/
-media/node_modules/
-media/out/
 dist/
 build/
+media/
