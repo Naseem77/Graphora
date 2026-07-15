@@ -8,3 +8,5 @@ arch/
 *.egg-info/
 media/node_modules/
 media/out/
+dist/
+build/

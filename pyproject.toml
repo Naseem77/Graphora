@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "graphora"
+name = "graphora-kg"
 version = "0.2.0"
 description = "Deterministic code knowledge graph: index with tree-sitter, query blast radius, mine risk memory from git, review diffs grounded in structure. No LLM required to build."
 readme = "README.md"
@@ -11,6 +11,17 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Naseem77" }]
 keywords = ["knowledge-graph", "code-review", "falkordb", "tree-sitter", "blast-radius", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "falkordb>=1.0",
     "tree-sitter>=0.23",
@@ -30,6 +41,11 @@ dependencies = [
 llm = ["litellm>=1.40"]
 mcp = ["mcp>=1.0"]
 dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/Naseem77/Graphora"
+Repository = "https://github.com/Naseem77/Graphora"
+Issues = "https://github.com/Naseem77/Graphora/issues"
 
 [project.scripts]
 graphora = "graphora.cli:main"
