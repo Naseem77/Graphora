@@ -132,7 +132,7 @@ none of the alternatives carry risk memory at all, at any token price.
 docker run -d --name graphora-falkordb -p 6379:6379 falkordb/falkordb:latest
 
 # install
-pip install -e .
+pip install graphora-kg
 
 # any repository
 graphora index /path/to/repo --project myrepo

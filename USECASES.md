@@ -7,7 +7,7 @@ Setup used for all of them:
 
 ```bash
 docker run -d --name graphora-falkordb -p 6379:6379 falkordb/falkordb:latest
-pip install -e .
+pip install graphora-kg
 graphora index . --project graphora          # 17 files, 148 functions, 251 call edges
 graphora risk mine . --project graphora
 ```

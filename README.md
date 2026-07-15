@@ -50,7 +50,7 @@ Graphora fixes all four at the source:
 
 ```bash
 # 1. Install (no server, no Docker needed)
-pip install -e .            # inside this repo; installs the `graphora` CLI
+pip install graphora-kg     # from PyPI, or: pip install -e . inside this repo
 
 # 2. Build the graph and the risk memory (both offline, both $0)
 graphora index /path/to/repo
