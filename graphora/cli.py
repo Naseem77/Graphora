@@ -135,8 +135,11 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
         print("\n".join(list_agents()))
         return 0
     agents = None if not args.agents or args.agents == ["all"] else args.agents
+    kinds = ["code", "sessions"] if args.skill == "all" else [args.skill]
     try:
-        written = install_skill(args.repo, agents)
+        written = []
+        for kind in kinds:
+            written.extend(install_skill(args.repo, agents, skill=kind))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -247,6 +250,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_skill.add_argument("agents", nargs="*", help="Agent names, or 'all' (default: all)")
     p_skill.add_argument("--repo", default=".", help="Repository root to install into (default: cwd)")
     p_skill.add_argument("--list", action="store_true", help="List supported agents")
+    p_skill.add_argument("--skill", choices=["code", "sessions", "all"], default="code",
+                         help="Which skill to install: code graph workflow, session recall, or both")
     p_skill.set_defaults(func=cmd_install_skill)
 
     return parser

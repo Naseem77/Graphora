@@ -13,6 +13,8 @@ from pathlib import Path
 
 MARK_START = "<!-- graphora:start -->"
 MARK_END = "<!-- graphora:end -->"
+SESSIONS_MARK_START = "<!-- graphora-sessions:start -->"
+SESSIONS_MARK_END = "<!-- graphora-sessions:end -->"
 
 SKILL_BODY = """\
 # Graphora: code graph, blast radius, and risk memory
@@ -42,6 +44,41 @@ git history. Use it before you edit, and before you commit.
   from real structure, not inferred from text.
 - MCP alternative: `graphora serve-mcp` exposes blast_radius, review_diff,
   risk_top, find_symbol, and graph_stats as MCP tools.
+"""
+
+SESSIONS_SKILL_BODY = """\
+# Graphora session recall: cross-agent work memory as a graph
+
+This machine keeps a Graphora graph of AI-agent work history: every session
+(GitHub Copilot CLI, Claude Code, Codex CLI) with the files it touched, the
+repo it worked in, and the PRs/issues/commits it referenced. Use it whenever
+the user asks about past or parallel work, in ANY terminal, e.g.:
+
+- "which windows/sessions touched <file>?"
+- "what's connected to PR <n>?"
+- "what did I do in <repo> across all my agents?"
+- "did Claude or Copilot work on this?"
+
+## Workflow
+
+1. **Refresh first** (fast, idempotent, safe to run every time):
+   `graphora sessions ingest --days 7`
+   Ingests every agent store found (Copilot, Claude Code, Codex) and skips
+   missing ones. No Docker required: with no FalkorDB server running it
+   automatically uses the embedded JSON backend.
+2. **Then query**:
+   - `graphora sessions connected file <name>` — sessions that touched a file
+   - `graphora sessions connected ref <pr-number>` — sessions around a PR/issue/commit
+   - `graphora sessions connected repo <name>` — everything in one repo
+3. **Answer with a short digest**, one line per session: agent, summary,
+   relative time, and what connected it. Do not dump raw JSON.
+
+## Notes
+
+- Read-only on the agents' own stores; deterministic; no LLM in the pipeline.
+- Sessions from different agents connect the moment they share a file, repo,
+  or PR — that is the point: cross-agent memory.
+- Resume a Copilot session with `copilot --resume <session-id>`.
 """
 
 
@@ -108,12 +145,31 @@ def list_agents() -> list[str]:
     return [t.agent for t in SKILL_TARGETS]
 
 
-def install_skill(repo_root: str | Path, agents: list[str] | None = None) -> list[str]:
-    """Write the Graphora skill for the given agents (default: all).
+SKILL_KINDS = {
+    "code": {
+        "body": SKILL_BODY,
+        "marks": (MARK_START, MARK_END),
+        "slug": "graphora",
+        "description": "Check the Graphora code graph (blast radius, risk memory, grounded review) before editing or committing code in this repository.",
+    },
+    "sessions": {
+        "body": SESSIONS_SKILL_BODY,
+        "marks": (SESSIONS_MARK_START, SESSIONS_MARK_END),
+        "slug": "graphora-sessions",
+        "description": "Recall AI-agent work history (Copilot, Claude Code, Codex) from the Graphora session graph when asked about past or parallel sessions, files touched, or PRs.",
+    },
+}
+
+
+def install_skill(repo_root: str | Path, agents: list[str] | None = None, skill: str = "code") -> list[str]:
+    """Write a Graphora skill ("code" or "sessions") for the given agents (default: all).
 
     Returns the list of files written, relative to the repo root.
     Idempotent: own files are overwritten, marked blocks are replaced in place.
     """
+    if skill not in SKILL_KINDS:
+        raise ValueError(f"Unknown skill: {skill}. Known: {sorted(SKILL_KINDS)}")
+    kind = SKILL_KINDS[skill]
     root = Path(repo_root).resolve()
     wanted = set(agents) if agents else set(list_agents())
     unknown = wanted - set(list_agents())
@@ -124,25 +180,28 @@ def install_skill(repo_root: str | Path, agents: list[str] | None = None) -> lis
     for target in SKILL_TARGETS:
         if target.agent not in wanted:
             continue
-        path = root / target.path
+        rel = target.path.replace("graphora", kind["slug"]) if target.style == "file" else target.path
+        path = root / rel
         if target.style == "file":
+            frontmatter = target.frontmatter.replace("graphora\n", f"{kind['slug']}\n")
+            frontmatter = frontmatter.replace(SKILL_KINDS["code"]["description"], kind["description"])
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(target.frontmatter + SKILL_BODY, encoding="utf-8")
+            path.write_text(frontmatter + kind["body"], encoding="utf-8")
         else:
-            _write_block(path)
-        rel = target.path
+            _write_block(path, kind["body"], kind["marks"])
         if rel not in written:
             written.append(rel)
     return written
 
 
-def _write_block(path: Path) -> None:
-    block = f"{MARK_START}\n{SKILL_BODY}{MARK_END}\n"
+def _write_block(path: Path, body: str, marks: tuple[str, str]) -> None:
+    mark_start, mark_end = marks
+    block = f"{mark_start}\n{body}{mark_end}\n"
     if path.exists():
         text = path.read_text(encoding="utf-8")
-        if MARK_START in text and MARK_END in text:
-            head, rest = text.split(MARK_START, 1)
-            _, tail = rest.split(MARK_END, 1)
+        if mark_start in text and mark_end in text:
+            head, rest = text.split(mark_start, 1)
+            _, tail = rest.split(mark_end, 1)
             path.write_text(head + block.rstrip("\n") + tail, encoding="utf-8")
             return
         separator = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
