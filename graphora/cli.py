@@ -144,6 +144,24 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sessions_ingest(args: argparse.Namespace) -> int:
+    from graphora.sessions import ingest_session_store
+
+    store = open_store(args.project or "agent-sessions", backend=args.backend, host=args.host, port=args.port)
+    counts = ingest_session_store(store, db_path=args.db, days=args.days)
+    print(json.dumps({"project": store.project, "graph": store.graph_name, **counts}, indent=2))
+    return 0
+
+
+def cmd_sessions_connected(args: argparse.Namespace) -> int:
+    from graphora.sessions import connected
+
+    store = open_store(args.project or "agent-sessions", backend=args.backend, host=args.host, port=args.port)
+    rows = connected(store, args.kind, args.value)
+    print(json.dumps(rows, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="graphora", description="Deterministic code knowledge graph tool")
     parser.add_argument("--version", action="version", version=f"graphora {__version__}")
@@ -202,6 +220,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_mcp = sub.add_parser("serve-mcp", parents=[common], help="Serve the graph as an MCP stdio server")
     p_mcp.set_defaults(func=cmd_serve_mcp)
 
+    p_sess = sub.add_parser("sessions", parents=[common], help="Agent session-history graph commands")
+    sess_sub = p_sess.add_subparsers(dest="sessions_command", required=True)
+    p_si = sess_sub.add_parser("ingest", parents=[common], help="Ingest the Copilot CLI session store into the graph")
+    p_si.add_argument("--db", default=None, help="Path to session-store.db (default: ~/.copilot/session-store.db)")
+    p_si.add_argument("--days", type=int, default=30, help="Only sessions updated in the last N days")
+    p_si.set_defaults(func=cmd_sessions_ingest)
+    p_sc = sess_sub.add_parser("connected", parents=[common], help="Sessions connected to a file, repo, or PR/issue/commit")
+    p_sc.add_argument("kind", choices=["file", "repo", "ref"])
+    p_sc.add_argument("value")
+    p_sc.set_defaults(func=cmd_sessions_connected)
+
     p_skill = sub.add_parser("install-skill", help="Install the Graphora skill/rule for AI coding agents")
     p_skill.add_argument("agents", nargs="*", help="Agent names, or 'all' (default: all)")
     p_skill.add_argument("--repo", default=".", help="Repository root to install into (default: cwd)")
@@ -218,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
             args.project = Path(args.repo).resolve().name
         elif args.command == "risk" and getattr(args, "path", None):
             args.project = Path(args.path).resolve().name
+        elif args.command == "sessions":
+            args.project = "agent-sessions"
         else:
             args.project = Path.cwd().name
     return args.func(args)
