@@ -138,15 +138,16 @@ The longer Graphora runs on a repository, the smarter it gets. That compounds.
 
 ## Agent session memory: graph your work, not just your code
 
-If you use the GitHub Copilot CLI across many terminal tabs, it already records every
-session locally (`~/.copilot/session-store.db`): summaries, files touched, PR references.
-Graphora ingests that as another data source, so sessions from different terminals become
-connected the moment they touch the same file, repo, or PR:
+AI coding agents already record every session locally: GitHub Copilot CLI
+(`~/.copilot/session-store.db`), Claude Code (`~/.claude/projects/`), Codex CLI
+(`~/.codex/sessions/`). Graphora ingests them all into **one graph**, so sessions from
+different terminals · and different agents · become connected the moment they touch the
+same file, repo, or PR. Cross-agent memory: "which agent touched build.yml?"
 
 ```bash
-graphora sessions ingest --days 7             # load your session history into the graph
+graphora sessions ingest --days 7             # all agents found (or --source copilot|claude|codex)
 
-graphora sessions connected file build.yml    # which windows touched this file?
+graphora sessions connected file build.yml    # which windows/agents touched this file?
 graphora sessions connected ref 275           # which sessions relate to PR 275?
 graphora sessions connected repo org/proj     # everything that happened in one repo
 ```
@@ -158,7 +159,14 @@ graphora sessions ingest --days 7 --backend embedded
 graphora sessions connected file build.yml --backend embedded
 ```
 
-Read-only on the source, no LLM, idempotent. See [use case 6](USECASES.md).
+Make it zero-effort: install the session-recall skill so your agents run these
+commands themselves when you ask "which sessions touched this file?":
+
+```bash
+graphora install-skill all --skill sessions   # or --skill all for code + sessions
+```
+
+Read-only on the sources, no LLM, idempotent. See [use case 6](USECASES.md).
 
 ## Benchmarks
 

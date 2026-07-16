@@ -212,9 +212,14 @@ graphora sessions connected repo org/proj     # everything that happened in one 
 1. `pip install graphora-kg`
 2. Have FalkorDB running (`docker run -d -p 6379:6379 falkordb/falkordb`), **or** skip
    Docker entirely and add `--backend embedded` to every command below.
-3. `graphora sessions ingest --days 7` — safe to re-run anytime; it's idempotent.
+3. `graphora sessions ingest --days 7` — ingests every agent store found on the machine
+   (Copilot CLI, Claude Code, Codex CLI), skips missing ones, safe to re-run anytime.
+   Use `--source copilot|claude|codex` to ingest just one.
 4. Ask away: `graphora sessions connected file <name>` / `ref <pr-number>` / `repo <name>`.
-5. Optional: `graphora serve-mcp --project agent-sessions` exposes your work history to
+   Each hit is tagged with the agent that did the work — cross-agent memory.
+5. Zero-effort mode: `graphora install-skill all --skill sessions` teaches your agents
+   (22 supported) to run these commands themselves when you ask about past work.
+6. Optional: `graphora serve-mcp --project agent-sessions` exposes your work history to
    any MCP-capable agent.
 
 Captured output:
