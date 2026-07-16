@@ -106,6 +106,53 @@ class GraphStore:
         except Exception:
             pass
 
+    # --- agent sessions (see graphora/sessions.py) -------------------------
+
+    def upsert_session(self, sid: str, props: dict) -> None:
+        self.query(
+            """MERGE (s:Session {id: $id})
+               SET s.summary = $summary, s.cwd = $cwd, s.branch = $branch,
+                   s.created_at = $created_at, s.updated_at = $updated_at, s.last_ask = $last_ask""",
+            {"id": sid, **props},
+        )
+
+    def link_session_repo(self, sid: str, repo: str) -> None:
+        self.query(
+            """MERGE (r:Repo {name: $repo})
+               WITH r MATCH (s:Session {id: $id}) MERGE (s)-[:IN_REPO]->(r)""",
+            {"repo": repo, "id": sid},
+        )
+
+    def link_session_file(self, sid: str, path: str, tool: str) -> None:
+        self.query(
+            """MERGE (f:WorkFile {path: $path})
+               WITH f MATCH (s:Session {id: $id})
+               MERGE (s)-[t:TOUCHED]->(f) SET t.tool = $tool""",
+            {"path": path, "id": sid, "tool": tool},
+        )
+
+    def link_session_ref(self, sid: str, kind: str, value: str) -> None:
+        self.query(
+            """MERGE (x:Ref {kind: $kind, value: $value})
+               WITH x MATCH (s:Session {id: $id}) MERGE (s)-[:REFERENCES]->(x)""",
+            {"kind": kind, "value": value, "id": sid},
+        )
+
+    def sessions_connected(self, kind: str, value: str) -> list[list]:
+        if kind == "file":
+            cypher = """MATCH (s:Session)-[:TOUCHED]->(f:WorkFile)
+                        WHERE f.path ENDS WITH $v
+                        RETURN s.id, s.summary, s.updated_at, f.path ORDER BY s.updated_at DESC"""
+        elif kind == "repo":
+            cypher = """MATCH (s:Session)-[:IN_REPO]->(r:Repo {name: $v})
+                        RETURN s.id, s.summary, s.updated_at, r.name ORDER BY s.updated_at DESC"""
+        else:
+            cypher = """MATCH (s:Session)-[:REFERENCES]->(x:Ref)
+                        WHERE x.value = $v OR x.value ENDS WITH $v
+                        RETURN s.id, s.summary, s.updated_at, x.kind + ' ' + x.value
+                        ORDER BY s.updated_at DESC"""
+        return self.query(cypher, {"v": value})
+
     # --- reads ------------------------------------------------------------
 
     def stats(self) -> dict[str, int]:

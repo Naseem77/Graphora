@@ -61,7 +61,7 @@ def _read_source(db_path: Path, days: int) -> dict[str, list[tuple]]:
 
 
 def ingest_session_store(store, db_path: str | Path | None = None, days: int = 30) -> dict[str, int]:
-    """Ingest agent sessions into `store`. Returns node/edge counts."""
+    """Ingest agent sessions into `store` (FalkorDB or embedded). Returns counts."""
     db = Path(db_path) if db_path else DEFAULT_DB
     if not db.exists():
         raise FileNotFoundError(f"Session store not found: {db}")
@@ -69,35 +69,23 @@ def ingest_session_store(store, db_path: str | Path | None = None, days: int = 3
     last_ask = dict(data["last_turns"])
 
     for sid, summary, cwd, repo, branch, created, updated in data["sessions"]:
-        store.query(
-            """MERGE (s:Session {id: $id})
-               SET s.summary = $summary, s.cwd = $cwd, s.branch = $branch,
-                   s.created_at = $created, s.updated_at = $updated, s.last_ask = $ask""",
-            {"id": sid, "summary": summary, "cwd": cwd, "branch": branch,
-             "created": created, "updated": updated, "ask": last_ask.get(sid, "")},
+        store.upsert_session(
+            sid,
+            {"summary": summary, "cwd": cwd, "branch": branch,
+             "created_at": created, "updated_at": updated, "last_ask": last_ask.get(sid, "")},
         )
         repo_name = repo or (Path(cwd).name if cwd else "")
         if repo_name:
-            store.query(
-                """MERGE (r:Repo {name: $repo})
-                   WITH r MATCH (s:Session {id: $id}) MERGE (s)-[:IN_REPO]->(r)""",
-                {"repo": repo_name, "id": sid},
-            )
+            store.link_session_repo(sid, repo_name)
 
     for sid, path, tool in data["files"]:
-        store.query(
-            """MERGE (f:WorkFile {path: $path})
-               WITH f MATCH (s:Session {id: $id})
-               MERGE (s)-[t:TOUCHED]->(f) SET t.tool = $tool""",
-            {"path": path, "id": sid, "tool": tool},
-        )
+        store.link_session_file(sid, path, tool)
 
     for sid, ref_type, ref_value in data["refs"]:
-        store.query(
-            """MERGE (x:Ref {kind: $kind, value: $value})
-               WITH x MATCH (s:Session {id: $id}) MERGE (s)-[:REFERENCES]->(x)""",
-            {"kind": ref_type, "value": ref_value, "id": sid},
-        )
+        store.link_session_ref(sid, ref_type, ref_value)
+
+    if hasattr(store, "save"):
+        store.save()
 
     return {
         "sessions": len(data["sessions"]),
@@ -108,19 +96,7 @@ def ingest_session_store(store, db_path: str | Path | None = None, days: int = 3
 
 def connected(store, kind: str, value: str) -> list[dict]:
     """Sessions connected to a file path, repo, or ref value (e.g. a PR number)."""
-    if kind == "file":
-        cypher = """MATCH (s:Session)-[:TOUCHED]->(f:WorkFile)
-                    WHERE f.path ENDS WITH $v
-                    RETURN s.id, s.summary, s.updated_at, f.path ORDER BY s.updated_at DESC"""
-    elif kind == "repo":
-        cypher = """MATCH (s:Session)-[:IN_REPO]->(r:Repo {name: $v})
-                    RETURN s.id, s.summary, s.updated_at, r.name ORDER BY s.updated_at DESC"""
-    else:  # ref: pr / issue / commit value
-        cypher = """MATCH (s:Session)-[:REFERENCES]->(x:Ref)
-                    WHERE x.value = $v OR x.value ENDS WITH $v
-                    RETURN s.id, s.summary, s.updated_at, x.kind + ' ' + x.value
-                    ORDER BY s.updated_at DESC"""
-    rows = store.query(cypher, {"v": value})
+    rows = store.sessions_connected(kind, value)
     return [
         {"session": r[0][:8], "summary": r[1], "updated_at": r[2], "via": r[3]}
         for r in rows
