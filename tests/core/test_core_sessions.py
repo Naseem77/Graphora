@@ -1,26 +1,25 @@
-"""Session-store ingestion tests (integration, needs FalkorDB on :6379)."""
+"""Session-store ingestion tests: embedded always, FalkorDB when available on :6379."""
 
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("falkordb")
-from falkordb import FalkorDB  # noqa: E402
-
-from graphora.sessions import connected, ingest_session_store  # noqa: E402
-from graphora.store import GraphStore  # noqa: E402
+from graphora.embedded import EmbeddedGraphStore
+from graphora.sessions import connected, ingest_session_store
 
 
 def _falkordb_available() -> bool:
     try:
+        from falkordb import FalkorDB
+
         FalkorDB(host="localhost", port=6379).select_graph("graphora:ping").query("RETURN 1")
         return True
     except Exception:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _falkordb_available(), reason="FalkorDB not running on localhost:6379")
+FALKORDB_UP = _falkordb_available()
 
 
 @pytest.fixture()
@@ -65,11 +64,20 @@ def session_db(tmp_path: Path) -> Path:
     return db
 
 
-@pytest.fixture()
-def store():
-    store = GraphStore("sessions-test")
-    yield store
-    store.delete_graph()
+@pytest.fixture(params=["embedded", "falkordb"])
+def store(request, tmp_path):
+    if request.param == "embedded":
+        store = EmbeddedGraphStore("sessions-test", data_dir=tmp_path / "graphs")
+        yield store
+        store.delete_graph()
+    else:
+        if not FALKORDB_UP:
+            pytest.skip("FalkorDB not running on localhost:6379")
+        from graphora.store import GraphStore
+
+        store = GraphStore("sessions-test")
+        yield store
+        store.delete_graph()
 
 
 def test_ingest_counts(store, session_db):
@@ -80,16 +88,19 @@ def test_ingest_counts(store, session_db):
 def test_ingest_is_idempotent(store, session_db):
     ingest_session_store(store, db_path=session_db, days=7)
     ingest_session_store(store, db_path=session_db, days=7)
-    rows = store.query("MATCH (s:Session) RETURN count(s)")
-    assert rows[0][0] == 3
-    rows = store.query("MATCH (:Session)-[t:TOUCHED]->(:WorkFile) RETURN count(t)")
-    assert rows[0][0] == 3
+    # re-ingesting must not duplicate sessions or TOUCHED edges
+    assert len(connected(store, "file", "build.yml")) == 2
+    assert len(connected(store, "repo", "org/proj")) == 2
+    assert len(connected(store, "ref", "275")) == 2
 
 
 def test_session_node_has_last_ask(store, session_db):
     ingest_session_store(store, db_path=session_db, days=7)
-    rows = store.query("MATCH (s:Session {id: 'aaa11111-1111'}) RETURN s.last_ask")
-    assert rows[0][0] == "add a healthcheck"
+    if hasattr(store, "_data"):  # embedded
+        ask = store._data["sessions"]["aaa11111-1111"]["last_ask"]
+    else:  # falkordb
+        ask = store.query("MATCH (s:Session {id: 'aaa11111-1111'}) RETURN s.last_ask")[0][0]
+    assert ask == "add a healthcheck"
 
 
 def test_connected_by_file(store, session_db):
