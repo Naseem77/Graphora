@@ -145,11 +145,19 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
 
 
 def cmd_sessions_ingest(args: argparse.Namespace) -> int:
-    from graphora.sessions import ingest_session_store
+    from graphora.sessions import ingest_sources
 
     store = open_store(args.project or "agent-sessions", backend=args.backend, host=args.host, port=args.port)
-    counts = ingest_session_store(store, db_path=args.db, days=args.days)
-    print(json.dumps({"project": store.project, "graph": store.graph_name, **counts}, indent=2))
+    sources = None if args.source == "all" else [args.source]
+    paths = {}
+    if args.db:
+        paths["copilot"] = args.db
+    if args.claude_root:
+        paths["claude"] = args.claude_root
+    if args.codex_root:
+        paths["codex"] = args.codex_root
+    results = ingest_sources(store, sources=sources, days=args.days, paths=paths)
+    print(json.dumps({"project": store.project, "graph": store.graph_name, "sources": results}, indent=2))
     return 0
 
 
@@ -222,8 +230,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sess = sub.add_parser("sessions", parents=[common], help="Agent session-history graph commands")
     sess_sub = p_sess.add_subparsers(dest="sessions_command", required=True)
-    p_si = sess_sub.add_parser("ingest", parents=[common], help="Ingest the Copilot CLI session store into the graph")
-    p_si.add_argument("--db", default=None, help="Path to session-store.db (default: ~/.copilot/session-store.db)")
+    p_si = sess_sub.add_parser("ingest", parents=[common], help="Ingest agent session stores into the graph")
+    p_si.add_argument("--source", choices=["all", "copilot", "claude", "codex"], default="all",
+                      help="Which agent's sessions to ingest (default: all found)")
+    p_si.add_argument("--db", default=None, help="Copilot session-store.db path (default: ~/.copilot/session-store.db)")
+    p_si.add_argument("--claude-root", default=None, help="Claude Code projects dir (default: ~/.claude/projects)")
+    p_si.add_argument("--codex-root", default=None, help="Codex CLI sessions dir (default: ~/.codex/sessions)")
     p_si.add_argument("--days", type=int, default=30, help="Only sessions updated in the last N days")
     p_si.set_defaults(func=cmd_sessions_ingest)
     p_sc = sess_sub.add_parser("connected", parents=[common], help="Sessions connected to a file, repo, or PR/issue/commit")
