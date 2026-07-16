@@ -207,6 +207,16 @@ graphora sessions connected ref 275           # which sessions relate to PR 275?
 graphora sessions connected repo org/proj     # everything that happened in one repo
 ```
 
+**How to use it** (step by step):
+
+1. `pip install graphora-kg`
+2. Have FalkorDB running (`docker run -d -p 6379:6379 falkordb/falkordb`), **or** skip
+   Docker entirely and add `--backend embedded` to every command below.
+3. `graphora sessions ingest --days 7` — safe to re-run anytime; it's idempotent.
+4. Ask away: `graphora sessions connected file <name>` / `ref <pr-number>` / `repo <name>`.
+5. Optional: `graphora serve-mcp --project agent-sessions` exposes your work history to
+   any MCP-capable agent.
+
 Captured output:
 
 ```json

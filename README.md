@@ -151,6 +151,13 @@ graphora sessions connected ref 275           # which sessions relate to PR 275?
 graphora sessions connected repo org/proj     # everything that happened in one repo
 ```
 
+No FalkorDB container? Same commands work with the embedded JSON backend:
+
+```bash
+graphora sessions ingest --days 7 --backend embedded
+graphora sessions connected file build.yml --backend embedded
+```
+
 Read-only on the source, no LLM, idempotent. See [use case 6](USECASES.md).
 
 ## Benchmarks
