@@ -125,3 +125,119 @@ def test_connected_by_repo(store, session_db):
 def test_missing_db_raises(store, tmp_path):
     with pytest.raises(FileNotFoundError):
         ingest_session_store(store, db_path=tmp_path / "nope.db")
+
+
+@pytest.fixture()
+def claude_root(tmp_path: Path) -> Path:
+    import json as _json
+
+    proj = tmp_path / "claude-projects" / "-Users-u-proj"
+    proj.mkdir(parents=True)
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    lines = [
+        {"type": "last-prompt", "lastPrompt": "fix the flaky test", "sessionId": "cl-1"},
+        {"type": "user", "cwd": "/home/u/proj", "gitBranch": "main", "timestamp": now,
+         "message": {"content": "fix the flaky test"}},
+        {"type": "assistant", "timestamp": now, "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "/home/u/proj/build.yml"}},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "/home/u/proj/main.py"}},
+        ]}},
+        {"type": "user", "cwd": "/home/u/proj", "timestamp": now,
+         "message": {"content": "also add a retry"}},
+    ]
+    (proj / "claude-session-1.jsonl").write_text(
+        "\n".join(_json.dumps(o) for o in lines), encoding="utf-8"
+    )
+    return tmp_path / "claude-projects"
+
+
+def test_read_claude_code(claude_root):
+    from graphora.sessions import read_claude_code
+
+    data = read_claude_code(claude_root, days=7)
+    assert len(data["sessions"]) == 1
+    sid, summary, cwd, repo, branch, _, _ = data["sessions"][0]
+    assert sid == "claude-session-1"
+    assert summary == "fix the flaky test"
+    assert (cwd, repo, branch) == ("/home/u/proj", "proj", "main")
+    assert sorted(p for _, p, _ in data["files"]) == ["/home/u/proj/build.yml", "/home/u/proj/main.py"]
+    assert data["last_turns"] == [["claude-session-1", "also add a retry"]]
+
+
+def test_read_claude_code_skips_old_sessions(claude_root, tmp_path):
+    import json as _json
+
+    old = claude_root / "-Users-u-old"
+    old.mkdir()
+    (old / "ancient.jsonl").write_text(_json.dumps(
+        {"type": "user", "cwd": "/home/u/old", "timestamp": "2020-01-01T00:00:00Z",
+         "message": {"content": "old stuff"}}), encoding="utf-8")
+    from graphora.sessions import read_claude_code
+
+    data = read_claude_code(claude_root, days=7)
+    assert [s[0] for s in data["sessions"]] == ["claude-session-1"]
+
+
+def test_read_codex(tmp_path):
+    import json as _json
+    from datetime import datetime, timezone
+
+    root = tmp_path / "codex-sessions" / "2026" / "07"
+    root.mkdir(parents=True)
+    now = datetime.now(timezone.utc).isoformat()
+    lines = [
+        {"type": "session_meta", "timestamp": now, "payload": {"id": "cx-1", "cwd": "/home/u/proj"}},
+        {"type": "response_item", "timestamp": now,
+         "payload": {"role": "user", "content": [{"type": "input_text", "text": "refactor the parser"}]}},
+    ]
+    (root / "rollout-1.jsonl").write_text("\n".join(_json.dumps(o) for o in lines), encoding="utf-8")
+    from graphora.sessions import read_codex
+
+    data = read_codex(tmp_path / "codex-sessions", days=7)
+    assert [s[0] for s in data["sessions"]] == ["cx-1"]
+    assert data["sessions"][0][2] == "/home/u/proj"
+    assert data["last_turns"] == [["cx-1", "refactor the parser"]]
+
+
+def test_ingest_sources_cross_agent(store, session_db, claude_root):
+    from graphora.sessions import ingest_sources
+
+    results = ingest_sources(
+        store, sources=["copilot", "claude"], days=7,
+        paths={"copilot": session_db, "claude": claude_root},
+    )
+    assert results["copilot"]["sessions"] == 3
+    assert results["claude"]["sessions"] == 1
+    # cross-agent memory: both agents touched build.yml
+    hits = connected(store, "file", "build.yml")
+    agents = {h["agent"] for h in hits}
+    assert agents == {"copilot", "claude"}
+
+
+def test_ingest_sources_skips_missing_when_all(store, session_db, tmp_path):
+    from graphora.sessions import ingest_sources
+
+    results = ingest_sources(
+        store, sources=None, days=7,
+        paths={"copilot": session_db,
+               "claude": tmp_path / "nope-claude",
+               "codex": tmp_path / "nope-codex"},
+    )
+    assert results["copilot"]["sessions"] == 3
+    assert "skipped" in results["claude"]
+    assert "skipped" in results["codex"]
+
+
+def test_ingest_sources_unknown_source_raises(store):
+    from graphora.sessions import ingest_sources
+
+    with pytest.raises(ValueError):
+        ingest_sources(store, sources=["gemini"])
+
+
+def test_connected_reports_agent(store, session_db):
+    ingest_session_store(store, db_path=session_db, days=7)
+    hits = connected(store, "file", "build.yml")
+    assert all(h["agent"] == "copilot" for h in hits)

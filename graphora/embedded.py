@@ -216,7 +216,8 @@ class EmbeddedGraphStore:
 
         def row(sid: str, via: str) -> list:
             props = sessions.get(sid, {})
-            return [sid, props.get("summary", ""), props.get("updated_at", ""), via]
+            return [sid, props.get("summary", ""), props.get("updated_at", ""), via,
+                    props.get("agent", "")]
 
         if kind == "file":
             hits = [row(e["sid"], e["path"])

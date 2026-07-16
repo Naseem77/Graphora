@@ -111,9 +111,9 @@ class GraphStore:
     def upsert_session(self, sid: str, props: dict) -> None:
         self.query(
             """MERGE (s:Session {id: $id})
-               SET s.summary = $summary, s.cwd = $cwd, s.branch = $branch,
+               SET s.agent = $agent, s.summary = $summary, s.cwd = $cwd, s.branch = $branch,
                    s.created_at = $created_at, s.updated_at = $updated_at, s.last_ask = $last_ask""",
-            {"id": sid, **props},
+            {"id": sid, "agent": "", **props},
         )
 
     def link_session_repo(self, sid: str, repo: str) -> None:
@@ -142,14 +142,16 @@ class GraphStore:
         if kind == "file":
             cypher = """MATCH (s:Session)-[:TOUCHED]->(f:WorkFile)
                         WHERE f.path ENDS WITH $v
-                        RETURN s.id, s.summary, s.updated_at, f.path ORDER BY s.updated_at DESC"""
+                        RETURN s.id, s.summary, s.updated_at, f.path, s.agent
+                        ORDER BY s.updated_at DESC"""
         elif kind == "repo":
             cypher = """MATCH (s:Session)-[:IN_REPO]->(r:Repo {name: $v})
-                        RETURN s.id, s.summary, s.updated_at, r.name ORDER BY s.updated_at DESC"""
+                        RETURN s.id, s.summary, s.updated_at, r.name, s.agent
+                        ORDER BY s.updated_at DESC"""
         else:
             cypher = """MATCH (s:Session)-[:REFERENCES]->(x:Ref)
                         WHERE x.value = $v OR x.value ENDS WITH $v
-                        RETURN s.id, s.summary, s.updated_at, x.kind + ' ' + x.value
+                        RETURN s.id, s.summary, s.updated_at, x.kind + ' ' + x.value, s.agent
                         ORDER BY s.updated_at DESC"""
         return self.query(cypher, {"v": value})
 
