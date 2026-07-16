@@ -136,6 +136,23 @@ A symbol fixed often and recently scores near 1.0. A quiet area decays by half e
 
 The longer Graphora runs on a repository, the smarter it gets. That compounds.
 
+## Agent session memory: graph your work, not just your code
+
+If you use the GitHub Copilot CLI across many terminal tabs, it already records every
+session locally (`~/.copilot/session-store.db`): summaries, files touched, PR references.
+Graphora ingests that as another data source, so sessions from different terminals become
+connected the moment they touch the same file, repo, or PR:
+
+```bash
+graphora sessions ingest --days 7             # load your session history into the graph
+
+graphora sessions connected file build.yml    # which windows touched this file?
+graphora sessions connected ref 275           # which sessions relate to PR 275?
+graphora sessions connected repo org/proj     # everything that happened in one repo
+```
+
+Read-only on the source, no LLM, idempotent. See [use case 6](USECASES.md).
+
 ## Benchmarks
 
 Measured on real repositories, fully deterministic, zero network. Full methodology and reproduction commands in [BENCHMARKS.md](./BENCHMARKS.md).
