@@ -1,6 +1,7 @@
 # Graphora Use Cases
 
-Five real scenarios, all executed locally and captured verbatim on 2026-07-14.
+Six real scenarios, all executed locally and captured verbatim (use cases 1–5 on
+2026-07-14, use case 6 on 2026-07-16).
 Environment: macOS, Python 3.11, FalkorDB in Docker on `localhost:6379`.
 
 Setup used for all of them:
@@ -165,6 +166,79 @@ time), every candidate is linked and tagged `AMBIGUOUS`. Same-file calls are `EX
 single-candidate cross-file resolutions are `INFERRED`. A reviewer, an agent, or an LLM
 downstream can weigh facts accordingly. This honesty is what makes graph output
 trustworthy enough to gate merges on.
+
+---
+
+## Use case 6: agent session memory as a graph
+
+**Scenario**: you work with AI coding agents in many terminal tabs at once. Each tab has
+its own context, and after a day you no longer remember which window did what, which
+sessions touched the same file, or which ones relate to the PR you're reviewing.
+
+The Copilot CLI already records every session in a local SQLite store
+(`~/.copilot/session-store.db`): summaries, messages, files touched, PR/issue/commit
+references. Graphora ingests it as just another data source — no code parsing, same
+graph, same tooling:
+
+```bash
+graphora sessions ingest --days 7
+```
+
+Captured output against a real workstation store (2026-07-16):
+
+```json
+{
+  "project": "agent-sessions",
+  "graph": "graphora:agent-sessions",
+  "sessions": 19,
+  "files_touched": 158,
+  "refs": 24
+}
+```
+
+The graph is `(:Session)-[:TOUCHED]->(:WorkFile)`, `(:Session)-[:IN_REPO]->(:Repo)`,
+`(:Session)-[:REFERENCES]->(:Ref)`. Sessions from different terminals become connected
+the moment they touch the same file, repo, or PR. Then ask relationship questions that
+are painful in SQL and trivial in Cypher:
+
+```bash
+graphora sessions connected file build.yml    # which windows touched this file?
+graphora sessions connected ref 275           # which sessions relate to PR 275?
+graphora sessions connected repo org/proj     # everything that happened in one repo
+```
+
+**How to use it** (step by step):
+
+1. `pip install graphora-kg`
+2. Have FalkorDB running (`docker run -d -p 6379:6379 falkordb/falkordb`), **or** skip
+   Docker entirely and add `--backend embedded` to every command below.
+3. `graphora sessions ingest --days 7` — ingests every agent store found on the machine
+   (Copilot CLI, Claude Code, Codex CLI), skips missing ones, safe to re-run anytime.
+   Use `--source copilot|claude|codex` to ingest just one.
+4. Ask away: `graphora sessions connected file <name>` / `ref <pr-number>` / `repo <name>`.
+   Each hit is tagged with the agent that did the work — cross-agent memory.
+5. Zero-effort mode: `graphora install-skill all --skill sessions` teaches your agents
+   (22 supported) to run these commands themselves when you ask about past work.
+6. Optional: `graphora serve-mcp --project agent-sessions` exposes your work history to
+   any MCP-capable agent.
+
+Captured output:
+
+```json
+[
+  {
+    "session": "007d10dd",
+    "summary": "Add Docker Build Completion Check",
+    "updated_at": "2026-07-14T07:47:52.822Z",
+    "via": "/Users/naseemali/Documents/GitHub/FalkorDB/.github/workflows/build.yml"
+  }
+]
+```
+
+**Why it matters**: tools like graphify map your *code*; Graphora also maps your *work*.
+Ingestion is deterministic and read-only on the source (no LLM, no writes to the session
+store), idempotent (re-ingesting never duplicates nodes), and reuses the live FalkorDB
+graph, so the MCP server exposes your work history to any agent for free.
 
 ---
 

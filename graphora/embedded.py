@@ -52,6 +52,10 @@ class EmbeddedGraphStore:
             "fix_commits": {},  # sha -> {date, subject, kind}
             "touched": [],      # [sha, path]
             "fixed": [],        # [sha, stable_key]
+            "sessions": {},         # sid -> {summary, cwd, branch, created_at, updated_at, last_ask}
+            "session_repos": [],    # [sid, repo]
+            "session_files": [],    # {sid, path, tool}
+            "session_refs": [],     # [sid, kind, value]
         }
 
     @property
@@ -183,6 +187,51 @@ class EmbeddedGraphStore:
 
     def has_files(self) -> bool:
         return bool(self._data["files"])
+
+    # --- agent sessions (see graphora/sessions.py) -------------------------
+
+    def upsert_session(self, sid: str, props: dict) -> None:
+        self._data.setdefault("sessions", {})[sid] = dict(props)
+
+    def link_session_repo(self, sid: str, repo: str) -> None:
+        edges = self._data.setdefault("session_repos", [])
+        if [sid, repo] not in edges:
+            edges.append([sid, repo])
+
+    def link_session_file(self, sid: str, path: str, tool: str) -> None:
+        edges = self._data.setdefault("session_files", [])
+        for edge in edges:
+            if edge["sid"] == sid and edge["path"] == path:
+                edge["tool"] = tool
+                return
+        edges.append({"sid": sid, "path": path, "tool": tool})
+
+    def link_session_ref(self, sid: str, kind: str, value: str) -> None:
+        edges = self._data.setdefault("session_refs", [])
+        if [sid, kind, value] not in edges:
+            edges.append([sid, kind, value])
+
+    def sessions_connected(self, kind: str, value: str) -> list[list]:
+        sessions = self._data.get("sessions", {})
+
+        def row(sid: str, via: str) -> list:
+            props = sessions.get(sid, {})
+            return [sid, props.get("summary", ""), props.get("updated_at", ""), via,
+                    props.get("agent", "")]
+
+        if kind == "file":
+            hits = [row(e["sid"], e["path"])
+                    for e in self._data.get("session_files", [])
+                    if e["path"].endswith(value)]
+        elif kind == "repo":
+            hits = [row(sid, repo)
+                    for sid, repo in self._data.get("session_repos", [])
+                    if repo == value]
+        else:
+            hits = [row(sid, f"{k} {v}")
+                    for sid, k, v in self._data.get("session_refs", [])
+                    if v == value or v.endswith(value)]
+        return sorted(hits, key=lambda r: r[2], reverse=True)
 
     def find_definitions(self, name: str) -> list[list]:
         return [

@@ -135,12 +135,41 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
         print("\n".join(list_agents()))
         return 0
     agents = None if not args.agents or args.agents == ["all"] else args.agents
+    kinds = ["code", "sessions"] if args.skill == "all" else [args.skill]
     try:
-        written = install_skill(args.repo, agents)
+        written = []
+        for kind in kinds:
+            written.extend(install_skill(args.repo, agents, skill=kind))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(json.dumps({"repo": str(Path(args.repo).resolve()), "written": written}, indent=2))
+    return 0
+
+
+def cmd_sessions_ingest(args: argparse.Namespace) -> int:
+    from graphora.sessions import ingest_sources
+
+    store = open_store(args.project or "agent-sessions", backend=args.backend, host=args.host, port=args.port)
+    sources = None if args.source == "all" else [args.source]
+    paths = {}
+    if args.db:
+        paths["copilot"] = args.db
+    if args.claude_root:
+        paths["claude"] = args.claude_root
+    if args.codex_root:
+        paths["codex"] = args.codex_root
+    results = ingest_sources(store, sources=sources, days=args.days, paths=paths)
+    print(json.dumps({"project": store.project, "graph": store.graph_name, "sources": results}, indent=2))
+    return 0
+
+
+def cmd_sessions_connected(args: argparse.Namespace) -> int:
+    from graphora.sessions import connected
+
+    store = open_store(args.project or "agent-sessions", backend=args.backend, host=args.host, port=args.port)
+    rows = connected(store, args.kind, args.value)
+    print(json.dumps(rows, indent=2))
     return 0
 
 
@@ -202,10 +231,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_mcp = sub.add_parser("serve-mcp", parents=[common], help="Serve the graph as an MCP stdio server")
     p_mcp.set_defaults(func=cmd_serve_mcp)
 
+    p_sess = sub.add_parser("sessions", parents=[common], help="Agent session-history graph commands")
+    sess_sub = p_sess.add_subparsers(dest="sessions_command", required=True)
+    p_si = sess_sub.add_parser("ingest", parents=[common], help="Ingest agent session stores into the graph")
+    p_si.add_argument("--source", choices=["all", "copilot", "claude", "codex"], default="all",
+                      help="Which agent's sessions to ingest (default: all found)")
+    p_si.add_argument("--db", default=None, help="Copilot session-store.db path (default: ~/.copilot/session-store.db)")
+    p_si.add_argument("--claude-root", default=None, help="Claude Code projects dir (default: ~/.claude/projects)")
+    p_si.add_argument("--codex-root", default=None, help="Codex CLI sessions dir (default: ~/.codex/sessions)")
+    p_si.add_argument("--days", type=int, default=30, help="Only sessions updated in the last N days")
+    p_si.set_defaults(func=cmd_sessions_ingest)
+    p_sc = sess_sub.add_parser("connected", parents=[common], help="Sessions connected to a file, repo, or PR/issue/commit")
+    p_sc.add_argument("kind", choices=["file", "repo", "ref"])
+    p_sc.add_argument("value")
+    p_sc.set_defaults(func=cmd_sessions_connected)
+
     p_skill = sub.add_parser("install-skill", help="Install the Graphora skill/rule for AI coding agents")
     p_skill.add_argument("agents", nargs="*", help="Agent names, or 'all' (default: all)")
     p_skill.add_argument("--repo", default=".", help="Repository root to install into (default: cwd)")
     p_skill.add_argument("--list", action="store_true", help="List supported agents")
+    p_skill.add_argument("--skill", choices=["code", "sessions", "all"], default="code",
+                         help="Which skill to install: code graph workflow, session recall, or both")
     p_skill.set_defaults(func=cmd_install_skill)
 
     return parser
@@ -218,6 +264,8 @@ def main(argv: list[str] | None = None) -> int:
             args.project = Path(args.repo).resolve().name
         elif args.command == "risk" and getattr(args, "path", None):
             args.project = Path(args.path).resolve().name
+        elif args.command == "sessions":
+            args.project = "agent-sessions"
         else:
             args.project = Path.cwd().name
     return args.func(args)

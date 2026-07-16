@@ -93,3 +93,40 @@ def test_cli_install_skill_unknown_agent_fails(tmp_path: Path, capsys):
     from graphora.cli import main
 
     assert main(["install-skill", "clippy", "--repo", str(tmp_path)]) == 1
+
+
+def test_install_sessions_skill_writes_own_files(tmp_path: Path):
+    written = install_skill(tmp_path, ["claude-code", "cursor"], skill="sessions")
+    assert ".claude/skills/graphora-sessions/SKILL.md" in written
+    assert ".cursor/rules/graphora-sessions.mdc" in written
+    text = (tmp_path / ".claude/skills/graphora-sessions/SKILL.md").read_text()
+    assert "name: graphora-sessions" in text
+    assert "sessions ingest" in text
+    assert "cross-agent" in text.lower()
+
+
+def test_sessions_and_code_skills_coexist_in_shared_file(tmp_path: Path):
+    install_skill(tmp_path, ["codex"], skill="code")
+    install_skill(tmp_path, ["codex"], skill="sessions")
+    text = (tmp_path / "AGENTS.md").read_text()
+    assert "<!-- graphora:start -->" in text
+    assert "<!-- graphora-sessions:start -->" in text
+    # re-install must not duplicate
+    install_skill(tmp_path, ["codex"], skill="sessions")
+    assert text.count("graphora-sessions:start") == (tmp_path / "AGENTS.md").read_text().count("graphora-sessions:start")
+
+
+def test_unknown_skill_kind_raises(tmp_path: Path):
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        install_skill(tmp_path, ["codex"], skill="nope")
+
+
+def test_cli_install_both_skills(tmp_path: Path, capsys):
+    from graphora.cli import main
+
+    assert main(["install-skill", "copilot-cli", "--repo", str(tmp_path), "--skill", "all"]) == 0
+    text = (tmp_path / "AGENTS.md").read_text()
+    assert "<!-- graphora:start -->" in text
+    assert "<!-- graphora-sessions:start -->" in text
