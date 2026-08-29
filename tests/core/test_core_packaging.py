@@ -9,7 +9,10 @@ release above 0.26.0.
 
 This file also asserts the project's active version surfaces
 (`pyproject.toml`'s `[project].version`, `graphora.__version__`, and the
-installed package metadata) agree, so a partial version bump is caught.
+installed package metadata) agree, so a partial version bump is caught,
+and that README.md's banner image uses an absolute URL (not a
+repo-relative path, which PyPI cannot resolve) in the packaged long
+description.
 """
 
 import importlib.metadata as metadata
@@ -81,4 +84,20 @@ def test_active_version_surfaces_agree():
         f"installed graphora-kg metadata version ({installed_version}) must match "
         f"pyproject.toml's [project].version ({pyproject_version}) -- reinstall "
         "(`pip install -e .`) after bumping the version"
+    )
+
+
+def test_readme_banner_uses_absolute_url_in_packaged_long_description():
+    # README.md's banner previously used a repo-relative <img src="assets/banner.gif">,
+    # which PyPI cannot reliably resolve (PyPI renders the long description outside
+    # the repository, with no relative-path base). It must be an absolute HTTPS URL
+    # to the raw asset so the image renders on the PyPI project page.
+    meta = metadata.metadata("graphora-kg")
+    long_description = meta.get("Description") or meta.get_payload() or ""
+    assert long_description, "graphora-kg metadata has no long description"
+
+    absolute_url = "https://raw.githubusercontent.com/Naseem77/Graphora/main/assets/banner.gif"
+    assert absolute_url in long_description, "packaged long description must reference the absolute banner URL"
+    assert 'src="assets/banner.gif"' not in long_description, (
+        "packaged long description must not contain the repo-relative banner path"
     )
