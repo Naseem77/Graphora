@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphora-kg"
-version = "0.2.0"
+version = "0.2.1"
 description = "Deterministic code knowledge graph: index with tree-sitter, query blast radius, mine risk memory from git, review diffs grounded in structure. No LLM required to build."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,7 +24,14 @@ classifiers = [
 ]
 dependencies = [
     "falkordb>=1.0",
-    "tree-sitter>=0.23",
+    # tree-sitter 0.26.0 has a known upstream bug (already fixed upstream, not
+    # yet released as of this writing): Point.row/Point.column can return
+    # unstable values for source coordinates beyond the small-integer range.
+    # Graphora reads points via safe tuple/index access (see graphora/parser.py
+    # _point_row) so it is not affected, but 0.26.0 is excluded here as a
+    # defense-in-depth measure for any other code path. Future corrected
+    # releases (>0.26.0) remain installable.
+    "tree-sitter>=0.23,!=0.26.0",
     "tree-sitter-python>=0.23",
     "tree-sitter-javascript>=0.23",
     "tree-sitter-typescript>=0.23",

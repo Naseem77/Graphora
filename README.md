@@ -14,7 +14,7 @@
 [![Tests](https://img.shields.io/badge/tests-80%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-<img src="assets/banner.gif" alt="Graphora: source files flow into a live knowledge graph that powers blast radius, diff review with risk memory, and MCP tools for agents. 22,160 repo tokens shrink to 1,237." width="900" />
+<img src="https://raw.githubusercontent.com/Naseem77/Graphora/main/assets/banner.gif" alt="Graphora: source files flow into a live knowledge graph that powers blast radius, diff review with risk memory, and MCP tools for agents. 22,160 repo tokens shrink to 1,237." width="900" />
 
 `pip install` it as a library · run it as a CLI · plug it into any AI agent as an MCP server · or install the skill into 22 agents with one command
 
