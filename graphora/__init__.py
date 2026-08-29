@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import importlib
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 _LAZY = {
     "parse_code_file": "graphora.parser",
