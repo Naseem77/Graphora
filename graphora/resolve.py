@@ -423,6 +423,18 @@ class _Resolver:
             confidence = EXTRACTED if local_classes or len(classes) == 1 else AMBIGUOUS
             return found, confidence, "class"
 
+        # Receiver names a namespace or object literal: `geo::total()`, `inner::f()`, `api.load()`.
+        namespace = ".".join(parts)
+        members = [
+            s
+            for s in self.by_name.get((family, name), [])
+            if s.parent_kind == "Namespace" and (s.parent == namespace or s.parent.endswith("." + namespace))
+        ]
+        if members:
+            same_file = [s for s in members if s.path == record.path]
+            members = same_file or members
+            return members, EXTRACTED if len(members) == 1 else AMBIGUOUS, "namespace"
+
         # Unknown receiver type: any method with that name could be meant,
         # including one outside the repository, so even one match is AMBIGUOUS.
         candidates = self._by_name(family, name, methods=True, members=True)

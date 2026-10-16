@@ -238,14 +238,14 @@ graph, so the MCP server exposes your work history to any agent for free.
 
 ## How it was tested <a name="how-it-was-tested"></a>
 
-180 tests (`python -m pytest tests -q`), run in CI against a live FalkorDB on mcp 1.x and 2.x;
+200 tests (`python -m pytest tests -q`), run in CI against a live FalkorDB on mcp 1.x and 2.x;
 the job fails if any test is skipped.
 
 | Area | What the tests pin down |
 | --- | --- |
 | Definitions (`test_core_coverage.py`) | For each of the 11 languages, the *exact* set of (kind, qualified name) the parser must return, so a missed definition or a false one (a `struct` usage, an interface signature) fails. Python is also checked against `ast`. |
-| Resolution (`test_core_resolve.py`) | One test per rule: imports vs same-name functions, `src/` layouts, relative and submodule imports, external imports (no edge), `self`, constructors, re-exports, Go packages, JS default/named imports, variable and return types, unions, the candidate cap, test doubles. |
-| What could break (`test_core_impact.py`) | Certain vs uncertain, transitive depth and chains, uncertainty propagating up a path, classes including their methods, diffs mapped to enclosing symbols, the "X or Y" text, JSON output, the CLI. |
+| Resolution (`test_core_resolve.py`, `test_core_resolve_languages.py`) | One test per rule, in each language (Java fields and implicit `this`, Rust `use`/`impl`, C includes, C++ namespaces, Ruby `require_relative`, PHP `use`, TS typed fields, JS object literals, Go typed variables): imports vs same-name functions, `src/` layouts, relative and submodule imports, external imports (no edge), `self`, constructors, re-exports, Go packages, JS default/named imports, variable and return types, unions, the candidate cap, test doubles. |
+| What could break (`test_core_impact.py`, `test_core_review.py`) | Certain vs uncertain, transitive depth and chains, uncertainty propagating up a path, classes including their methods, diffs mapped to enclosing symbols (body edits, deleted functions, new and deleted files), the "X or Y" text, JSON output, identical answers on both backends, review with and without an LLM, the CLI from `--git-range` and stdin. |
 | Stores | Both backends end to end, a parity test (embedded == FalkorDB), incremental updates keeping cross-file callers. |
 | Robustness | Deeply nested expressions, a file whose parser throws, form feeds and Unicode line separators, linear-time parsing of a 20,000-function file, `.gitignore` and generated files. |
 | CLI, MCP, skills, sessions, benchmarks | Every command via `main()`, every MCP tool, skill installation for all agents, session ingestion, deterministic benchmarks. |

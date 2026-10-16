@@ -253,7 +253,7 @@ write, so an incremental update (`update_files`) never drops callers in unchange
 
 ```bash
 pip install -e ".[dev,mcp]"
-python -m pytest tests -q           # 180 tests
+python -m pytest tests -q           # 200 tests
 ruff check graphora tests scripts && mypy graphora
 ```
 

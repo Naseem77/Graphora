@@ -1319,10 +1319,11 @@ def _dedupe_imports(items: list[ParsedImport]) -> list[ParsedImport]:
 
 
 def _dedupe_calls(calls: list[ParsedCall]) -> list[ParsedCall]:
-    seen: set[tuple[str, str, int]] = set()
+    # The receiver is part of the key: `r.area() + c.area()` on one line is two calls.
+    seen: set[tuple[str, str, int, str]] = set()
     result = []
     for call in calls:
-        key = (call.caller, call.callee, call.line)
+        key = (call.caller, call.callee, call.line, call.receiver)
         if key not in seen:
             seen.add(key)
             result.append(call)

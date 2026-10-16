@@ -159,3 +159,18 @@ def test_cli_breaks(store, tmp_path, capsys, monkeypatch):
 
     data = json.loads(capsys.readouterr().out)
     assert data["targets"][0]["name"] == "Db.save"
+
+
+def test_falkordb_gives_the_same_answers(store, tmp_path):
+    """Both backends must agree on will/might break and the X-or-Y alternatives."""
+    from graphora.store import GraphStore, falkordb_available
+
+    if not falkordb_available():
+        pytest.skip("FalkorDB not running on localhost:6379")
+    falkor = GraphStore("graphora-impact-parity")
+    try:
+        index_repository(tmp_path / "repo", project="graphora-impact-parity", store=falkor)
+        for names in (["Db.save"], ["record"], ["save"], ["FileStore"]):
+            assert what_could_break(falkor, names, depth=3).to_dict() == what_could_break(store, names, depth=3).to_dict()
+    finally:
+        falkor.delete_graph()
