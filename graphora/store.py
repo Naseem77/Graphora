@@ -40,7 +40,9 @@ class GraphStore:
 
     # --- writes ---------------------------------------------------------
 
-    def write_files(self, parsed_files: list[ParsedFile]) -> int:
+    def write_files(self, parsed_files: list[ParsedFile], save: bool = True) -> int:
+        """Write parsed files. `save` is accepted for parity with the embedded
+        store; FalkorDB writes are persistent immediately."""
         for parsed in parsed_files:
             self.delete_file(parsed.path)
             self._write_file_node(parsed)

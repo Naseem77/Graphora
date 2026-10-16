@@ -82,7 +82,7 @@ def index_repository(
     for index, parsed in enumerate(parsed_files, start=1):
         if on_progress:
             on_progress("writing", index, total, parsed.path)
-        store.write_files([parsed])
+        store.write_files([parsed], save=False)  # link_cross_file_calls saves
 
     if on_progress:
         on_progress("linking", total, total, "cross-file calls")
@@ -115,6 +115,6 @@ def update_files(
         if parsed is None:
             store.delete_file(rel)
             continue
-        store.write_files([parsed])
+        store.write_files([parsed], save=False)  # link_cross_file_calls saves
     store.link_cross_file_calls()
     return store

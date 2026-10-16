@@ -32,6 +32,7 @@ class EmbeddedGraphStore:
         self.data_dir = Path(data_dir) if data_dir else default_data_dir()
         self._path = self.data_dir / f"{project}.json"
         self._data = self._empty()
+        self._call_index: dict[tuple[str, str, int], dict] | None = None
         if self._path.exists():
             try:
                 loaded = json.loads(self._path.read_text(encoding="utf-8"))
@@ -70,7 +71,7 @@ class EmbeddedGraphStore:
 
     # --- writes ---------------------------------------------------------
 
-    def write_files(self, parsed_files: list[ParsedFile]) -> int:
+    def write_files(self, parsed_files: list[ParsedFile], save: bool = True) -> int:
         for parsed in parsed_files:
             self._delete_file_no_save(parsed.path)
             self._data["files"][parsed.path] = {
@@ -107,7 +108,8 @@ class EmbeddedGraphStore:
                     self._merge_call(caller_key, f"{parsed.path}:Function:{call.callee}", call.line, call.confidence)
                 elif caller_key in self._data["symbols"]:
                     self._data["symbols"][caller_key]["pending_calls"].append(f"{call.callee}@{call.line}")
-        self.save()
+        if save:
+            self.save()
         return len(parsed_files)
 
     def link_cross_file_calls(self) -> int:
@@ -136,18 +138,24 @@ class EmbeddedGraphStore:
         return linked
 
     def _merge_call(self, a: str, b: str, line: int, confidence: str) -> None:
-        for edge in self._data["calls"]:
-            if edge["a"] == a and edge["b"] == b and edge["line"] == line:
-                edge["confidence"] = confidence
-                return
-        self._data["calls"].append({"a": a, "b": b, "line": line, "confidence": confidence})
+        if self._call_index is None:
+            self._call_index = {(e["a"], e["b"], e["line"]): e for e in self._data["calls"]}
+        edge = self._call_index.get((a, b, line))
+        if edge is not None:
+            edge["confidence"] = confidence
+            return
+        edge = {"a": a, "b": b, "line": line, "confidence": confidence}
+        self._data["calls"].append(edge)
+        self._call_index[(a, b, line)] = edge
 
     def _delete_file_no_save(self, path: str) -> None:
         self._data["files"].pop(path, None)
         dead = {k for k, s in self._data["symbols"].items() if s["path"] == path}
         for key in dead:
             del self._data["symbols"][key]
-        self._data["calls"] = [e for e in self._data["calls"] if e["a"] not in dead and e["b"] not in dead]
+        if dead:
+            self._data["calls"] = [e for e in self._data["calls"] if e["a"] not in dead and e["b"] not in dead]
+            self._call_index = None
         self._data["imports"] = [i for i in self._data["imports"] if i["path"] != path]
         self._data["touched"] = [t for t in self._data["touched"] if t[1] != path]
         self._data["fixed"] = [f for f in self._data["fixed"] if f[1] not in dead]
@@ -158,10 +166,12 @@ class EmbeddedGraphStore:
 
     def clear(self) -> None:
         self._data = self._empty()
+        self._call_index = None
         self.save()
 
     def delete_graph(self) -> None:
         self._data = self._empty()
+        self._call_index = None
         try:
             self._path.unlink(missing_ok=True)
         except OSError:
