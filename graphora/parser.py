@@ -88,6 +88,7 @@ class ParsedBinding:
     local: str
     module: str
     name: str = ""
+    scope: str = ""  # qualified name of the function the import is in ("" = module level)
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,7 @@ class ParsedFile:
 
 
 def is_supported_code_file(path: str) -> bool:
-    return Path(path).suffix.lower() in CODE_EXTENSIONS
+    return Path(path).suffix.lower() in CODE_EXTENSIONS or Path(path).name == "go.mod"
 
 
 def is_test_path(path: str) -> bool:
@@ -112,6 +113,8 @@ def is_test_path(path: str) -> bool:
 
 
 def language_for_path(path: str) -> str:
+    if Path(path).name == "go.mod":
+        return "gomod"
     suffix = Path(path).suffix.lower()
     return {
         ".py": "python",
@@ -137,10 +140,19 @@ def language_for_path(path: str) -> str:
 def parse_code_file(path: str, content: str) -> ParsedFile:
     """Parse one source file. Tree-sitter first, regex fallback."""
     language = language_for_path(path)
+    if language == "gomod":
+        return _parse_go_mod(path, content)
     parsed = _parse_with_tree_sitter(path, content, language)
     if parsed is not None:
         return parsed
     return _parse_with_regex(path, content, language)
+
+
+def _parse_go_mod(path: str, content: str) -> ParsedFile:
+    """go.mod declares the module path that makes an import local to the repository."""
+    match = re.search(r"(?m)^\s*module\s+(\S+)", content)
+    bindings = [ParsedBinding("<module>", match.group(1).strip('"'))] if match else []
+    return ParsedFile(path, "gomod", [], [], [], content, parser_used="regex", bindings=bindings)
 
 
 def extract_symbols_from_diff(diff: str) -> list[str]:
@@ -235,7 +247,10 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
         imported = _tree_sitter_import(language, node, content_bytes)
         if imported:
             imports.append(ParsedImport(name=imported, confidence=EXTRACTED))
-        bindings.extend(_tree_sitter_bindings(language, node, content_bytes))
+        found_bindings = _tree_sitter_bindings(language, node, content_bytes)
+        if found_bindings:
+            owner = next((f.qualname for f in reversed(scope) if f.kind == "Function"), "")
+            bindings.extend(replace(b, scope=owner) for b in found_bindings)
 
         definition = _tree_sitter_definition(language, node, content_bytes)
         if definition is not None:

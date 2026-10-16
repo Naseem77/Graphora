@@ -128,7 +128,7 @@ class EmbeddedGraphStore:
                 path=path,
                 language=f["language"],
                 is_test=f["is_test"],
-                bindings=tuple(tuple(b) for b in f.get("bindings", [])),
+                bindings=tuple((*b, "")[:4] for b in f.get("bindings", [])),
                 calls=tuple(CallSite(*c) for c in f.get("calls", [])),
             )
             for path, f in self._data["files"].items()

@@ -191,6 +191,7 @@ def test_javascript_relative_imports():
 def test_go_same_package_and_package_import():
     edges, _ = _resolve(
         {
+            "go.mod": "module example.com/proj\n",
             "shapes/area.go": "package shapes\nfunc Area() int { return helper() }\n",
             "shapes/helper.go": "package shapes\nfunc helper() int { return 1 }\n",
             "other/helper.go": "package other\nfunc helper() int { return 2 }\n",
@@ -320,3 +321,85 @@ def test_union_typed_receiver_lists_both_types():
     )
     assert _targets(edges, "lookup") == {("stores.py", "FalkorStore.find"), ("stores.py", "JsonStore.find")}
     assert edges[("lookup", "stores.py", "JsonStore.find")][::2] == (AMBIGUOUS, "union")
+
+
+def test_from_dot_import_module_then_call():
+    edges, _ = _resolve(
+        {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": "def f():\n    return 1\n",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/deep.py": "from .. import mod\n\ndef g():\n    return mod.f()\n",
+            "pkg/main.py": "from . import mod\n\ndef run():\n    return mod.f()\n",
+        }
+    )
+    assert edges[("run", "pkg/mod.py", "f")][0] == EXTRACTED
+    assert edges[("g", "pkg/mod.py", "f")][0] == EXTRACTED
+
+
+def test_relative_import_beyond_the_root_resolves_nowhere():
+    edges, _ = _resolve(
+        {"x.py": "def helper():\n    return 1\n", "a.py": "from ....x import helper\n\ndef run():\n    return helper()\n"}
+    )
+    assert _targets(edges, "run") == set()
+
+
+def test_stdlib_and_package_internal_names_do_not_capture_imports():
+    edges, result = _resolve(
+        {
+            "app/__init__.py": "",
+            "app/handlers/__init__.py": "",
+            "app/handlers/logging.py": "def info(m):\n    return m\n",
+            "app/handlers/requests.py": "def get(u):\n    return u\n",
+            "app/x.py": "import logging\nimport requests\n\ndef run():\n    logging.info('a')\n    requests.get('u')\n",
+            "app/y.py": "from app.handlers import logging\n\ndef ok():\n    logging.info('b')\n",
+        }
+    )
+    assert _targets(edges, "run") == set()
+    assert result.external == 2
+    assert _targets(edges, "ok") == {("app/handlers/logging.py", "info")}
+
+
+def test_go_imports_resolve_through_go_mod_only():
+    edges, _ = _resolve(
+        {
+            "go.mod": "module example.com/proj\n\ngo 1.22\n",
+            "internal/json/json.go": "package json\nfunc Marshal(v any) []byte { return nil }\n",
+            "pkg/errors/errors.go": "package errors\nfunc New(s string) error { return nil }\n",
+            "cmd/main.go": (
+                'package main\nimport (\n  "encoding/json"\n  "github.com/pkg/errors"\n'
+                '  myjson "example.com/proj/internal/json"\n)\n'
+                "func main() { json.Marshal(1); errors.New(\"x\"); myjson.Marshal(2) }\n"
+            ),
+        }
+    )
+    assert _targets(edges, "main") == {("internal/json/json.go", "Marshal")}
+
+
+def test_go_without_go_mod_needs_two_matching_path_segments():
+    edges, _ = _resolve(
+        {
+            "internal/json/json.go": "package json\nfunc Marshal(v any) []byte { return nil }\n",
+            "cmd/main.go": 'package main\nimport "encoding/json"\nfunc main() { json.Marshal(1) }\n',
+        }
+    )
+    assert _targets(edges, "main") == set()
+
+
+def test_function_local_and_try_except_imports():
+    edges, _ = _resolve(
+        {
+            "a.py": "def helper():\n    return 1\n",
+            "b.py": "def helper():\n    return 2\n",
+            "c.py": "def helper():\n    return 3\n",
+            "fast.py": (
+                "try:\n    from a import helper\nexcept ImportError:\n    from b import helper\n\n"
+                "def run():\n    return helper()\n"
+                "def local():\n    from c import helper\n    return helper()\n"
+            ),
+        }
+    )
+    assert _targets(edges, "run") == {("a.py", "helper"), ("b.py", "helper")}
+    assert {edges[("run", p, q)][0] for p, q in _targets(edges, "run")} == {AMBIGUOUS}
+    assert _targets(edges, "local") == {("c.py", "helper")}
+    assert edges[("local", "c.py", "helper")][0] == EXTRACTED

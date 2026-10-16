@@ -146,7 +146,7 @@ class GraphStore:
                 path=path,
                 language=language,
                 is_test=bool(is_test),
-                bindings=tuple(tuple(b) for b in json.loads(bindings or "[]")),
+                bindings=tuple((*b, "")[:4] for b in json.loads(bindings or "[]")),
                 calls=tuple(CallSite(*c) for c in json.loads(raw_calls or "[]")),
             )
             for path, language, is_test, bindings, raw_calls in self.query(
