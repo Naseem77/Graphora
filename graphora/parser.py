@@ -315,7 +315,7 @@ def _tree_sitter_symbol(language: str, node: Any, content_bytes: bytes, content:
     if not kind or name_node is None:
         return None
     line = _point_row(node.start_point) + 1
-    signature = content.splitlines()[line - 1].strip()
+    signature = _source_line_at(content_bytes, node.start_byte)
     name = _node_text(name_node, content_bytes).split("::")[-1]
     if not re.match(r"^[A-Za-z_][\w$]*$", name):
         return None
@@ -326,6 +326,20 @@ def _tree_sitter_symbol(language: str, node: Any, content_bytes: bytes, content:
         signature=signature,
         confidence=EXTRACTED,
     )
+
+
+def _source_line_at(content: bytes, offset: int) -> str:
+    """The stripped source line containing byte `offset`.
+
+    Splits on newline bytes only, matching tree-sitter's row numbering;
+    str.splitlines() also breaks on form feeds and Unicode separators, and
+    re-splitting the whole file per symbol made parsing quadratic.
+    """
+    start = content.rfind(b"\n", 0, offset) + 1
+    end = content.find(b"\n", offset)
+    if end == -1:
+        end = len(content)
+    return content[start:end].decode("utf-8", errors="replace").strip()
 
 
 def _c_declarator_name(node: Any) -> Any | None:
@@ -389,7 +403,7 @@ def _parse_with_regex(path: str, content: str, language: str) -> ParsedFile:
     calls: list[ParsedCall] = []
     current_function: tuple[str, int] | None = None
 
-    for line_number, line in enumerate(content.splitlines(), start=1):
+    for line_number, line in enumerate(content.split("\n"), start=1):
         stripped = line.strip()
         if not stripped:
             continue
