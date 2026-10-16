@@ -29,6 +29,7 @@ than MAX_CANDIDATES candidates is left unlinked rather than fanned out.
 from __future__ import annotations
 
 import posixpath
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -82,6 +83,7 @@ class SymbolRecord:
     parent_kind: str
     is_test: bool
     confidence: str = EXTRACTED
+    returns: str = ""  # declared return type name
 
     @property
     def is_method(self) -> bool:
@@ -153,6 +155,7 @@ def records_for(parsed: ParsedFile) -> tuple[list[SymbolRecord], FileRecord]:
                 parent_kind=s.parent_kind,
                 is_test=parsed.is_test,
                 confidence=s.confidence,
+                returns=s.returns,
             )
         )
     functions_by_qualname: dict[str, list[SymbolRecord]] = defaultdict(list)
@@ -252,7 +255,57 @@ class _Resolver:
 
         if receiver == "":
             return self._resolve_bare(record, family, caller, call.callee)
+        if receiver.endswith("()"):
+            owners = self._result_classes(record, caller, receiver, depth=0)
+            found = [m for owner in owners for m in self._methods_of(owner.qualname, call.callee, owner.path)]
+            if found:
+                return found, EXTRACTED if len(owners) == 1 else AMBIGUOUS, "returns"
+            receiver = "<expr>"
         return self._resolve_attribute(record, family, call.callee, receiver)
+
+    def _result_classes(
+        self, record: FileRecord, caller: SymbolRecord, receiver: str, depth: int
+    ) -> list[SymbolRecord]:
+        """Classes a call result is an instance of, from its callee's declared return type.
+
+        `receiver` is "a.b()" or "a.b().c()": resolve the last call, then read
+        the return type of what it resolved to (a constructor returns its class).
+        """
+        if depth > 4:
+            return []
+        inner = receiver[:-2]
+        head, separator, name = max(
+            (inner.rpartition(sep) for sep in (".", "::", "->")), key=lambda parts: len(parts[0])
+        )
+        counters = (self.result.external, self.result.unmatched)
+        call = CallSite(caller.key, name if separator else inner, head if separator else "", 0)
+        targets, _, _ = self._resolve_call(record, caller, call)
+        self.result.external, self.result.unmatched = counters  # a probe, not a call site
+        owners: dict[str, SymbolRecord] = {}
+        for target in targets[:MAX_CANDIDATES]:
+            if target.kind == "Class":
+                owners[target.key] = target
+            elif target.parent_kind == "Class" and target.name in (*_CONSTRUCTOR_NAMES, target.parent.rsplit(".", 1)[-1]):
+                owners.update((c.key, c) for c in self._classes_named(target.parent.rsplit(".", 1)[-1], target.path))
+            elif target.returns:
+                owners.update((c.key, c) for c in self._classes_named(target.returns, target.path))
+        return list(owners.values())
+
+    def _classes_named(self, type_name: str, from_path: str) -> list[SymbolRecord]:
+        """Resolve a type name as written in `from_path`: same file, its imports, then the repo."""
+        simple = re.split(r"\.|::|\\", type_name)[-1]
+        local = [s for s in self.by_file[from_path] if s.kind == "Class" and s.name == simple]
+        if local:
+            return local
+        record = self.files.get(from_path)
+        if record is not None:
+            for local_name, module, member in record.bindings:
+                if local_name == simple:
+                    files = self._module_files(record, module)
+                    found = [s for s in self._top_level(files, member or simple) if s.kind == "Class"]
+                    if found:
+                        return found
+        return self.classes.get((self._family(from_path), simple), [])
 
     def _resolve_bare(
         self, record: FileRecord, family: str, caller: SymbolRecord, name: str
@@ -323,34 +376,37 @@ class _Resolver:
         separator = "::" if "::" in receiver else ("\\" if "\\" in receiver else ".")
         parts = receiver.split(separator)
 
-        # Receiver is an imported module (or a member of one).
+        # Receiver is an imported module, or a member of one (a submodule or a class).
         for local_name, module, member in record.bindings:
-            if local_name == receiver or (local_name == parts[0] and len(parts) > 1 and local_name != "*"):
-                rest = parts[1:] if local_name == parts[0] and local_name != receiver else []
-                if member and member not in ("default", "*"):
-                    rest = [member, *rest]  # `from pkg import util` then `util.x()`
-                files = self._module_files(record, ".".join([module, *rest])) if rest else []
-                if files:
-                    member = ""  # the receiver is a module, not an imported class
-                else:
-                    files = self._module_files(record, module)
-                if not files:
-                    self.result.external += 1
-                    return [], EXTRACTED, "external"
-                if member and member not in ("default", "*") and not rest:
-                    # Imported a class: `Klass.create()`.
-                    owners = [s for s in self._top_level(files, member) if s.kind == "Class"]
-                    found = [m for owner in owners for m in self._methods_of(owner.qualname, name, owner.path)]
-                    if found:
-                        return found, EXTRACTED, "import"
+            if local_name == "*" or not (local_name == receiver or (local_name == parts[0] and len(parts) > 1)):
+                continue
+            rest = parts[1:] if local_name != receiver else []
+            imported = member if member not in ("", "default", "*") else ""
+            # `from pkg import util; util.x()` / `import a; a.b.x()`: a module path.
+            module_path = ".".join([module, *([imported] if imported else []), *rest])
+            files = self._module_files(record, module_path) if (imported or rest) else []
+            if files:
                 found = self._top_level(files, name)
                 if found:
                     return self._constructors(found), EXTRACTED, "import"
                 owners = [s for f in files for s in self.by_file[f] if s.kind == "Class" and s.name == parts[-1]]
-                found = [m for owner in owners for m in self._methods_of(owner.qualname, name, owner.path)]
-                if found:
-                    return found, EXTRACTED, "import"
-                break
+            else:
+                files = self._module_files(record, module)
+                if not files:
+                    self.result.external += 1
+                    return [], EXTRACTED, "external"
+                if imported and not rest:
+                    # `from x import Klass; Klass.create()`: methods of the imported class.
+                    owners = [s for s in self._top_level(files, imported) if s.kind == "Class"]
+                else:
+                    found = self._top_level(files, name)
+                    if found:
+                        return self._constructors(found), EXTRACTED, "import"
+                    owners = [s for f in files for s in self.by_file[f] if s.kind == "Class" and s.name == parts[-1]]
+            found = [m for owner in owners for m in self._methods_of(owner.qualname, name, owner.path)]
+            if found:
+                return found, EXTRACTED, "import"
+            break
 
         # Receiver names a class: `Foo.create()`, `Foo::new()`.
         class_name = parts[-1]
@@ -433,8 +489,21 @@ class _Resolver:
                 return hits[-1:]  # a later redefinition shadows an earlier one
         return []  # only nested in other functions: not visible from here
 
-    def _top_level(self, files: list[str], name: str) -> list[SymbolRecord]:
-        return [s for path in files for s in self.by_file[path] if s.name == name and s.parent_kind in ("", "Namespace")]
+    def _top_level(self, files: list[str], name: str, depth: int = 0) -> list[SymbolRecord]:
+        """Top-level definitions of `name` in `files`, following re-exports
+        (`from .impl import name` in a package __init__, `export { name } from`)."""
+        found = [s for path in files for s in self.by_file[path] if s.name == name and s.parent_kind in ("", "Namespace")]
+        if found or depth >= 4:
+            return found
+        for path in files:
+            record = self.files.get(path)
+            if record is None:
+                continue
+            for local, module, member in record.bindings:
+                if local == "*" or (local == name and member not in ("", "*", "default")):
+                    original = name if local == "*" else member
+                    found.extend(self._top_level(self._module_files(record, module), original, depth + 1))
+        return list(dict.fromkeys(found))
 
     def _default_export(self, files: list[str]) -> list[SymbolRecord]:
         found: list[SymbolRecord] = []
@@ -479,11 +548,22 @@ class _Resolver:
         return resolver(record.path, module) if resolver and module else []
 
     def _suffix_match(self, *relatives: str) -> list[str]:
-        out: list[str] = []
+        """Files ending in one of `relatives`, nearest the repository root first.
+
+        Absolute imports resolve from a source root, so `falkordb` means
+        falkordb/__init__.py, not falkordb/asyncio/falkordb.py; among matches
+        only those with the fewest leading directories are kept.
+        """
+        matches: list[tuple[int, str]] = []
         for relative in relatives:
             relative = relative.lstrip("/")
-            out.extend(p for p in self.paths if p == relative or p.endswith("/" + relative))
-        return list(dict.fromkeys(out))
+            for p in self.paths:
+                if p == relative or p.endswith("/" + relative):
+                    matches.append((p[: len(p) - len(relative)].count("/"), p))
+        if not matches:
+            return []
+        nearest = min(depth for depth, _ in matches)
+        return list(dict.fromkeys(p for depth, p in matches if depth == nearest))
 
     def _exact(self, *candidates: str) -> list[str]:
         return [c for c in dict.fromkeys(posixpath.normpath(c) for c in candidates) if c in self.files]

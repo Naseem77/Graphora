@@ -48,6 +48,7 @@ class ParsedSymbol:
     end_line: int = 0
     parent: str = ""  # qualified name of the enclosing scope ("" at top level)
     parent_kind: str = ""  # "Class", "Function", "Namespace", or ""
+    returns: str = ""  # declared return type name, when the source states one
 
     def __post_init__(self) -> None:
         if not self.qualname:
@@ -218,11 +219,18 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
     bindings: list[ParsedBinding] = []
     calls: list[ParsedCall] = []
 
+    # Variable -> type facts, keyed by the scope that owns them ("" = module).
+    types: dict[str, dict[str, str]] = {}
+
     # Iterative pre-order walk carrying the enclosing scopes (deep trees overflow recursion).
     stack: list[tuple[Any, tuple[_Frame, ...]]] = [(root, ())]
     while stack:
         node, scope = stack.pop()
         child_scope = scope
+
+        for target, kind in _tree_sitter_types(language, node, content_bytes):
+            owner = _type_owner(scope, target)
+            types.setdefault(owner, {})[target] = kind
 
         imported = _tree_sitter_import(language, node, content_bytes)
         if imported:
@@ -237,6 +245,9 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
                 parent = ".".join(part for part in (parent, *definition.qualifiers) if part)
                 parent_kind = definition.qualifier_kind
             qualname = f"{parent}.{definition.name}" if parent else definition.name
+            returns = _return_type(language, node, content_bytes) if definition.kind == "Function" else ""
+            if returns in {"Self", "self", "this", "static"} and parent_kind == "Class":
+                returns = parent.rsplit(".", 1)[-1]
             if definition.emit:
                 symbols.append(
                     ParsedSymbol(
@@ -249,6 +260,7 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
                         end_line=_point_row(node.end_point) + 1,
                         parent=parent,
                         parent_kind=parent_kind,
+                        returns=returns,
                     )
                 )
             child_scope = scope + (_Frame(qualname, definition.kind),)
@@ -256,6 +268,7 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
         call = _tree_sitter_call(language, node, content_bytes)
         if call is not None:
             callee, receiver = call
+            receiver = _typed_receiver(receiver, scope, types)
             caller = next((f.qualname for f in reversed(scope) if f.kind == "Function"), None)
             # Self-recursion adds no impact information; drop it as before.
             if caller and not (receiver == "" and caller.rsplit(".", 1)[-1] == callee):
@@ -284,6 +297,69 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
         parser_used="tree-sitter",
         bindings=_dedupe_bindings(bindings),
     )
+
+
+def _type_owner(scope: tuple[_Frame, ...], target: str) -> str:
+    """`self.x`/`this.x`/`@x` belong to the enclosing class; other names to the innermost function."""
+    wanted = "Class" if target.startswith(_SELF_PREFIXES) else "Function"
+    for frame in reversed(scope):
+        if frame.kind == wanted:
+            return frame.qualname
+    return ""
+
+
+def _typed_receiver(receiver: str, scope: tuple[_Frame, ...], types: dict[str, dict[str, str]]) -> str:
+    """Replace a variable receiver with its known type (or the call that produced it)."""
+    if not receiver or receiver == "<expr>" or not types:
+        return receiver
+    owners = [*(frame.qualname for frame in reversed(scope)), ""]
+
+    def lookup(key: str) -> str:
+        key = _normal_target(key)
+        for owner in owners:
+            kind = types.get(owner, {}).get(key)
+            if kind:
+                return kind
+        return ""
+
+    for _ in range(4):  # `g = db.select_graph()` where `db = FalkorDB()`: follow the chain
+        if receiver.endswith("()"):
+            head = receiver[:-2]
+            first = re.split(r"\.|::|->", head, maxsplit=1)[0]
+            typed = lookup(first) if first != head else ""
+            if not typed:
+                return receiver
+            receiver = typed.removesuffix("()") + head[len(first):] + "()" if not typed.endswith("()") else (
+                typed[:-2] + "()." + head[len(first) + 1 :] + "()"
+            )
+            if not _CALL_RESULT.match(receiver):
+                return "<expr>"
+            continue
+        typed = lookup(receiver)
+        if not typed:
+            return receiver
+        receiver = typed
+    return receiver
+
+
+def _return_type(language: str, node: Any, content: bytes) -> str:
+    """The declared return type of a function definition node, if stated."""
+    field = node.child_by_field_name
+    if language in {"javascript", "typescript"} and node.type in {
+        "variable_declarator", "pair", "field_definition", "public_field_definition"
+    }:
+        value = field("value")
+        return _return_type(language, value, content) if value is not None else ""
+    if language in {"python", "javascript", "typescript", "rust", "php"}:
+        return _type_name(_node_text(field("return_type"), content))
+    if language == "go":
+        result = field("result")
+        if result is None or result.type == "parameter_list":
+            return ""
+        return _type_name(_node_text(result, content))
+    if language in {"java", "c", "cpp"}:
+        return _type_name(_node_text(field("type"), content))
+    return ""
 
 
 def _settle_qualifier_kinds(symbols: list[ParsedSymbol]) -> list[ParsedSymbol]:
@@ -598,18 +674,18 @@ def _tree_sitter_call(language: str, node: Any, content: bytes) -> tuple[str, st
     t = node.type
     field = node.child_by_field_name
     if language == "python" and t == "call":
-        return _split_callee(field("function"), content, ("attribute", "object", "attribute"))
+        return _split_callee(language, field("function"), content, ("attribute", "object", "attribute"))
     if language in {"javascript", "typescript"}:
         if t == "call_expression":
-            return _split_callee(field("function"), content, ("member_expression", "object", "property"))
+            return _split_callee(language, field("function"), content, ("member_expression", "object", "property"))
         if t == "new_expression":
             return _bare(_node_text(field("constructor"), content))
         return None
     if language == "go" and t == "call_expression":
-        return _split_callee(field("function"), content, ("selector_expression", "operand", "field"))
+        return _split_callee(language, field("function"), content, ("selector_expression", "operand", "field"))
     if language == "java":
         if t == "method_invocation":
-            return _with_receiver(_node_text(field("name"), content), _node_text(field("object"), content))
+            return _with_receiver(_node_text(field("name"), content), _receiver_text(language, field("object"), content))
         if t == "object_creation_expression":
             return _bare(_node_text(field("type"), content).split("<")[0])
         return None
@@ -620,7 +696,7 @@ def _tree_sitter_call(language: str, node: Any, content: bytes) -> tuple[str, st
                 _node_text(function.child_by_field_name("name"), content),
                 _node_text(function.child_by_field_name("path"), content),
             )
-        return _split_callee(function, content, ("field_expression", "value", "field"))
+        return _split_callee(language, function, content, ("field_expression", "value", "field"))
     if language in {"c", "cpp"} and t == "call_expression":
         function = field("function")
         if function is not None and function.type == "qualified_identifier":
@@ -628,10 +704,10 @@ def _tree_sitter_call(language: str, node: Any, content: bytes) -> tuple[str, st
                 _node_text(_innermost_name(function), content),
                 _node_text(function.child_by_field_name("scope"), content),
             )
-        return _split_callee(function, content, ("field_expression", "argument", "field"))
+        return _split_callee(language, function, content, ("field_expression", "argument", "field"))
     if language == "ruby" and t == "call":
         method = _node_text(field("method"), content)
-        receiver = _node_text(field("receiver"), content)
+        receiver = _receiver_text(language, field("receiver"), content)
         if method in {"require", "require_relative"}:
             return None
         if method == "new":
@@ -642,7 +718,7 @@ def _tree_sitter_call(language: str, node: Any, content: bytes) -> tuple[str, st
         if t == "function_call_expression":
             return _bare(_node_text(field("function"), content).split("\\")[-1])
         if t == "member_call_expression":
-            return _with_receiver(_node_text(field("name"), content), _node_text(field("object"), content))
+            return _with_receiver(_node_text(field("name"), content), _receiver_text(language, field("object"), content))
         if t == "scoped_call_expression":
             return _with_receiver(_node_text(field("name"), content), _node_text(field("scope"), content))
         if t == "object_creation_expression":
@@ -653,18 +729,46 @@ def _tree_sitter_call(language: str, node: Any, content: bytes) -> tuple[str, st
     return None
 
 
-def _split_callee(function: Any | None, content: bytes, member: tuple[str, str, str]) -> tuple[str, str] | None:
+def _split_callee(
+    language: str, function: Any | None, content: bytes, member: tuple[str, str, str]
+) -> tuple[str, str] | None:
     if function is None:
         return None
     member_type, object_field, name_field = member
     if function.type == member_type:
         return _with_receiver(
             _node_text(function.child_by_field_name(name_field), content),
-            _node_text(function.child_by_field_name(object_field), content),
+            _receiver_text(language, function.child_by_field_name(object_field), content),
         )
     if function.type in {"identifier", "name"}:
         return _bare(_node_text(function, content))
     return None
+
+
+_CALL_NODES = {
+    "call", "call_expression", "method_invocation", "member_call_expression",
+    "scoped_call_expression", "function_call_expression",
+}
+# Receiver that is the result of a call: "db.select_graph()" (resolved via the callee's return type).
+_CALL_RESULT = re.compile(r"^(?:[A-Za-z_]\w*(?:\(\))?(?:\.|::|->))*[A-Za-z_]\w*\(\)$")
+
+
+def _receiver_text(language: str, node: Any | None, content: bytes, depth: int = 0) -> str:
+    """Receiver text; a call used as a receiver becomes `inner.callee()`."""
+    if node is None:
+        return ""
+    if node.type in {"await", "await_expression", "parenthesized_expression"} and node.named_children:
+        return _receiver_text(language, node.named_children[-1], content, depth)
+    if node.type in _CALL_NODES and depth < 8:
+        text = _node_text(node, content)
+        if _CONSTRUCTED_RECEIVER.match(" ".join(text.split())):
+            return text  # `Db()`: _with_receiver turns it into the type
+        nested = _tree_sitter_call(language, node, content)
+        if nested is not None and nested[1] != "<expr>":
+            name, receiver = nested
+            return f"{receiver}.{name}()" if receiver else f"{name}()"
+        return "<expr>"
+    return _node_text(node, content)
 
 
 # A capitalized constructor call used as a receiver; the name says its type.
@@ -685,9 +789,163 @@ def _with_receiver(name: str, receiver: str) -> tuple[str, str] | None:
     constructed = _CONSTRUCTED_RECEIVER.match(receiver)
     if constructed:
         receiver = constructed.group(1)  # `Db().save()` / `new Db().save()`: the receiver is a Db
+    if _CALL_RESULT.match(receiver):
+        return name, receiver
     if any(ch in receiver for ch in "()[]{}\"'") or len(receiver) > 120:
         receiver = "<expr>"  # call chains, subscripts: receiver type is unknown
     return name, receiver
+
+
+# --- local type facts ---------------------------------------------------------
+#
+# A light, flow-insensitive type pass: when the source states a variable's
+# type (a typed parameter or annotation) or assigns it a constructor call
+# (`db = FalkorDB()`, `x := &Foo{}`, `self.c = Client()`), calls on that
+# variable are recorded with the type as their receiver, so `db.select_graph()`
+# resolves to FalkorDB.select_graph instead of every method of that name.
+
+_TYPE_NAME = re.compile(r"^[A-Za-z_]\w*(?:(?:\.|::|\\)[A-Za-z_]\w*)*$")
+_SELF_PREFIXES = ("self.", "this.", "@")
+
+
+def _type_name(text: str) -> str:
+    text = " ".join(text.split()).lstrip(":").strip().strip("\"'")
+    for prefix in ("&mut ", "&", "*", "?", "mut "):
+        text = text.removeprefix(prefix).strip()
+    for wrapper in ("Optional[", "Awaitable[", "Promise<", "Future<", "Box<", "Rc<", "Arc<", "Option<", "Result<"):
+        if text.startswith(wrapper) and text.endswith(("]", ">")):
+            text = text[len(wrapper) : -1].split(",")[0].strip().strip("\"'")
+    if "|" in text:
+        parts = [p.strip() for p in text.split("|") if p.strip() not in ("None", "null", "undefined")]
+        text = parts[0] if len(parts) == 1 else ""
+    text = text.split("<")[0].strip()
+    return text if _TYPE_NAME.match(text) else ""
+
+
+def _constructed_type(language: str, node: Any | None, content: bytes) -> str:
+    """The type a constructor-like expression produces, or ""."""
+    if node is None:
+        return ""
+    t = node.type
+    if language == "python" and t == "call":
+        name = _node_text(node.child_by_field_name("function"), content)
+        return name if name.rsplit(".", 1)[-1][:1].isupper() and _TYPE_NAME.match(name) else ""
+    if language in {"javascript", "typescript"} and t == "new_expression":
+        return _type_name(_node_text(node.child_by_field_name("constructor"), content))
+    if language == "java" and t == "object_creation_expression":
+        return _type_name(_node_text(node.child_by_field_name("type"), content))
+    if language == "go":
+        if t == "unary_expression":
+            return _constructed_type(language, node.child_by_field_name("operand"), content)
+        if t == "composite_literal":
+            return _type_name(_node_text(node.child_by_field_name("type"), content))
+    if language == "rust":
+        if t == "struct_expression":
+            return _type_name(_node_text(node.child_by_field_name("name"), content))
+        if t == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is not None and function.type == "scoped_identifier":
+                name = _node_text(function.child_by_field_name("name"), content)
+                if name in {"new", "default", "from", "with_capacity", "builder", "open", "connect"}:
+                    return _type_name(_node_text(function.child_by_field_name("path"), content))
+    if language == "php" and t == "object_creation_expression":
+        for child in node.named_children:
+            if child.type in {"name", "qualified_name"}:
+                return _type_name(_node_text(child, content))
+    if language == "ruby" and t == "call" and _node_text(node.child_by_field_name("method"), content) == "new":
+        return _type_name(_node_text(node.child_by_field_name("receiver"), content))
+    return ""
+
+
+def _assigned_type(language: str, node: Any | None, content: bytes) -> str:
+    """Constructor type, or `recv.callee()` for a value returned by a call."""
+    constructed = _constructed_type(language, node, content)
+    if constructed or node is None:
+        return constructed
+    if node.type in {"await", "await_expression"} and node.named_children:
+        return _assigned_type(language, node.named_children[-1], content)
+    if node.type in _CALL_NODES:
+        result = _receiver_text(language, node, content)
+        return result if _CALL_RESULT.match(result) else ""
+    return ""
+
+
+def _normal_target(text: str) -> str:
+    text = text.strip().lstrip("$").replace("->", ".")
+    return text
+
+
+def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[str, str]]:
+    """(variable, type) facts stated by this node."""
+    t = node.type
+    field = node.child_by_field_name
+
+    def text(n: Any | None) -> str:
+        return _node_text(n, content)
+
+    out: list[tuple[str, str]] = []
+    if language == "python":
+        if t == "typed_parameter":
+            names = [c for c in node.named_children if c.type == "identifier"]
+            if names:
+                out.append((text(names[0]), _type_name(text(field("type")))))
+        elif t == "typed_default_parameter":
+            out.append((text(field("name")), _type_name(text(field("type")))))
+        elif t == "assignment":
+            left = field("left")
+            if left is not None and left.type in {"identifier", "attribute"}:
+                declared = _type_name(text(field("type"))) if field("type") is not None else ""
+                out.append((text(left), declared or _assigned_type(language, field("right"), content)))
+    elif language in {"javascript", "typescript"}:
+        if t in {"required_parameter", "optional_parameter"}:
+            pattern = field("pattern")
+            if pattern is not None and pattern.type == "identifier":
+                out.append((text(pattern), _type_name(text(field("type")))))
+        elif t == "variable_declarator":
+            name = field("name")
+            if name is not None and name.type == "identifier":
+                declared = _type_name(text(field("type"))) if field("type") is not None else ""
+                out.append((text(name), declared or _assigned_type(language, field("value"), content)))
+        elif t == "assignment_expression":
+            out.append((text(field("left")), _assigned_type(language, field("right"), content)))
+        elif t == "public_field_definition" and field("type") is not None:
+            out.append((f"this.{text(field('name'))}", _type_name(text(field("type")))))
+    elif language == "java":
+        if t == "formal_parameter":
+            out.append((text(field("name")), _type_name(text(field("type")))))
+        elif t in {"local_variable_declaration", "field_declaration"}:
+            declared = _type_name(text(field("type")))
+            for declarator in _field_children(node, "declarator"):
+                name = text(declarator.child_by_field_name("name"))
+                kind = declared if declared != "var" else _assigned_type(
+                    language, declarator.child_by_field_name("value"), content
+                )
+                out.append((f"this.{name}" if t == "field_declaration" else name, kind))
+                if t == "field_declaration":
+                    out.append((name, kind))  # Java code calls fields without `this.`
+    elif language == "go":
+        if t in {"parameter_declaration", "var_spec"}:
+            kind = _type_name(text(field("type")))
+            out.extend((text(name), kind) for name in _field_children(node, "name"))
+        elif t == "short_var_declaration":
+            lefts = field("left").named_children if field("left") is not None else []
+            rights = field("right").named_children if field("right") is not None else []
+            for left, right in zip(lefts, rights):
+                out.append((text(left), _assigned_type(language, right, content)))
+    elif language == "rust":
+        if t == "parameter":
+            out.append((text(field("pattern")), _type_name(text(field("type")))))
+        elif t == "let_declaration":
+            declared = _type_name(text(field("type"))) if field("type") is not None else ""
+            out.append((text(field("pattern")), declared or _assigned_type(language, field("value"), content)))
+    elif language == "php":
+        if t == "simple_parameter":
+            out.append((text(field("name")), _type_name(text(field("type")))))
+        elif t == "assignment_expression":
+            out.append((text(field("left")), _assigned_type(language, field("right"), content)))
+    elif language == "ruby" and t == "assignment":
+        out.append((text(field("left")), _assigned_type(language, field("right"), content)))
+    return [(_normal_target(target), kind) for target, kind in out if target and kind]
 
 
 # --- import bindings ----------------------------------------------------------
@@ -726,6 +984,19 @@ def _python_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
 
 
 def _js_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type == "export_statement" and node.child_by_field_name("source") is not None:
+        # Re-exports: `export { a as b } from "./x"`, `export * from "./x"`.
+        source = _node_text(node.child_by_field_name("source"), content).strip("\"'`")
+        clause = next((c for c in node.named_children if c.type == "export_clause"), None)
+        if clause is None:
+            return [ParsedBinding("*", source, "*")]
+        out = []
+        for spec in clause.named_children:
+            if spec.type == "export_specifier":
+                name = _node_text(spec.child_by_field_name("name"), content)
+                alias = _node_text(spec.child_by_field_name("alias"), content) or name
+                out.append(ParsedBinding(alias, source, name))
+        return out
     if node.type == "export_statement" and any(child.type == "default" for child in node.children):
         # Recorded on the exporting file as local "default" -> the exported name.
         declaration = node.child_by_field_name("declaration")

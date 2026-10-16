@@ -232,3 +232,76 @@ def test_production_code_does_not_resolve_to_test_doubles():
         ("tests/test_run.py", "FakeProvider"),  # the construction
         ("tests/test_run.py", "FakeProvider.enrich"),
     }
+
+
+def test_variable_types_pick_the_right_twin_class():
+    files = {
+        "falkordb/falkordb.py": "class FalkorDB:\n    def select_graph(self, name):\n        return name\n",
+        "falkordb/asyncio/falkordb.py": "class FalkorDB:\n    def select_graph(self, name):\n        return name\n",
+        "falkordb/__init__.py": "from .falkordb import FalkorDB\n",
+        "falkordb/asyncio/__init__.py": "from .falkordb import FalkorDB\n",
+        "tests/test_async.py": (
+            "from falkordb.asyncio import FalkorDB\n\n"
+            "def test_select():\n"
+            "    db = FalkorDB()\n"
+            "    db.select_graph('g')\n"
+        ),
+        "app/service.py": (
+            "from falkordb import FalkorDB\n\n"
+            "class Service:\n"
+            "    def __init__(self):\n"
+            "        self.db = FalkorDB()\n"
+            "    def graph(self, name):\n"
+            "        return self.db.select_graph(name)\n"
+            "def typed(db: FalkorDB):\n"
+            "    return db.select_graph('x')\n"
+        ),
+    }
+    edges, _ = _resolve(files)
+    assert _targets(edges, "test_select") >= {("falkordb/asyncio/falkordb.py", "FalkorDB.select_graph")}
+    assert ("falkordb/falkordb.py", "FalkorDB.select_graph") not in _targets(edges, "test_select")
+    assert _targets(edges, "Service.graph") == {("falkordb/falkordb.py", "FalkorDB.select_graph")}
+    assert _targets(edges, "typed") == {("falkordb/falkordb.py", "FalkorDB.select_graph")}
+    assert edges[("typed", "falkordb/falkordb.py", "FalkorDB.select_graph")][0] == EXTRACTED
+
+
+def test_javascript_reexport_through_index():
+    edges, _ = _resolve(
+        {
+            "src/lib/format.ts": "export function fmt(x: string) { return x; }\n",
+            "src/lib/index.ts": "export { fmt } from './format';\nexport * from './other';\n",
+            "src/lib/other.ts": "export function slug(x: string) { return x; }\n",
+            "src/fmt2.ts": "export function fmt(x: string) { return x; }\n",
+            "src/app.ts": "import { fmt, slug } from './lib';\nexport function render() { fmt('a'); slug('b'); }\n",
+        }
+    )
+    assert _targets(edges, "render") == {("src/lib/format.ts", "fmt"), ("src/lib/other.ts", "slug")}
+
+
+def test_call_results_resolve_through_declared_return_types():
+    edges, _ = _resolve(
+        {
+            "falkordb/graph.py": "class Graph:\n    def query(self, q):\n        return q\n",
+            "falkordb/asyncio/graph.py": "class AsyncGraph:\n    def query(self, q):\n        return q\n",
+            "falkordb/db.py": (
+                "from falkordb.graph import Graph\n\n"
+                "class FalkorDB:\n"
+                "    def select_graph(self, name) -> Graph:\n"
+                "        return Graph()\n"
+            ),
+            "app.py": (
+                "from falkordb.db import FalkorDB\n\n"
+                "def run():\n"
+                "    db = FalkorDB()\n"
+                "    graph = db.select_graph('g')\n"
+                "    graph.query('a')\n"
+                "    db.select_graph('h').query('b')\n"
+            ),
+        }
+    )
+    assert _targets(edges, "run") == {
+        ("falkordb/db.py", "FalkorDB"),
+        ("falkordb/db.py", "FalkorDB.select_graph"),
+        ("falkordb/graph.py", "Graph.query"),
+    }
+    assert edges[("run", "falkordb/graph.py", "Graph.query")][::2] == (EXTRACTED, "returns")
