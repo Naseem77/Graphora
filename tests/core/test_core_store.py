@@ -1,7 +1,5 @@
 """Phase 1 tests: FalkorDB store + indexer (integration, needs FalkorDB on :6379)."""
 
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest

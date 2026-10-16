@@ -17,8 +17,8 @@ from typing import Any
 try:
     from tree_sitter import Language, Parser
 except ImportError:  # pragma: no cover - optional parser dependency
-    Language = None  # type: ignore[assignment]
-    Parser = None  # type: ignore[assignment]
+    Language = None  # type: ignore[assignment,misc]
+    Parser = None  # type: ignore[assignment,misc]
 
 
 EXTRACTED = "EXTRACTED"
@@ -318,7 +318,7 @@ def _tree_sitter_parser(language: str) -> Any | None:
         "ruby": ("tree_sitter_ruby", "language"),
         "php": ("tree_sitter_php", "language_php"),
     }.get(language, (None, None))
-    if not module_name:
+    if not module_name or not language_attr:
         return None
     try:
         module = __import__(module_name)
@@ -816,32 +816,35 @@ def _rust_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
     return out
 
 
+def _rust_join(prefix: str, path: str) -> str:
+    return f"{prefix}::{path}" if prefix else path
+
+
 def _rust_use_tree(node: Any | None, prefix: str, content: bytes, out: list[ParsedBinding]) -> None:
     if node is None:
         return
-    join = (lambda a, b: f"{a}::{b}" if a else b)
     if node.type in {"identifier", "self", "crate", "super"}:
         name = _node_text(node, content)
         out.append(ParsedBinding(name, prefix, name) if prefix else ParsedBinding(name, name))
     elif node.type == "scoped_identifier":
         path = _node_text(node.child_by_field_name("path"), content)
         name = _node_text(node.child_by_field_name("name"), content)
-        out.append(ParsedBinding(name, join(prefix, path), name))
+        out.append(ParsedBinding(name, _rust_join(prefix, path), name))
     elif node.type == "use_as_clause":
         path = _node_text(node.child_by_field_name("path"), content)
         alias = _node_text(node.child_by_field_name("alias"), content)
-        owner, _, name = join(prefix, path).rpartition("::")
+        owner, _, name = _rust_join(prefix, path).rpartition("::")
         out.append(ParsedBinding(alias, owner, name) if owner else ParsedBinding(alias, name))
     elif node.type == "scoped_use_list":
         path = _node_text(node.child_by_field_name("path"), content)
         for child in (node.child_by_field_name("list").named_children if node.child_by_field_name("list") else []):
-            _rust_use_tree(child, join(prefix, path), content, out)
+            _rust_use_tree(child, _rust_join(prefix, path), content, out)
     elif node.type == "use_list":
         for child in node.named_children:
             _rust_use_tree(child, prefix, content, out)
     elif node.type == "use_wildcard":
         path = _node_text(node, content).removesuffix("::*").removesuffix("*")
-        out.append(ParsedBinding("*", join(prefix, path), "*"))
+        out.append(ParsedBinding("*", _rust_join(prefix, path), "*"))
 
 
 def _c_bindings(node: Any, content: bytes) -> list[ParsedBinding]:

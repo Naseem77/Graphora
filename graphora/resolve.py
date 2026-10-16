@@ -209,9 +209,9 @@ class _Resolver:
         for path in self.paths:
             record = self.files[path]
             for _, module, _ in record.bindings:
-                for target in self._module_files(record, module):
-                    if target != path:
-                        file_imports.add((path, target))
+                for imported in self._module_files(record, module):
+                    if imported != path:
+                        file_imports.add((path, imported))
             for call in record.calls:
                 caller = self.symbols.get(call.caller_key)
                 if caller is None:
@@ -437,7 +437,7 @@ class _Resolver:
         return [s for path in files for s in self.by_file[path] if s.name == name and s.parent_kind in ("", "Namespace")]
 
     def _default_export(self, files: list[str]) -> list[SymbolRecord]:
-        found = []
+        found: list[SymbolRecord] = []
         for path in files:
             names = [name for local, _, name in self.files[path].bindings if local == "default"]
             found.extend(s for s in self.by_file[path] if s.name in names and s.parent_kind == "")
@@ -446,7 +446,7 @@ class _Resolver:
     def _by_name(
         self, family: str, name: str, methods: bool, top_level: bool = False, members: bool = False
     ) -> list[SymbolRecord]:
-        out = []
+        out: list[SymbolRecord] = []
         for s in self.by_name.get((family, name), []):
             if s.is_method and not methods:
                 continue
@@ -479,7 +479,7 @@ class _Resolver:
         return resolver(record.path, module) if resolver and module else []
 
     def _suffix_match(self, *relatives: str) -> list[str]:
-        out = []
+        out: list[str] = []
         for relative in relatives:
             relative = relative.lstrip("/")
             out.extend(p for p in self.paths if p == relative or p.endswith("/" + relative))

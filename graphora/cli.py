@@ -193,14 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
     # already given before it (argparse applies the inner parser's defaults last).
     nested_common = argparse.ArgumentParser(add_help=False)
     for action in common._actions:
-        nested_common.add_argument(
-            *action.option_strings,
-            dest=action.dest,
-            type=action.type,
-            choices=action.choices,
-            help=action.help,
-            default=argparse.SUPPRESS,
-        )
+        options: dict = {"dest": action.dest, "help": action.help, "default": argparse.SUPPRESS}
+        if action.type is not None:
+            options["type"] = action.type
+        if action.choices is not None:
+            options["choices"] = action.choices
+        nested_common.add_argument(*action.option_strings, **options)
 
     sub = parser.add_subparsers(dest="command", required=True)
 

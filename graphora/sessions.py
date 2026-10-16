@@ -33,7 +33,7 @@ DEFAULT_CODEX_ROOT = Path.home() / ".codex" / "sessions"
 # Back-compat alias (pre-multi-source name)
 DEFAULT_DB = DEFAULT_COPILOT_DB
 
-_EMPTY = {"sessions": [], "files": [], "refs": [], "last_turns": []}
+_EMPTY: dict[str, list] = {"sessions": [], "files": [], "refs": [], "last_turns": []}
 
 
 def _cutoff(days: int) -> str:
@@ -96,7 +96,7 @@ def read_claude_code(root: str | Path | None = None, days: int = 30) -> dict:
     if not base.exists():
         raise FileNotFoundError(f"Claude Code projects dir not found: {base}")
     cutoff = _cutoff(days)
-    out = {"sessions": [], "files": [], "refs": [], "last_turns": []}
+    out: dict[str, list] = {"sessions": [], "files": [], "refs": [], "last_turns": []}
     for jsonl in sorted(base.glob("*/*.jsonl")):
         sid = jsonl.stem
         cwd = branch = summary = ""
@@ -155,7 +155,7 @@ def read_codex(root: str | Path | None = None, days: int = 30) -> dict:
     if not base.exists():
         raise FileNotFoundError(f"Codex sessions dir not found: {base}")
     cutoff = _cutoff(days)
-    out = {"sessions": [], "files": [], "refs": [], "last_turns": []}
+    out: dict[str, list] = {"sessions": [], "files": [], "refs": [], "last_turns": []}
     for jsonl in sorted(base.rglob("*.jsonl")):
         sid = jsonl.stem
         cwd = summary = ""

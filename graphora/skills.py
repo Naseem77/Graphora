@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 MARK_START = "<!-- graphora:start -->"
 MARK_END = "<!-- graphora:end -->"
@@ -146,7 +147,7 @@ def list_agents() -> list[str]:
     return [t.agent for t in SKILL_TARGETS]
 
 
-SKILL_KINDS = {
+SKILL_KINDS: dict[str, dict[str, Any]] = {
     "code": {
         "body": SKILL_BODY,
         "marks": (MARK_START, MARK_END),
