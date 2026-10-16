@@ -244,3 +244,71 @@ def test_unknown_receiver_in_other_language_stays_ambiguous():
         }
     )
     assert {edges[("Main.run", p, q)][0] for p, q in _targets(edges, "Main.run") if q.endswith("go")} == {AMBIGUOUS}
+
+
+def test_rust_crate_name_imports_external_types_and_inline_tests():
+    from graphora.embedded import EmbeddedGraphStore
+    from graphora.impact import what_could_break
+    from graphora.indexer import index_repository
+
+    files = {
+        "Cargo.toml": '[package]\nname = "text-to-cypher"\nversion = "0.1.0"\n',
+        "src/lib.rs": (
+            "pub mod client;\n"
+            "pub use client::TextToCypherClient;\n"
+        ),
+        "src/client.rs": (
+            "pub struct TextToCypherClient { url: String }\n"
+            "impl TextToCypherClient {\n"
+            "    pub fn new(url: &str) -> Self { TextToCypherClient { url: String::new() } }\n"
+            "}\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    use super::*;\n"
+            "    #[test]\n"
+            "    fn test_creation() { TextToCypherClient::new(\"x\"); }\n"
+            "}\n"
+        ),
+        "src/runtime.rs": "pub struct Engine;\nimpl Engine { pub fn new() -> Self { Engine } }\n",
+        "examples/usage.rs": (
+            "use text_to_cypher::TextToCypherClient;\n"
+            "fn main() {\n"
+            "    let c = TextToCypherClient::new(\"u\");\n"
+            "    let s = String::new();\n"
+            "    let r = Runtime::new();\n"
+            "}\n"
+        ),
+    }
+    edges = _resolve({k: v for k, v in files.items() if k.endswith(".rs") or k == "Cargo.toml"})
+    assert _targets(edges, "main") == {("src/client.rs", "TextToCypherClient.new")}
+    assert edges[("main", "src/client.rs", "TextToCypherClient.new")][0] == EXTRACTED
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "repo"
+        for path, text in files.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text(text)
+        store = EmbeddedGraphStore("rust", data_dir=Path(tmp) / "data")
+        index_repository(root, project="rust", store=store)
+        result = what_could_break(store, ["TextToCypherClient.new"], depth=1)
+        assert {b.caller["qualname"] for b in result.will_break} == {"main"}
+        assert {b.caller["qualname"] for b in result.tests} == {"tests.test_creation"}
+        assert result.might_break == []
+
+
+def test_capitalized_types_outside_the_repo_are_external():
+    edges = _resolve(
+        {
+            "src/util.js": "export class Stats { max(a) { return a; } keys(o) { return o; } }\n",
+            "src/app.js": "export function run(o) { Math.max(1, 2); Object.keys(o); }\n",
+            "src/Sorter.java": "class Sorter { void sort(Object x) {} }\n",
+            "src/Main.java": "class Main { void run(java.util.List<String> l) { Collections.sort(l); } }\n",
+            "app/stats.py": "class Stats:\n    def home(self):\n        return 1\n",
+            "app/main.py": "def run():\n    return Path.home()\n",
+        }
+    )
+    assert _targets(edges, "run") == set()
+    assert _targets(edges, "Main.run") == set()

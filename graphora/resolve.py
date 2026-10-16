@@ -131,6 +131,8 @@ class Resolution:
 
 
 _STDLIB = frozenset(getattr(sys, "stdlib_module_names", ()))
+# CamelCase: a type, not a variable or an ALL_CAPS constant.
+_TYPE_LIKE = re.compile(r"^[A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*$")
 
 
 def _submodule(module: str, *parts: str) -> str:
@@ -164,7 +166,7 @@ def records_for(parsed: ParsedFile) -> tuple[list[SymbolRecord], FileRecord]:
                 signature=s.signature,
                 parent=s.parent,
                 parent_kind=s.parent_kind,
-                is_test=parsed.is_test,
+                is_test=parsed.is_test or s.is_test,
                 confidence=s.confidence,
                 returns=s.returns,
             )
@@ -224,6 +226,17 @@ class _Resolver:
                 if local == "<module>"
             ),
             key=lambda item: -len(item[1]),
+        )
+        # (directory, crate name) of every Cargo.toml.
+        self.rust_crates = sorted(
+            (
+                (posixpath.dirname(f.path), module)
+                for f in files
+                if f.language == "cargo"
+                for local, module, _, _ in f.bindings
+                if local == "<crate>"
+            ),
+            key=lambda item: -len(item[0]),
         )
         self.result = Resolution()
 
@@ -490,6 +503,12 @@ class _Resolver:
             members = same_file or members
             return members, EXTRACTED if len(members) == 1 else AMBIGUOUS, "namespace"
 
+        # A type name that is not defined anywhere in the repository (`String::new()`,
+        # `Math.max()`, `Path.home()`): a library type, so not your code.
+        if _TYPE_LIKE.match(class_name) and not classes:
+            self.result.external += 1
+            return [], EXTRACTED, "external"
+
         # Unknown receiver type: any method with that name could be meant,
         # including one outside the repository, so even one match is AMBIGUOUS.
         candidates = self._by_name(family, name, methods=True, members=True)
@@ -718,6 +737,8 @@ class _Resolver:
         return [p for p in self.paths if posixpath.dirname(p).endswith(relative) and p.endswith(".java")]
 
     def _rust_module(self, path: str, module: str) -> list[str]:
+        if self.rust_crates:
+            return self._rust_crate_module(path, module)
         parts = [p for p in module.split("::") if p not in ("crate", "self", "super", "")]
         if not parts:
             return [path]
@@ -727,6 +748,38 @@ class _Resolver:
             parent = "/".join(parts[:-1])
             found = self._suffix_match(f"{parent}.rs", f"{parent}/mod.rs")
         return found
+
+    def _rust_crate_module(self, path: str, module: str) -> list[str]:
+        """Resolve `crate::a::b`, `my_crate::a::b`, `self::`/`super::` against Cargo crates;
+        any other first segment (std, tokio, ...) is an external crate."""
+        parts = [p for p in module.split("::") if p]
+        if not parts:
+            return []
+        own = next((root for root, _ in self.rust_crates if not root or path.startswith(root + "/")), None)
+        first, rest = parts[0], parts[1:]
+        if first == "crate" and own is not None:
+            base = posixpath.join(own, "src") if own else "src"
+        elif first in {"self", "super"}:
+            # Modules live in a directory: `super` of a mod.rs/lib.rs climbs one level,
+            # `super` of a plain file module (a.rs) is its own directory.
+            base = posixpath.dirname(path)
+            if first == "super" and posixpath.basename(path) in {"mod.rs", "lib.rs", "main.rs"}:
+                base = posixpath.dirname(base)
+        else:
+            root = next((r for r, crate in self.rust_crates if crate == first), None)
+            if root is None:
+                return []  # external crate
+            base = posixpath.join(root, "src") if root else "src"
+        if not rest:
+            return self._exact(posixpath.join(base, "lib.rs"), posixpath.join(base, "main.rs"), path)[:1]
+        for depth in (len(rest), len(rest) - 1):
+            if depth < 1:
+                break
+            relative = posixpath.join(base, *rest[:depth])
+            found = self._exact(f"{relative}.rs", f"{relative}/mod.rs")
+            if found:
+                return found
+        return self._exact(posixpath.join(base, "lib.rs"), posixpath.join(base, "main.rs"))[:1]
 
     def _c_module(self, path: str, module: str) -> list[str]:
         local = self._exact(posixpath.join(posixpath.dirname(path), module))

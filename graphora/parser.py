@@ -49,6 +49,7 @@ class ParsedSymbol:
     parent: str = ""  # qualified name of the enclosing scope ("" at top level)
     parent_kind: str = ""  # "Class", "Function", "Namespace", or ""
     returns: str = ""  # declared return type name, when the source states one
+    is_test: bool = False  # test code inside a non-test file (Rust #[cfg(test)] / #[test])
 
     def __post_init__(self) -> None:
         if not self.qualname:
@@ -104,8 +105,12 @@ class ParsedFile:
     bindings: list[ParsedBinding] = field(default_factory=list)
 
 
+# Manifests that say which imports are local: Go's module path, Rust's crate name.
+MANIFESTS = {"go.mod": "gomod", "Cargo.toml": "cargo"}
+
+
 def is_supported_code_file(path: str) -> bool:
-    return Path(path).suffix.lower() in CODE_EXTENSIONS or Path(path).name == "go.mod"
+    return Path(path).suffix.lower() in CODE_EXTENSIONS or Path(path).name in MANIFESTS
 
 
 def is_test_path(path: str) -> bool:
@@ -113,8 +118,8 @@ def is_test_path(path: str) -> bool:
 
 
 def language_for_path(path: str) -> str:
-    if Path(path).name == "go.mod":
-        return "gomod"
+    if Path(path).name in MANIFESTS:
+        return MANIFESTS[Path(path).name]
     suffix = Path(path).suffix.lower()
     return {
         ".py": "python",
@@ -142,6 +147,8 @@ def parse_code_file(path: str, content: str) -> ParsedFile:
     language = language_for_path(path)
     if language == "gomod":
         return _parse_go_mod(path, content)
+    if language == "cargo":
+        return _parse_cargo_toml(path, content)
     parsed = _parse_with_tree_sitter(path, content, language)
     if parsed is not None:
         return parsed
@@ -153,6 +160,22 @@ def _parse_go_mod(path: str, content: str) -> ParsedFile:
     match = re.search(r"(?m)^\s*module\s+(\S+)", content)
     bindings = [ParsedBinding("<module>", match.group(1).strip('"'))] if match else []
     return ParsedFile(path, "gomod", [], [], [], content, parser_used="regex", bindings=bindings)
+
+
+def _parse_cargo_toml(path: str, content: str) -> ParsedFile:
+    """Cargo.toml names the crate: `use my_crate::x` inside the repository is local."""
+    name = ""
+    section = ""
+    for raw in content.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            section = line.strip("[] ")
+            continue
+        match = re.match(r'name\s*=\s*"([^"]+)"', line)
+        if match and section in {"package", "lib"}:
+            name = match.group(1)  # [lib] name, when given, wins over [package]
+    bindings = [ParsedBinding("<crate>", name.replace("-", "_"))] if name else []
+    return ParsedFile(path, "cargo", [], [], [], content, parser_used="regex", bindings=bindings)
 
 
 def extract_symbols_from_diff(diff: str) -> list[str]:
@@ -216,6 +239,7 @@ class _Definition:
 class _Frame:
     qualname: str
     kind: str
+    test: bool = False
 
 
 def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFile | None:
@@ -263,6 +287,7 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
             returns = _return_type(language, node, content_bytes) if definition.kind == "Function" else ""
             if returns in {"Self", "self", "this", "static"} and parent_kind == "Class":
                 returns = parent.rsplit(".", 1)[-1]
+            in_test = any(f.test for f in scope) or _is_test_item(language, node, definition.name, content_bytes)
             if definition.emit:
                 symbols.append(
                     ParsedSymbol(
@@ -276,9 +301,10 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
                         parent=parent,
                         parent_kind=parent_kind,
                         returns=returns,
+                        is_test=in_test,
                     )
                 )
-            child_scope = scope + (_Frame(qualname, definition.kind),)
+            child_scope = scope + (_Frame(qualname, definition.kind, in_test),)
 
         call = _tree_sitter_call(language, node, content_bytes)
         if call is not None:
@@ -312,6 +338,21 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
         parser_used="tree-sitter",
         bindings=_dedupe_bindings(bindings),
     )
+
+
+def _is_test_item(language: str, node: Any, name: str, content: bytes) -> bool:
+    """Rust inline tests: `#[cfg(test)] mod tests`, `#[test]`/`#[tokio::test]` functions."""
+    if language != "rust" or node.type not in {"mod_item", "function_item"}:
+        return False
+    if node.type == "mod_item" and name == "tests":
+        return True
+    sibling = node.prev_named_sibling
+    while sibling is not None and sibling.type == "attribute_item":
+        text = _node_text(sibling, content)
+        if "cfg(test)" in text or re.search(r"\btest\b", text):
+            return True
+        sibling = sibling.prev_named_sibling
+    return False
 
 
 def _type_owner(scope: tuple[_Frame, ...], target: str) -> str:
