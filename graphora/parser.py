@@ -225,7 +225,8 @@ def extract_files_from_diff(diff: str) -> list[str]:
 
 # Values that make a variable, property, or class field a function definition.
 _JS_FUNCTION_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
-_NAME_PATTERN = re.compile(r"^~?[A-Za-z_][\w$]*[?!=]?$")
+# Identifiers in any script (Ñ, π), with JS `$`/`#private`, C++ `~Dtor`, Ruby `paid?`/`name=`.
+_NAME_PATTERN = re.compile(r"^(?:[~#$]?[^\W\d][\w$]*[?!=]?|\$+)$")
 _UNKNOWN_QUALIFIER_KIND = "?"
 
 
@@ -251,7 +252,7 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
     if parser is None:
         return None
 
-    content_bytes = content.encode("utf-8")
+    content_bytes = content.encode("utf-8", errors="replace")  # lone surrogates must not crash
     root = parser.parse(content_bytes).root_node
     symbols: list[ParsedSymbol] = []
     imports: list[ParsedImport] = []
@@ -662,14 +663,31 @@ def _js_test_block(node: Any, content: bytes) -> _Definition | None:
     return _Definition("Function", f"{base}_{slug}" if slug else base)
 
 
+def _is_default_export(node: Any) -> bool:
+    parent = node.parent
+    return parent is not None and parent.type == "export_statement" and any(c.type == "default" for c in parent.children)
+
+
 def _js_definition(node: Any, content: bytes) -> _Definition | None:
     kind = node.type
     if kind == "call_expression":
         return _js_test_block(node, content)
     if kind in {"function_declaration", "generator_function_declaration", "method_definition"}:
         return _named("Function", node, content)
+    if kind in _JS_FUNCTION_VALUES and node.child_by_field_name("name") is None and _is_default_export(node):
+        return _Definition("Function", "default")  # export default function () {}
+    if kind == "assignment_expression":
+        return _js_exports_assignment(node, content)
     if kind in {"class_declaration", "abstract_class_declaration", "class", "interface_declaration", "enum_declaration"}:
-        return _named("Class", node, content)
+        named = _named("Class", node, content)
+        if named is not None or node.child_by_field_name("name") is not None:
+            return named
+        if _is_default_export(node):
+            return _Definition("Class", "default")  # export default class {}
+        if node.parent is not None and node.parent.type == "variable_declarator":
+            return None  # `const K = class {}` is named by the declarator
+        # An anonymous class still scopes its methods (they are not top-level functions).
+        return _Definition("Class", f"anonymous_{_point_row(node.start_point) + 1}", emit=False)
     if kind in {"internal_module", "module"}:
         return _named("Namespace", node, content, emit=False)
     value = node.child_by_field_name("value")
@@ -681,6 +699,8 @@ def _js_definition(node: Any, content: bytes) -> _Definition | None:
             return None
         if value.type in _JS_FUNCTION_VALUES:
             return _named("Function", node, content)
+        if value.type == "class":
+            return _named("Class", node, content)  # const K = class { ... }
         if value.type == "object":
             return _named("Namespace", node, content, emit=False)
         return None
@@ -693,6 +713,21 @@ def _js_definition(node: Any, content: bytes) -> _Definition | None:
         return _named("Function", node, content, field_name="property")
     if kind == "public_field_definition":
         return _named("Function", node, content)
+    return None
+
+
+def _js_exports_assignment(node: Any, content: bytes) -> _Definition | None:
+    """CommonJS: `module.exports = function x() {}`, `exports.foo = function () {}`."""
+    left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+    if left is None or right is None or left.type != "member_expression" or right.type not in _JS_FUNCTION_VALUES:
+        return None
+    target = _node_text(left, content).replace(" ", "")
+    if target == "module.exports":
+        own = _node_text(right.child_by_field_name("name"), content)
+        return _Definition("Function", own or "default")
+    if target.startswith(("exports.", "module.exports.")):
+        name = target.rsplit(".", 1)[-1]
+        return _Definition("Function", name) if _NAME_PATTERN.match(name) else None
     return None
 
 
@@ -733,6 +768,8 @@ def _rust_definition(node: Any, content: bytes) -> _Definition | None:
         return _named("Class", node, content)
     if node.type == "impl_item":
         type_text = _node_text(node.child_by_field_name("type"), content)
+        # `impl<'a> Tr for &'a mut Foo<i32>`: the type is Foo.
+        type_text = re.sub(r"^&\s*(?:'\w+\s+)?(?:mut\s+)?(?:dyn\s+)?", "", type_text.strip())
         name = type_text.split("<")[0].split("::")[-1].strip()
         return _Definition("Class", name, emit=False) if _NAME_PATTERN.match(name) else None
     if node.type == "mod_item":
@@ -750,8 +787,12 @@ def _c_family_definition(node: Any, content: bytes, cpp: bool) -> _Definition | 
             scope_text = _node_text(name_node.child_by_field_name("scope"), content)
             qualifiers = tuple(part for part in scope_text.split("::") if part)
             name_node = _innermost_name(name_node)
+        if name_node is not None and name_node.type == "template_function":  # template<> int f<int>(...)
+            name_node = name_node.child_by_field_name("name")
         name = _node_text(name_node, content).strip()
-        if not _NAME_PATTERN.match(name):
+        if name_node is not None and name_node.type == "operator_name":
+            name = "".join(name.split())  # operator+, operator==
+        elif not _NAME_PATTERN.match(name):
             return None
         if qualifiers:
             return _Definition("Function", name, qualifiers=qualifiers, qualifier_kind=_UNKNOWN_QUALIFIER_KIND)
@@ -799,6 +840,8 @@ def _php_definition(node: Any, content: bytes) -> _Definition | None:
         return _named("Function", node, content) if node.child_by_field_name("body") is not None else None
     if node.type in {"class_declaration", "interface_declaration", "trait_declaration", "enum_declaration"}:
         return _named("Class", node, content)
+    if node.type == "anonymous_class":  # new class { ... }: its methods are not top-level functions
+        return _Definition("Class", f"anonymous_{_point_row(node.start_point) + 1}", emit=False)
     return None
 
 
@@ -821,8 +864,15 @@ def _c_declarator_name(node: Any) -> Any | None:
     declarator = node.child_by_field_name("declarator")
     depth = 0
     while declarator is not None and depth < 10:
-        if declarator.type in {"identifier", "field_identifier", "destructor_name", "qualified_identifier"}:
+        if declarator.type in {
+            "identifier", "field_identifier", "destructor_name", "qualified_identifier",
+            "operator_name", "template_function",
+        }:
             return declarator
+        if declarator.type == "parenthesized_declarator":  # int (*f(void))(int): f returns a pointer
+            declarator = declarator.named_children[0] if declarator.named_children else None
+            depth += 1
+            continue
         declarator = declarator.child_by_field_name("declarator")
         depth += 1
     return None
@@ -883,9 +933,13 @@ def _tree_sitter_call(language: str, node: Any, content: bytes) -> tuple[str, st
         return _with_receiver(method, receiver)
     if language == "php":
         if t == "function_call_expression":
-            return _bare(_node_text(field("function"), content).split("\\")[-1])
-        if t == "member_call_expression":
-            return _with_receiver(_node_text(field("name"), content), _receiver_text(language, field("object"), content))
+            function = field("function")
+            if function is None or function.type == "variable_name":
+                return None  # `$helper()` calls whatever the variable holds
+            return _bare(_node_text(function, content).split("\\")[-1])
+        if t == "member_call_expression":  # $this->log(), $obj->save(): drop PHP's `$` sigil
+            receiver = _receiver_text(language, field("object"), content)
+            return _with_receiver(_node_text(field("name"), content), receiver.lstrip("$").replace("->$", "->"))
         if t == "scoped_call_expression":
             return _with_receiver(_node_text(field("name"), content), _node_text(field("scope"), content))
         if t == "object_creation_expression":
@@ -947,12 +1001,10 @@ def _bare(name: str) -> tuple[str, str] | None:
 
 
 def _with_receiver(name: str, receiver: str) -> tuple[str, str] | None:
-    name = name.strip().lstrip("$&")
+    name = name.strip().lstrip("&")
     if not _NAME_PATTERN.match(name):
         return None
     receiver = " ".join(receiver.split())
-    if receiver.startswith("$"):
-        receiver = receiver[1:]  # PHP $this / $obj
     constructed = _CONSTRUCTED_RECEIVER.match(receiver)
     if constructed:
         receiver = constructed.group(1)  # `Db().save()` / `new Db().save()`: the receiver is a Db
@@ -971,7 +1023,7 @@ def _with_receiver(name: str, receiver: str) -> tuple[str, str] | None:
 # variable are recorded with the type as their receiver, so `db.select_graph()`
 # resolves to FalkorDB.select_graph instead of every method of that name.
 
-_TYPE_NAME = re.compile(r"^[A-Za-z_]\w*(?:(?:\.|::|\\)[A-Za-z_]\w*)*$")
+_TYPE_NAME = re.compile(r"^[^\W\d]\w*(?:(?:\.|::|\\)[^\W\d]\w*)*$")
 _SELF_PREFIXES = ("self.", "this.", "@")
 
 
@@ -1014,8 +1066,8 @@ def _constructed_type(language: str, node: Any | None, content: bytes) -> str:
     if language == "go":
         if t == "unary_expression":
             return _constructed_type(language, node.child_by_field_name("operand"), content)
-        if t == "composite_literal":
-            return _type_name(_node_text(node.child_by_field_name("type"), content))
+        if t == "composite_literal":  # Foo{} and generic Foo[int]{}
+            return _type_name(_node_text(node.child_by_field_name("type"), content).split("[")[0])
     if language == "rust":
         if t == "struct_expression":
             return _type_name(_node_text(node.child_by_field_name("name"), content))

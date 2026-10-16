@@ -400,3 +400,67 @@ def test_same_qualname_twice_in_one_file_stays_two_symbols():
     src = "import sys\nif sys.version_info > (3,):\n    def compat():\n        return 1\nelse:\n    def compat():\n        return 2\n"
     symbols = [s for s in parse_code_file("c.py", src).symbols if s.name == "compat"]
     assert [s.line for s in symbols] == [3, 6]
+
+
+EDGE_CASES = [
+    (
+        "web/misc.js",
+        "function $http(a) { return a; }\n"
+        "const $el = () => 1;\n"
+        "export default function () { $http(1); }\n"
+        "module.exports = function exported() {};\n"
+        "exports.foo = function () {};\n"
+        "const K = class { m() {} };\n"
+        "class A { #priv() { this.#priv(); } }\n",
+        {
+            ("Function", "$http"), ("Function", "$el"), ("Function", "default"), ("Function", "exported"),
+            ("Function", "foo"), ("Class", "K"), ("Function", "K.m"), ("Class", "A"), ("Function", "A.#priv"),
+        },
+    ),
+    ("web/anon.js", "export default class { n() {} }\n", {("Class", "default"), ("Function", "default.n")}),
+    ("pkg/uni.py", "class Ñ:\n    def método(self):\n        return 1\n\ndef π():\n    return 3\n",
+     {("Class", "Ñ"), ("Function", "Ñ.método"), ("Function", "π")}),
+    ("web/uni.js", "function ñandú() {}\nconst π = () => 3;\n", {("Function", "ñandú"), ("Function", "π")}),
+    ("src/refs.rs", "struct Foo<T>(T);\ntrait Tr { fn t(&self); }\nimpl<'a> Tr for &'a Foo<i32> { fn t(&self) {} }\n",
+     {("Class", "Foo"), ("Class", "Tr"), ("Function", "Foo.t")}),
+    ("src/fp.c", "int (*get_handler(void))(int) { return 0; }\n", {("Function", "get_handler")}),
+    (
+        "src/ops.cpp",
+        "struct V { V operator+(const V& o) const { return o; } };\n"
+        "bool operator==(const V& a, const V& b) { return true; }\n"
+        "template<typename T> T maxv(T a, T b) { return a; }\n"
+        "template<> int maxv<int>(int a, int b) { return a; }\n",
+        {("Class", "V"), ("Function", "V.operator+"), ("Function", "operator=="), ("Function", "maxv"),
+         ("Function", "maxv")},
+    ),
+    ("src/Anon.php", "<?php\nfunction anon() {}\n$o = new class { function anon() {} };\n", {("Function", "anon")}),
+]
+
+
+@pytest.mark.parametrize("path,source,expected", EDGE_CASES, ids=[c[0] for c in EDGE_CASES])
+def test_edge_case_definitions(path, source, expected):
+    found = {(s.kind, s.qualname) for s in parse_code_file(path, source).symbols if not s.qualname.startswith("anonymous")}
+    assert found == expected, f"missing={sorted(expected - found)} extra={sorted(found - expected)}"
+
+
+def test_php_anonymous_class_methods_are_not_top_level():
+    symbols = parse_code_file("src/Anon.php", "<?php\n$o = new class { function anon() {} };\n").symbols
+    assert all(s.parent_kind == "Class" for s in symbols if s.name == "anon")
+
+
+def test_dollar_names_are_kept_in_calls():
+    calls = {(c.callee, c.receiver) for c in parse_code_file("a.js", "function f() { $foo(); $.ajax(); }\n").calls}
+    assert ("$foo", "") in calls and ("ajax", "$") in calls
+    php = {(c.callee, c.receiver) for c in parse_code_file("a.php", "<?php function f() { $helper(); }\n").calls}
+    assert ("helper", "") not in php  # $helper() calls a variable, not function helper
+
+
+def test_lone_surrogates_do_not_crash():
+    parsed = parse_code_file("odd.py", "def ok():\n    return '\ud800'\n")
+    assert [s.name for s in parsed.symbols] == ["ok"]
+
+
+def test_go_generic_composite_literal_keeps_its_type():
+    calls = {(c.callee, c.receiver) for c in parse_code_file(
+        "p/a.go", "package p\nfunc f() { s := &S[int]{}; s.Do() }\n").calls}
+    assert ("Do", "S") in calls
