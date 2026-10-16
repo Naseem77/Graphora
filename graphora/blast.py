@@ -21,9 +21,6 @@ class SymbolImpact:
     path: str
     line: int
     signature: str
-    risk_score: float
-    fix_count: int
-    last_broke_at: str
     callers: list[tuple[str, str, str]] = field(default_factory=list)  # (name, path, confidence)
     callees: list[tuple[str, str, str]] = field(default_factory=list)
     tests: list[tuple[str, str, str]] = field(default_factory=list)
@@ -47,11 +44,6 @@ class BlastRadius:
             lines.append(_relation_line("tests", impact.tests))
             if impact.importers:
                 lines.append(f"- imported by ({len(impact.importers)}): {', '.join(impact.importers)}")
-            if impact.fix_count:
-                lines.append(
-                    f"- RISK MEMORY: involved in {impact.fix_count} fix/revert commits"
-                    f" (last: {impact.last_broke_at}), risk score {impact.risk_score:.2f}"
-                )
         if self.unresolved:
             lines.append(f"\nSymbols not found in graph: {', '.join(self.unresolved)}")
         return "\n".join(lines)
@@ -67,9 +59,6 @@ class BlastRadius:
                     "path": s.path,
                     "line": s.line,
                     "signature": s.signature,
-                    "risk_score": s.risk_score,
-                    "fix_count": s.fix_count,
-                    "last_broke_at": s.last_broke_at,
                     "callers": [{"name": n, "path": p, "confidence": c} for n, p, c in s.callers],
                     "callees": [{"name": n, "path": p, "confidence": c} for n, p, c in s.callees],
                     "tests": [{"name": n, "path": p, "confidence": c} for n, p, c in s.tests],
@@ -113,7 +102,7 @@ def blast_radius_for_diff(store: GraphStore, diff: str) -> BlastRadius:
 
 
 def _impact_for(store: GraphStore, row: list) -> SymbolImpact:
-    name, kind, path, line, signature, risk_score, fix_count, last_broke_at = row
+    name, kind, path, line, signature = row[:5]
     callers = sorted(store.callers_of(name, path))
     callees = sorted(store.callees_of(name, path))
     tests = sorted(store.tests_covering(name, path))
@@ -124,9 +113,6 @@ def _impact_for(store: GraphStore, row: list) -> SymbolImpact:
         path=path,
         line=int(line),
         signature=signature or "",
-        risk_score=float(risk_score or 0.0),
-        fix_count=int(fix_count or 0),
-        last_broke_at=str(last_broke_at or ""),
         callers=callers,
         callees=callees,
         tests=tests,

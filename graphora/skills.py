@@ -17,11 +17,11 @@ SESSIONS_MARK_START = "<!-- graphora-sessions:start -->"
 SESSIONS_MARK_END = "<!-- graphora-sessions:end -->"
 
 SKILL_BODY = """\
-# Graphora: code graph, blast radius, and risk memory
+# Graphora: code graph and blast radius
 
 This repository is indexed by Graphora, a deterministic code knowledge graph
-(tree-sitter + graph storage, zero LLM to build) with a risk memory mined from
-git history. Use it before you edit, and before you commit.
+(tree-sitter + graph storage, zero LLM to build). Use it before you edit, and
+before you commit.
 
 ## Workflow
 
@@ -30,10 +30,8 @@ git history. Use it before you edit, and before you commit.
    importers, each tagged EXTRACTED, INFERRED, or AMBIGUOUS.
 2. **Before committing**, run a grounded review of your diff:
    `git diff | graphora review` flags changed symbols that have callers but
-   no covering tests, and warns when a symbol broke before (risk memory).
-3. **When choosing what to test or refactor first**:
-   `graphora risk top` ranks symbols by historical fix/revert frequency.
-4. **Keep the graph fresh** after adding or deleting files:
+   no covering tests.
+3. **Keep the graph fresh** after adding or deleting files:
    `graphora index .`
 
 ## Notes
@@ -43,7 +41,7 @@ git history. Use it before you edit, and before you commit.
 - Prefer facts from the graph over guessing: a blast radius answer is read
   from real structure, not inferred from text.
 - MCP alternative: `graphora serve-mcp` exposes blast_radius, review_diff,
-  risk_top, find_symbol, and graph_stats as MCP tools.
+  find_symbol, and graph_stats as MCP tools.
 """
 
 SESSIONS_SKILL_BODY = """\
@@ -98,7 +96,7 @@ SKILL_TARGETS: list[SkillTarget] = [
         frontmatter=(
             "---\n"
             "name: graphora\n"
-            "description: Check the Graphora code graph (blast radius, risk memory, grounded review) before editing or committing code in this repository.\n"
+            "description: Check the Graphora code graph (blast radius, grounded review) before editing or committing code in this repository.\n"
             "---\n\n"
         ),
     ),
@@ -108,7 +106,7 @@ SKILL_TARGETS: list[SkillTarget] = [
         "file",
         frontmatter=(
             "---\n"
-            "description: Graphora code graph workflow (blast radius, risk memory, grounded review)\n"
+            "description: Graphora code graph workflow (blast radius, grounded review)\n"
             "alwaysApply: true\n"
             "---\n\n"
         ),
@@ -150,7 +148,7 @@ SKILL_KINDS = {
         "body": SKILL_BODY,
         "marks": (MARK_START, MARK_END),
         "slug": "graphora",
-        "description": "Check the Graphora code graph (blast radius, risk memory, grounded review) before editing or committing code in this repository.",
+        "description": "Check the Graphora code graph (blast radius, grounded review) before editing or committing code in this repository.",
     },
     "sessions": {
         "body": SESSIONS_SKILL_BODY,

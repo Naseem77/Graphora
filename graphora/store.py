@@ -184,9 +184,7 @@ class GraphStore:
             """
             MATCH (s)
             WHERE (s:Function OR s:Class) AND s.name = $name
-            RETURN s.name, labels(s)[0], s.path, s.line, s.signature,
-                   coalesce(s.risk_score, 0.0), coalesce(s.fix_count, 0),
-                   coalesce(s.last_broke_at, '')
+            RETURN s.name, labels(s)[0], s.path, s.line, s.signature
             """,
             {"name": name},
         )
@@ -267,78 +265,6 @@ class GraphStore:
             {"name": r[0], "kind": r[1], "path": r[2], "line": int(r[3] or 0), "signature": r[4]}
             for r in rows
         ]
-
-    # --- risk memory surface -------------------------------------------------
-
-    def known_fix_shas(self) -> set[str]:
-        return {row[0] for row in self.query("MATCH (c:FixCommit) RETURN c.sha")}
-
-    def upsert_fix_commit(self, sha: str, date: str, subject: str, kind: str) -> None:
-        self.query(
-            "MERGE (c:FixCommit {sha: $sha}) SET c.date = $date, c.subject = $subject, c.kind = $kind",
-            {"sha": sha, "date": date, "subject": subject[:300], "kind": kind},
-        )
-
-    def touch_file(self, sha: str, path: str) -> int:
-        rows = self.query(
-            """
-            MATCH (f:File {path: $path}), (c:FixCommit {sha: $sha})
-            MERGE (c)-[:TOUCHED]->(f)
-            RETURN f.path
-            """,
-            {"path": path, "sha": sha},
-        )
-        return len(rows)
-
-    def record_symbol_fix(self, path: str, name: str, sha: str, date: str) -> int:
-        rows = self.query(
-            """
-            MATCH (s {path: $path, name: $name}), (c:FixCommit {sha: $sha})
-            WHERE s:Function OR s:Class
-            MERGE (c)-[:FIXED]->(s)
-            SET s.fix_count = coalesce(s.fix_count, 0) + 1,
-                s.last_broke_at =
-                    CASE WHEN coalesce(s.last_broke_at, '') < $date THEN $date
-                         ELSE s.last_broke_at END
-            RETURN s.name
-            """,
-            {"path": path, "name": name, "sha": sha, "date": date},
-        )
-        return len(rows)
-
-    def risky_symbols(self, limit: int = 15) -> list[list]:
-        return self.query(
-            """
-            MATCH (s)
-            WHERE (s:Function OR s:Class) AND coalesce(s.fix_count, 0) > 0
-            OPTIONAL MATCH (caller:Function)-[:CALLS]->(s)
-            WITH s, count(DISTINCT caller) AS caller_count
-            RETURN s.name, s.path, s.line, coalesce(s.fix_count, 0),
-                   coalesce(s.last_broke_at, ''), coalesce(s.risk_score, 0.0), caller_count
-            ORDER BY coalesce(s.risk_score, 0.0) DESC, coalesce(s.fix_count, 0) DESC
-            LIMIT $limit
-            """,
-            {"limit": limit},
-        )
-
-    def symbols_with_fixes(self) -> list[list]:
-        return self.query(
-            """
-            MATCH (s)
-            WHERE (s:Function OR s:Class) AND coalesce(s.fix_count, 0) > 0
-            RETURN s.path, s.name, s.fix_count, coalesce(s.last_broke_at, '')
-            """
-        )
-
-    def set_risk_score(self, path: str, name: str, score: float) -> None:
-        self.query(
-            """
-            MATCH (s {path: $path, name: $name})
-            WHERE s:Function OR s:Class
-            SET s.risk_score = $score
-            """,
-            {"path": path, "name": name, "score": score},
-        )
 
     # --- internals ----------------------------------------------------------
 

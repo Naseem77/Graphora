@@ -58,7 +58,7 @@ def server(project):
 async def test_mcp_lists_all_tools(server):
     tools = await server.list_tools()
     names = {tool.name for tool in tools}
-    assert names == {"graph_stats", "blast_radius", "review_diff", "risk_top", "find_symbol"}
+    assert names == {"graph_stats", "blast_radius", "review_diff", "find_symbol"}
 
 
 @pytest.mark.anyio

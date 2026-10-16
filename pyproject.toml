@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "graphora-kg"
 version = "0.2.1"
-description = "Deterministic code knowledge graph: index with tree-sitter, query blast radius, mine risk memory from git, review diffs grounded in structure. No LLM required to build."
+description = "Deterministic code knowledge graph: index with tree-sitter, find what could break when you change code, review diffs grounded in structure. No LLM required to build."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

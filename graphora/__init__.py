@@ -1,8 +1,7 @@
 """Graphora: a deterministic code knowledge-graph tool.
 
 Index a repository into FalkorDB with tree-sitter (no LLM), query blast
-radius for any change, mine git history into a risk memory, and review
-diffs grounded in real structure. Usable as a library, CLI, or MCP server.
+radius for any change, and review diffs grounded in real structure. Usable as a library, CLI, or MCP server.
 """
 
 from __future__ import annotations
@@ -22,8 +21,6 @@ _LAZY = {
     "update_files": "graphora.indexer",
     "blast_radius": "graphora.blast",
     "BlastRadius": "graphora.blast",
-    "mine_risk_memory": "graphora.risk",
-    "risk_report": "graphora.risk",
 }
 
 __all__ = list(_LAZY) + ["__version__"]

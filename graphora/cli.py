@@ -5,8 +5,6 @@ Usage:
   graphora stats [--project NAME]
   graphora blast SYMBOL [SYMBOL...] [--project NAME] [--json]
   graphora review [--diff FILE | --git-range RANGE --repo PATH] [--project NAME] [--llm]
-  graphora risk mine PATH [--project NAME] [--since DATE]
-  graphora risk top [--project NAME] [--limit N]
   graphora benchmark PATH [--project NAME] [--symbols A,B]
   graphora serve-mcp [--project NAME]
 """
@@ -85,36 +83,6 @@ def cmd_review(args: argparse.Namespace) -> int:
         return 1
     review = review_diff(_store(args), diff, model=args.model, use_llm=args.llm)
     print(review.render())
-    return 0
-
-
-def cmd_risk_mine(args: argparse.Namespace) -> int:
-    from graphora.risk import mine_risk_memory
-
-    root = Path(args.path).resolve()
-    project = args.project or root.name
-    store = open_store(project, backend=args.backend, host=args.host, port=args.port)
-    stats = mine_risk_memory(store, root, since=args.since, max_commits=args.max_commits)
-    print(json.dumps(stats.__dict__, indent=2))
-    return 0
-
-
-def cmd_risk_top(args: argparse.Namespace) -> int:
-    from graphora.risk import risk_report
-
-    report = risk_report(_store(args), limit=args.limit)
-    if args.json:
-        print(json.dumps(report, indent=2))
-        return 0
-    if not report:
-        print("No risk memory yet. Run: graphora risk mine <repo-path>")
-        return 0
-    print(f"{'RISK':>6}  {'FIXES':>5}  {'CALLERS':>7}  {'LAST BROKE':<12} SYMBOL")
-    for row in report:
-        print(
-            f"{row['risk_score']:>6.2f}  {row['fix_count']:>5}  {row['caller_count']:>7}  "
-            f"{row['last_broke_at'][:10]:<12} {row['name']}  ({row['path']}:{row['line']})"
-        )
     return 0
 
 
@@ -240,18 +208,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument("--model", default=None)
     p_review.set_defaults(func=cmd_review)
 
-    p_risk = sub.add_parser("risk", parents=[common], help="Risk memory commands")
-    risk_sub = p_risk.add_subparsers(dest="risk_command", required=True)
-    p_mine = risk_sub.add_parser("mine", parents=[nested_common], help="Mine git fix/revert history into the graph")
-    p_mine.add_argument("path")
-    p_mine.add_argument("--since", default=None, help="e.g. '2 years ago'")
-    p_mine.add_argument("--max-commits", type=int, default=2000)
-    p_mine.set_defaults(func=cmd_risk_mine)
-    p_top = risk_sub.add_parser("top", parents=[nested_common], help="Riskiest symbols")
-    p_top.add_argument("--limit", type=int, default=15)
-    p_top.add_argument("--json", action="store_true")
-    p_top.set_defaults(func=cmd_risk_top)
-
     p_bench = sub.add_parser("benchmark", parents=[common], help="Reproducible token-cost benchmark")
     p_bench.add_argument("path")
     p_bench.add_argument("--symbols", help="Comma-separated symbols to query (default: auto-pick)")
@@ -292,8 +248,6 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "project", None) is None and args.command not in {"index", "benchmark"}:
         if args.command == "review" and args.repo:
             args.project = Path(args.repo).resolve().name
-        elif args.command == "risk" and getattr(args, "path", None):
-            args.project = Path(args.path).resolve().name
         elif args.command == "sessions":
             args.project = "agent-sessions"
         else:

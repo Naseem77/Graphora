@@ -71,7 +71,6 @@ class BenchmarkResult:
             f"- caller relationships: {self.grounded_facts['callers']}",
             f"- callee relationships: {self.grounded_facts['callees']}",
             f"- covering tests identified: {self.grounded_facts['tests']}",
-            f"- risk-memory annotations: {self.grounded_facts['risk_annotations']}",
             "",
             "_Token counts use a fixed 4 chars/token heuristic; the benchmark is fully",
             "deterministic (no LLM, no network) and reproducible with:_",
@@ -121,7 +120,6 @@ def run_benchmark(
         "callers": sum(len(i.callers) for i in radius.symbols),
         "callees": sum(len(i.callees) for i in radius.symbols),
         "tests": sum(len(i.tests) for i in radius.symbols),
-        "risk_annotations": sum(1 for i in radius.symbols if i.fix_count > 0),
     }
 
     return BenchmarkResult(

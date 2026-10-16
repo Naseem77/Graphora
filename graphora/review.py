@@ -2,7 +2,7 @@
 
 Works in two modes:
 - facts mode (default, zero LLM): prints the deterministic blast radius,
-  graph diff facts, and risk memory for a change.
+  graph diff facts, and missing-test warnings for a change.
 - LLM mode (optional): sends diff + compact graph context to a model via
   litellm and returns a structured review. The graph context is the only
   repo knowledge the model gets, which is what keeps token cost tiny.
@@ -58,19 +58,19 @@ def review_diff(
 ) -> Review:
     radius = blast_radius_for_diff(store, diff)
     facts = radius.to_context()
-    risky = _risk_warnings(radius)
+    warnings = _missing_test_warnings(radius)
     context_tokens = estimate_tokens(diff) + estimate_tokens(facts)
 
     model = model or os.environ.get("REVIEW_MODEL", "")
     if not use_llm or not model:
         summary = _facts_summary(radius)
-        return Review(summary=summary, findings=risky, context_tokens=context_tokens, grounded_facts=facts)
+        return Review(summary=summary, findings=warnings, context_tokens=context_tokens, grounded_facts=facts)
 
     raw = _ask_llm(diff, facts, model)
     summary, findings = _parse_llm_review(raw)
     return Review(
         summary=summary,
-        findings=risky + findings,
+        findings=warnings + findings,
         context_tokens=context_tokens,
         grounded_facts=facts,
     )
@@ -90,22 +90,9 @@ def _facts_summary(radius: BlastRadius) -> str:
     return " ".join(parts)
 
 
-def _risk_warnings(radius: BlastRadius) -> list[ReviewFinding]:
+def _missing_test_warnings(radius: BlastRadius) -> list[ReviewFinding]:
     findings = []
     for impact in radius.symbols:
-        if impact.fix_count > 0:
-            findings.append(
-                ReviewFinding(
-                    path=impact.path,
-                    line=impact.line,
-                    severity="risk-memory",
-                    body=(
-                        f"`{impact.name}` was involved in {impact.fix_count} past fix/revert commits "
-                        f"(last: {impact.last_broke_at[:10]}), risk score {impact.risk_score:.2f}, "
-                        f"{len(impact.callers)} caller(s). Review extra carefully."
-                    ),
-                )
-            )
         if not impact.tests and impact.callers:
             findings.append(
                 ReviewFinding(
@@ -122,7 +109,7 @@ def _ask_llm(diff: str, facts: str, model: str) -> str:
     import litellm
 
     prompt = f"""You are a senior code reviewer. You get a diff plus deterministic facts
-from a code knowledge graph (callers, callees, tests, risk history). Ground every claim
+from a code knowledge graph (callers, callees, tests). Ground every claim
 in those facts. Respond with a SINGLE JSON object:
 {{"summary": "...", "findings": [{{"path": "...", "line": 1, "severity": "critical|warning|suggestion", "body": "..."}}]}}
 

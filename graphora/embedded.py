@@ -1,7 +1,7 @@
 """Embedded graph store: pure Python, JSON on disk, zero Docker.
 
 Implements the same method surface as `graphora.store.GraphStore`, so every
-consumer (indexer, blast radius, risk memory, review, CLI, MCP, benchmark)
+consumer (indexer, blast radius, review, CLI, MCP, benchmark)
 works unchanged. Data persists to `{data_dir}/{project}.json`
 (default `~/.graphora`, override with GRAPHORA_DATA_DIR).
 """
@@ -47,12 +47,9 @@ class EmbeddedGraphStore:
             "schema_version": SCHEMA_VERSION,
             "files": {},        # path -> {language, is_test, content_hash, line_count, parser}
             "symbols": {},      # stable_key -> {name, kind, path, line, signature, confidence,
-                                #                is_test, pending_calls, fix_count, last_broke_at, risk_score}
+                                #                is_test, pending_calls}
             "calls": [],        # {a, b, line, confidence} (a, b = stable keys)
             "imports": [],      # {path, module, confidence}
-            "fix_commits": {},  # sha -> {date, subject, kind}
-            "touched": [],      # [sha, path]
-            "fixed": [],        # [sha, stable_key]
             "sessions": {},         # sid -> {summary, cwd, branch, created_at, updated_at, last_ask}
             "session_repos": [],    # [sid, repo]
             "session_files": [],    # {sid, path, tool}
@@ -97,9 +94,6 @@ class EmbeddedGraphStore:
                     "confidence": symbol.confidence,
                     "is_test": parsed.is_test,
                     "pending_calls": [],
-                    "fix_count": 0,
-                    "last_broke_at": "",
-                    "risk_score": 0.0,
                 }
             local_functions = {s.name for s in parsed.symbols if s.kind == "Function"}
             for call in parsed.calls:
@@ -157,8 +151,6 @@ class EmbeddedGraphStore:
             self._data["calls"] = [e for e in self._data["calls"] if e["a"] not in dead and e["b"] not in dead]
             self._call_index = None
         self._data["imports"] = [i for i in self._data["imports"] if i["path"] != path]
-        self._data["touched"] = [t for t in self._data["touched"] if t[1] != path]
-        self._data["fixed"] = [f for f in self._data["fixed"] if f[1] not in dead]
 
     def delete_file(self, path: str) -> None:
         self._delete_file_no_save(path)
@@ -190,9 +182,7 @@ class EmbeddedGraphStore:
             "calls": calls,
             "edges": calls
             + len(self._data["imports"])
-            + len(self._data["symbols"])  # DEFINED_IN
-            + len(self._data["touched"])
-            + len(self._data["fixed"]),
+            + len(self._data["symbols"]),  # DEFINED_IN
         }
 
     def has_files(self) -> bool:
@@ -245,8 +235,7 @@ class EmbeddedGraphStore:
 
     def find_definitions(self, name: str) -> list[list]:
         return [
-            [s["name"], s["kind"], s["path"], s["line"], s["signature"],
-             s.get("risk_score", 0.0), s.get("fix_count", 0), s.get("last_broke_at", "")]
+            [s["name"], s["kind"], s["path"], s["line"], s["signature"]]
             for s in self._sorted_symbols()
             if s["name"] == name
         ]
@@ -311,77 +300,6 @@ class EmbeddedGraphStore:
 
     def _sorted_symbols(self) -> list[dict]:
         return [self._data["symbols"][k] for k in sorted(self._data["symbols"])]
-
-    # --- risk memory surface -------------------------------------------------
-
-    def known_fix_shas(self) -> set[str]:
-        return set(self._data["fix_commits"])
-
-    def upsert_fix_commit(self, sha: str, date: str, subject: str, kind: str) -> None:
-        self._data["fix_commits"][sha] = {"date": date, "subject": subject[:300], "kind": kind}
-        self.save()
-
-    def touch_file(self, sha: str, path: str) -> int:
-        if path not in self._data["files"] or sha not in self._data["fix_commits"]:
-            return 0
-        if [sha, path] not in self._data["touched"]:
-            self._data["touched"].append([sha, path])
-        self.save()
-        return 1
-
-    def record_symbol_fix(self, path: str, name: str, sha: str, date: str) -> int:
-        if sha not in self._data["fix_commits"]:
-            return 0
-        matched = 0
-        for key in sorted(self._data["symbols"]):
-            sym = self._data["symbols"][key]
-            if sym["path"] != path or sym["name"] != name:
-                continue
-            if [sha, key] not in self._data["fixed"]:
-                self._data["fixed"].append([sha, key])
-            sym["fix_count"] = int(sym.get("fix_count", 0)) + 1
-            if (sym.get("last_broke_at") or "") < date:
-                sym["last_broke_at"] = date
-            matched += 1
-        if matched:
-            self.save()
-        return matched
-
-    def risky_symbols(self, limit: int = 15) -> list[list]:
-        rows = []
-        for key in sorted(self._data["symbols"]):
-            sym = self._data["symbols"][key]
-            if int(sym.get("fix_count", 0)) <= 0:
-                continue
-            callers = {
-                e["a"]
-                for e in self._data["calls"]
-                if e["b"] == key
-                and (c := self._data["symbols"].get(e["a"])) is not None
-                and c["kind"] == "Function"
-            }
-            rows.append(
-                [sym["name"], sym["path"], sym["line"], int(sym["fix_count"]),
-                 sym.get("last_broke_at", ""), float(sym.get("risk_score", 0.0)), len(callers)]
-            )
-        rows.sort(key=lambda r: (-r[5], -r[3]))
-        return rows[:limit]
-
-    def symbols_with_fixes(self) -> list[list]:
-        return [
-            [s["path"], s["name"], int(s["fix_count"]), s.get("last_broke_at", "")]
-            for s in self._sorted_symbols()
-            if int(s.get("fix_count", 0)) > 0
-        ]
-
-    def set_risk_score(self, path: str, name: str, score: float) -> None:
-        changed = False
-        for sym in self._data["symbols"].values():
-            if sym["path"] == path and sym["name"] == name:
-                sym["risk_score"] = score
-                changed = True
-        if changed:
-            self.save()
 
 
 def _hash(text: str) -> str:

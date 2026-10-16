@@ -93,39 +93,6 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
 
 
-def test_embedded_risk_memory_end_to_end(tmp_path: Path):
-    from graphora.risk import mine_risk_memory, risk_report
-
-    repo = tmp_path / "riskrepo"
-    (repo / "pkg").mkdir(parents=True)
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@t")
-    _git(repo, "config", "user.name", "t")
-    (repo / "pkg" / "billing.py").write_text("def charge(amount):\n    return amount\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "feat: add billing")
-    (repo / "pkg" / "billing.py").write_text("def charge(amount):\n    return amount * 1\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "fix: charge rounding bug")
-
-    store = EmbeddedGraphStore("risk-embedded", data_dir=tmp_path / "data")
-    index_repository(repo, project="risk-embedded", store=store)
-    stats = mine_risk_memory(store, repo)
-    assert stats.fix_commits == 1
-    report = risk_report(store)
-    assert report and report[0]["name"] == "charge"
-    assert report[0]["risk_score"] > 0
-
-    # idempotent
-    again = mine_risk_memory(store, repo)
-    assert again.fix_commits == 0
-    assert risk_report(store)[0]["fix_count"] == report[0]["fix_count"]
-
-    # risk surfaces in blast radius
-    radius = blast_radius(store, ["charge"])
-    assert radius.symbols[0].fix_count == 1
-
-
 def test_embedded_benchmark_is_deterministic(sample_repo: Path, store: EmbeddedGraphStore):
     from graphora.benchmark import run_benchmark
 

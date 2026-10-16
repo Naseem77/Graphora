@@ -84,28 +84,6 @@ def test_cli_review_facts_mode(project, repo: Path, tmp_path: Path, capsys):
     assert "Grounded facts" in out
 
 
-def test_cli_risk_mine_and_top(project, repo: Path, capsys):
-    assert main(["risk", "mine", str(repo), "--project", project]) == 0
-    mined = json.loads(capsys.readouterr().out)
-    assert mined["fix_commits"] == 1
-    assert main(["risk", "top", "--project", project, "--json"]) == 0
-    top = json.loads(capsys.readouterr().out)
-    assert top[0]["name"] == "compute"
-
-
-def test_cli_review_surfaces_risk_memory(project, repo: Path, tmp_path: Path, capsys):
-    main(["risk", "mine", str(repo), "--project", project])
-    capsys.readouterr()
-    diff_file = tmp_path / "change2.diff"
-    diff_file.write_text(
-        "--- a/pkg/core.py\n+++ b/pkg/core.py\n@@ -1,2 +1,2 @@\n-def compute(x):\n+def compute(x, y=0):\n"
-    )
-    main(["review", "--diff", str(diff_file), "--project", project])
-    out = capsys.readouterr().out
-    assert "risk-memory" in out
-    assert "past fix/revert commits" in out
-
-
 def test_cli_version_and_missing_diff(project, capsys):
     with pytest.raises(SystemExit):
         main(["--version"])
