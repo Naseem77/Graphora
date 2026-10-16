@@ -1,14 +1,17 @@
-"""Graphora: a deterministic code knowledge-graph tool.
+"""Graphora: know what breaks before you change it.
 
-Index a repository into FalkorDB with tree-sitter (no LLM), query blast
-radius for any change, and review diffs grounded in real structure. Usable as a library, CLI, or MCP server.
+Index every function, method, and class of a repository with tree-sitter
+(no LLM) into FalkorDB or an embedded store, then ask what a change could
+break: callers that will break, callers that might (with the alternatives
+each uncertain call could mean), and the tests that reach it. Usable as a
+library, CLI, or MCP server.
 """
 
 from __future__ import annotations
 
 import importlib
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 _LAZY = {
     "parse_code_file": "graphora.parser",

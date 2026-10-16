@@ -1,24 +1,23 @@
 # Graphora Use Cases
 
-Six real scenarios, all executed locally and captured verbatim (use cases 1–5 on
-2026-07-14, use case 6 on 2026-07-16).
-Environment: macOS, Python 3.11, FalkorDB in Docker on `localhost:6379`.
+Real scenarios, executed locally and captured verbatim (use cases 1-5 on 2026-10-16 against
+Graphora's own repository and Shiftory; use case 6 on 2026-07-16).
+Environment: macOS, Python 3.12, embedded backend (no server) unless noted.
 
-Setup used for all of them:
+Setup used for use cases 1-5:
 
 ```bash
-docker run -d --name graphora-falkordb -p 6379:6379 falkordb/falkordb:latest
 pip install graphora-kg
-graphora index . --project graphora          # 17 files, 148 functions, 251 call edges
-graphora risk mine . --project graphora
+graphora index . --project graphora --backend embedded   # 33 files, 424 functions, 24 classes, 935 call edges
 ```
 
 ---
 
-## Use case 1: cross-file impact review with zero LLM <a name="use-case-1"></a>
+## Use case 1: review a diff with what it could break, zero LLM <a name="use-case-1"></a>
 
-**Scenario**: a one-line diff adds a `decay` parameter to `compute_risk_score()`.
-A diff-only reviewer sees one file and has to guess the impact.
+**Scenario**: a one-line edit *inside the body* of `records_for()`. A diff-only reviewer sees
+one line in one file. (The previous release only noticed changed `def` lines, so a body edit
+produced "no known symbols changed".)
 
 ```bash
 graphora review --diff change.diff --project graphora
@@ -26,146 +25,141 @@ graphora review --diff change.diff --project graphora
 
 Captured output:
 
-```
+````
 # Graphora Review
 
-`compute_risk_score` has 1 caller(s) and 1 covering test(s).
+Changed: `records_for`. Will break: 2 caller(s); might break: 2 (ambiguous calls); tests that reach the change: 2.
 
 ## Grounded facts (from the graph)
 
-Blast radius (from code graph, deterministic):
+```
+What could break if you change `records_for` (graphora/resolve.py:137)
 
-### compute_risk_score (Function)
-- defined at graphora/risk.py:130 `def compute_risk_score(fix_count: int, last_broke_at: str, now: datetime | None = None) -> float:`
-- callers (1): _recompute_risk_scores [graphora/risk.py] (EXTRACTED)
-- calls (0): none
-- tests (1): test_risk_score_decays_over_time [tests/core/test_core_risk.py] (INFERRED)
-- imported by (3): graphora/cli.py, graphora/mcp_server.py, tests/core/test_core_risk.py
+Will break (2):
+  - `EmbeddedGraphStore.write_files` (graphora/embedded.py:88) calls `records_for` at line 93
+  - `GraphStore.write_files` (graphora/store.py:75) calls `records_for` at line 85
 
-_Context sent to model: ~197 tokens (graph blast radius, not the repo)._
+Might break (2): the call could mean something else
+  - `index_repository` (graphora/indexer.py:110) may call `EmbeddedGraphStore.write_files` at line 148 (index_repository -> EmbeddedGraphStore.write_files -> records_for)
+      this `write_files(...)` call is either `EmbeddedGraphStore.write_files` (graphora/embedded.py:88)
+      or `GraphStore.write_files` (graphora/store.py:75)
+      or a method outside this repository
+  - `update_files` (graphora/indexer.py:157) may call `EmbeddedGraphStore.write_files` at line 181 (update_files -> EmbeddedGraphStore.write_files -> records_for)
+      this `write_files(...)` call is either `EmbeddedGraphStore.write_files` (graphora/embedded.py:88)
+      or `GraphStore.write_files` (graphora/store.py:75)
+      or a method outside this repository
+
+Tests that reach it (2):
+  - `_resolve` (tests/core/test_core_resolve.py:7) calls `records_for` at line 10
+  - `test_redefined_function_gets_its_own_key` (tests/core/test_core_resolve.py:148) calls `records_for` at line 149
 ```
 
-**Why it matters**: ~197 tokens of context instead of a ~22,200-token repo dump, no LLM
-call at all, and every conclusion (one known caller, one covering test, three importing
-files) is read from the graph, not guessed. Add `--llm` with `REVIEW_MODEL` set and
-the same tiny context feeds a full model-written review.
+_Facts mode: no model was called._
+````
+
+**Why it matters**: both store implementations certainly break. The indexer's calls reach
+them through a parameter typed as *either* backend, so they are reported as "might break" with
+both possibilities named, instead of silently picking one.
 
 ---
 
-## Use case 2: risk memory finds where a real codebase breaks
+## Use case 2: "X or Y" instead of a guess <a name="use-case-2"></a>
 
-**Scenario**: point Graphora at falkordb-py, a real client library with 231 commits of
-history, and ask where it historically breaks.
+**Scenario**: change `EmbeddedGraphStore.find_symbols`. Several functions call
+`store.find_symbols(...)` on a store that can be either backend.
 
 ```bash
-cd ../falkordb-py
-graphora index . --project falkordb-py
-graphora risk mine . --project falkordb-py     # scanned history, found 40 fix/revert commits
-graphora risk top --project falkordb-py
+graphora breaks EmbeddedGraphStore.find_symbols --depth 1 --project graphora
 ```
 
-Captured output:
+Captured output (first entries):
 
 ```
-  RISK  FIXES  CALLERS  LAST BROKE   SYMBOL
-  0.14      3        0  2025-05-28   test_graph_creation  (tests/test_async_graph.py:10)
-  0.08      2        2  2025-03-13   Is_Cluster  (falkordb/asyncio/cluster.py:9)
-  0.07      1        0  2025-06-19   QueryResult  (falkordb/query_result.py:355)
-  0.05      1        0  2025-03-12   FalkorDB  (falkordb/asyncio/falkordb.py:10)
-  0.05      1        2  2025-03-12   Cluster_Conn  (falkordb/asyncio/cluster.py:26)
+What could break if you change `EmbeddedGraphStore.find_symbols` (graphora/embedded.py:233)
+
+Will break (1):
+  - `EmbeddedGraphStore.find_symbol` (graphora/embedded.py:277) calls `EmbeddedGraphStore.find_symbols` at line 280
+
+Might break (3): the call could mean something else
+  - `blast_radius` (graphora/blast.py:82) may call `EmbeddedGraphStore.find_symbols` at line 87
+      this `find_symbols(...)` call is either `EmbeddedGraphStore.find_symbols` (graphora/embedded.py:233)  <- the one you are changing
+      or `GraphStore.find_symbols` (graphora/store.py:267)
+      or a method outside this repository
 ```
 
-**Why it matters**: the async cluster code surfaces as the genuine historical trouble
-spot, derived purely from commit metadata and diffs, at $0. From now on, any review or
-blast radius touching `Is_Cluster` automatically carries a risk-memory finding:
-
-> **risk-memory**: `Is_Cluster` was involved in 2 past fix/revert commits (last: 2025-03-13), risk score 0.08, 2 callers. Review extra carefully.
-
-Mining is idempotent per commit, so re-running never double-counts. The longer it runs
-on a repository, the smarter it gets. No stateless reviewer can offer this.
+**Why it matters**: a name-matching tool would either link every `find_symbols` in sight or
+pick one. Graphora tells the agent exactly which call sites are uncertain and what they could
+resolve to, so it can check them instead of trusting a guess.
 
 ---
 
-## Use case 3: any AI agent, via MCP
+## Use case 3: imports beat names (Shiftory) <a name="use-case-3"></a>
 
-**Scenario**: give Copilot CLI, Claude Code, Cursor, or any MCP client structured access
-to the graph, so agents check impact *before* editing.
+**Scenario**: [Shiftory](https://github.com/Naseem77/Shiftory) has 8 functions named `main`
+(scripts, a CLI, a worker). Its tests call `cli.main(...)` and `worker.main()` 14 times.
+
+| | Previous release (name matching) | Now (import resolution) |
+| --- | --- | --- |
+| Edges into the 8 `main` functions | 112 (every call linked to all 8; 98 false) | 14, all `EXTRACTED`, each to the right `main` |
+| Who calls `build_evidence`? | correct | `analyze` + 1 test (correct) |
+| Who calls `analyze`? | correct | 2 callers + 12 tests (correct) |
 
 ```bash
-graphora serve-mcp --project falkordb-py
+graphora breaks build_evidence --project shiftory
 ```
 
-A real captured stdio session (MCP Python client):
-
 ```
-TOOLS: ['graph_stats', 'blast_radius', 'review_diff', 'risk_top', 'find_symbol']
-
-blast_radius(query): confidence-tagged JSON of callers/callees/tests/risk
-
-risk_top(3):
-  0.14 test_graph_creation (tests/test_async_graph.py) fixes=3
-  0.08 Is_Cluster (falkordb/asyncio/cluster.py) fixes=2, callers=2
-  0.07 QueryResult (falkordb/query_result.py) fixes=1
-
-find_symbol(Is_Cluster): falkordb/asyncio/cluster.py:9 `def Is_Cluster(conn: redis.Redis):`
+Will break (3):
+  - `analyze` (src/shiftory/evidence/builder.py:81) calls `build_evidence` at line 90
+  - `_analyze` (src/shiftory/cli.py:161) calls `analyze` at line 163 (_analyze -> analyze -> build_evidence)
+  - `_explain_in_run` (src/shiftory/cli.py:430) calls `analyze` at line 457 (_explain_in_run -> analyze -> build_evidence)
 ```
-
-**Why it matters**: the server's instructions tell agents to call `blast_radius` before
-touching a symbol. That turns Graphora into a guardrail for AI-generated changes: the
-agent learns "this function has 5 callers and broke twice" *before* it edits, not after
-CI fails.
 
 ---
 
-## Use case 4: a CI gate in three lines of library code
+## Use case 4: any AI agent, via MCP <a name="use-case-4"></a>
 
-**Scenario**: block PRs that change symbols which have callers but no covering tests.
-Executed live against the Graphora graph:
-
-```python
-from graphora import GraphStore
-from graphora.blast import blast_radius_for_diff
-
-radius = blast_radius_for_diff(GraphStore("myrepo"), pr_diff)
-untested = [s.name for s in radius.symbols if s.callers and not s.tests]
-assert not untested, f"Changed symbols with callers but no tests: {untested}"
+```bash
+graphora serve-mcp --project graphora
 ```
 
-The same library API drove two more workflows in the same session:
+Tools listed by the server: `what_could_break`, `what_could_break_for_diff`, `blast_radius`,
+`review_diff`, `find_symbol`, `graph_stats`. A captured `what_could_break` call with
+`{"symbols": ["records_for"], "depth": 1, "as_json": true}` (abridged):
 
-```python
-# Refactor planning: all call sites of a function, confidence-tagged
-blast_radius(store, ["parse_code_file"])   # returned every call site
-
-# Incremental re-index after editing one file (no full rebuild)
-update_files(repo_root, ["graphora/benchmark.py"], store=store)
+```json
+{
+ "targets": [{"name": "records_for", "kind": "Function", "path": "graphora/resolve.py", "line": 137}],
+ "will_break": [
+  {"name": "EmbeddedGraphStore.write_files", "path": "graphora/embedded.py", "line": 88, "calls": "records_for", "certain": true},
+  {"name": "GraphStore.write_files", "path": "graphora/store.py", "line": 75, "calls": "records_for", "certain": true}
+ ],
+ "tests": 2
+}
 ```
 
-**Why it matters**: no webhook, no bot, no server. Import and query. This is the
-"tool usable in code" mode: CI gates, pre-refactor checks, custom dashboards, editor
-plugins all build on the same three functions.
+The server's instructions tell agents to call `what_could_break` before editing a symbol and
+to report uncertain callers as uncertain.
 
 ---
 
-## Use case 5: confidence tags catch real ambiguity
+## Use case 5: a CI gate in a few lines of library code <a name="use-case-5"></a>
 
-**Scenario**: while querying its own graph, Graphora hit a genuinely ambiguous case, and
-told the truth about it.
+```python
+from graphora import index_repository, open_store
+from graphora.impact import what_could_break_for_diff
 
-The repository defines *two* functions named `blast_radius` (the core implementation in
-`graphora/blast.py` and the MCP tool wrapper in `graphora/mcp_server.py`). A name-based
-caller match cannot know which one a call refers to. Captured output:
+store = open_store("myrepo", backend="embedded")
+index_repository(".", project="myrepo", store=store)
 
+impact = what_could_break_for_diff(store, pr_diff)
+if impact.will_break and not impact.tests:
+    raise SystemExit("This change certainly breaks callers and no test reaches it:\n" + impact.to_text())
 ```
-blast_radius @ graphora/blast.py:90       -> callers: run_benchmark(AMBIGUOUS), cmd_blast(AMBIGUOUS), blast_radius_for_diff(EXTRACTED)
-blast_radius @ graphora/mcp_server.py:41  -> callers: run_benchmark(AMBIGUOUS), cmd_blast(AMBIGUOUS)
-```
 
-**Why it matters**: instead of silently picking one candidate (and being wrong half the
-time), every candidate is linked and tagged `AMBIGUOUS`. Same-file calls are `EXTRACTED`,
-single-candidate cross-file resolutions are `INFERRED`. A reviewer, an agent, or an LLM
-downstream can weigh facts accordingly. This honesty is what makes graph output
-trustworthy enough to gate merges on.
+Incremental re-indexing for watch mode or CI: `update_files(root, ["changed.py"], store=store)`
+re-parses only those files and relinks the whole graph, so callers in unchanged files keep
+their edges.
 
 ---
 
@@ -244,37 +238,14 @@ graph, so the MCP server exposes your work history to any agent for free.
 
 ## How it was tested <a name="how-it-was-tested"></a>
 
-Test-first at every phase; the full suite had to pass before the next phase started.
+180 tests (`python -m pytest tests -q`), run in CI against a live FalkorDB on mcp 1.x and 2.x;
+the job fails if any test is skipped.
 
-| Phase | Tests | What they verify |
-| --- | ---: | --- |
-| 1. Parser + store | 13 | Symbol/import/call extraction per language, confidence rules (same-file call = EXTRACTED, cross-file = INFERRED), test-file detection, ignore lists, incremental update/delete against live FalkorDB |
-| 2. Blast radius | 6 | Callers and tests found, test callers excluded, confidence propagation, unresolved symbols, diff-driven radius, compact context |
-| 3. Risk memory | 7 | Fix/hotfix/revert detection on a scripted real git repo, feature commits excluded, idempotent re-runs, revert kind, ranking, risk decay math, blast integration |
-| 4. CLI + review | 6 | Every command end-to-end via `main()`, JSON output, facts-mode review, risk warnings surfaced |
-| 5. MCP server | 4 | All 5 tools listed and invoked on the real server object, JSON payloads validated |
-| 6. Benchmark | 5 | Savings hold on a realistic fixture, grounded-fact counts, determinism (two runs byte-identical), report rendering |
-| 7. Embedded backend | 12 | JSON persistence across instances, blast/risk/CLI end-to-end without a server, auto-fallback, byte-identical output parity with FalkorDB |
-| 8. Skill installer | 11 | 22 agents supported, frontmatter formats, idempotent marked blocks, existing files preserved, CLI end-to-end |
-| 9. Languages | 14 | Rust/C/C++/Ruby/PHP symbols, imports, calls via tree-sitter; qualified-name resolution; 4-language end-to-end index; diff attribution |
-| 10. Public benchmark | 3 | Deterministic rows, markdown rendering, all repos pinned to full 40-char SHAs |
-
-Final state:
-
-```
-$ python3 -m pytest tests -q
-80 passed in 3.4s
-```
-
-All 80 core tests, green. Integration tests run against a live FalkorDB and real
-per-test git repositories, and skip
-cleanly when FalkorDB is not running.
-
-Two bugs were caught by the tests themselves during development and fixed on the spot:
-
-1. **git `--grep` portability**: `\b` word boundaries are not supported by git's ERE on
-   macOS, so fix-commit filtering silently matched nothing. Fix: list commits and filter
-   in Python with a proper regex.
-2. **Unfair benchmark baseline**: "changed files only" was informationally weaker than
-   the blast radius (it cannot tell you callers or tests). Fix: the baseline now includes
-   every file containing a caller or covering test, which is the honest comparison.
+| Area | What the tests pin down |
+| --- | --- |
+| Definitions (`test_core_coverage.py`) | For each of the 11 languages, the *exact* set of (kind, qualified name) the parser must return, so a missed definition or a false one (a `struct` usage, an interface signature) fails. Python is also checked against `ast`. |
+| Resolution (`test_core_resolve.py`) | One test per rule: imports vs same-name functions, `src/` layouts, relative and submodule imports, external imports (no edge), `self`, constructors, re-exports, Go packages, JS default/named imports, variable and return types, unions, the candidate cap, test doubles. |
+| What could break (`test_core_impact.py`) | Certain vs uncertain, transitive depth and chains, uncertainty propagating up a path, classes including their methods, diffs mapped to enclosing symbols, the "X or Y" text, JSON output, the CLI. |
+| Stores | Both backends end to end, a parity test (embedded == FalkorDB), incremental updates keeping cross-file callers. |
+| Robustness | Deeply nested expressions, a file whose parser throws, form feeds and Unicode line separators, linear-time parsing of a 20,000-function file, `.gitignore` and generated files. |
+| CLI, MCP, skills, sessions, benchmarks | Every command via `main()`, every MCP tool, skill installation for all agents, session ingestion, deterministic benchmarks. |

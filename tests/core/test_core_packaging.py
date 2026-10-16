@@ -87,17 +87,17 @@ def test_active_version_surfaces_agree():
     )
 
 
-def test_readme_banner_uses_absolute_url_in_packaged_long_description():
-    # README.md's banner previously used a repo-relative <img src="assets/banner.gif">,
-    # which PyPI cannot reliably resolve (PyPI renders the long description outside
-    # the repository, with no relative-path base). It must be an absolute HTTPS URL
-    # to the raw asset so the image renders on the PyPI project page.
+def test_readme_images_use_absolute_urls_in_packaged_long_description():
+    # PyPI renders the long description outside the repository, with no
+    # relative-path base, so a repo-relative image (e.g. <img src="assets/x.gif">)
+    # shows as broken there. Every image must be an absolute HTTPS URL.
+    import re
+
     meta = metadata.metadata("graphora-kg")
     long_description = meta.get("Description") or meta.get_payload() or ""
     assert long_description, "graphora-kg metadata has no long description"
 
-    absolute_url = "https://raw.githubusercontent.com/Naseem77/Graphora/main/assets/banner.gif"
-    assert absolute_url in long_description, "packaged long description must reference the absolute banner URL"
-    assert 'src="assets/banner.gif"' not in long_description, (
-        "packaged long description must not contain the repo-relative banner path"
-    )
+    sources = re.findall(r'<img[^>]*\ssrc="([^"]+)"', long_description)
+    sources += re.findall(r"!\[[^\]]*\]\(([^)\s]+)", long_description)
+    relative = [src for src in sources if not src.startswith("https://")]
+    assert not relative, f"packaged long description has repo-relative images: {relative}"
