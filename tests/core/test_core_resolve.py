@@ -403,3 +403,34 @@ def test_function_local_and_try_except_imports():
     assert {edges[("run", p, q)][0] for p, q in _targets(edges, "run")} == {AMBIGUOUS}
     assert _targets(edges, "local") == {("c.py", "helper")}
     assert edges[("local", "c.py", "helper")][0] == EXTRACTED
+
+
+def test_methods_of_a_same_named_class_in_another_file_are_not_borrowed():
+    edges, _ = _resolve(
+        {
+            "a.py": "class Base:\n    def go(self):\n        return 0\n\nclass Foo(Base):\n    pass\n",
+            "b.py": "class Foo:\n    def go(self):\n        return 1\n",
+            "main.py": "from a import Foo\n\ndef run(f: Foo):\n    return f.go()\n",
+        }
+    )
+    assert ("b.py", "Foo.go") not in _targets(edges, "run")
+
+
+def test_inherited_methods_resolve_through_base_classes():
+    edges, _ = _resolve(
+        {
+            "base.py": "class Base:\n    def save(self):\n        return 0\n",
+            "a.py": (
+                "from base import Base\n\n"
+                "class Foo(Base):\n    def run(self):\n        return self.save()\n"
+            ),
+            "b.py": "class Other:\n    def save(self):\n        return 1\n",
+            "main.py": "from a import Foo\n\ndef use(f: Foo):\n    return f.save()\n",
+            "web/base.ts": "export class Store { save() { return 0; } }\n",
+            "web/db.ts": "import { Store } from './base';\nexport class Db extends Store { run() { return this.save(); } }\n",
+        }
+    )
+    assert _targets(edges, "use") == {("base.py", "Base.save")}
+    assert _targets(edges, "Foo.run") == {("base.py", "Base.save")}
+    assert edges[("Foo.run", "base.py", "Base.save")][0] == EXTRACTED
+    assert _targets(edges, "Db.run") == {("web/base.ts", "Store.save")}

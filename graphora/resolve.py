@@ -86,6 +86,7 @@ class SymbolRecord:
     confidence: str = EXTRACTED
     returns: str = ""  # declared return type name
     attributes: str = ""  # classes: "field=Type;..." for fields whose type is stated
+    bases: str = ""  # classes: comma-separated base classes as written
 
     @property
     def is_method(self) -> bool:
@@ -203,6 +204,7 @@ def records_for(parsed: ParsedFile) -> tuple[list[SymbolRecord], FileRecord]:
                 confidence=s.confidence,
                 returns=s.returns,
                 attributes=s.attributes,
+                bases=s.bases,
             )
         )
     functions_by_qualname: dict[str, list[SymbolRecord]] = defaultdict(list)
@@ -611,18 +613,48 @@ class _Resolver:
         return ""
 
     def _methods_of(self, class_qualname: str, name: str, near_path: str) -> list[SymbolRecord]:
+        """Methods `name` of the class `class_qualname` defined in `near_path`.
+
+        Most languages define methods inside the class body, so a same-named class
+        in another file is a different class. Go (same package) and Rust (impl
+        blocks anywhere in the crate) define methods outside the type.
+        """
         found = self.methods.get((class_qualname, name), [])
         same_file = [m for m in found if m.path == near_path]
         if same_file:
             return same_file
-        if found:
-            return found
-        # Go/Rust methods live outside the type's body (other files, impl blocks).
-        simple = class_qualname.rsplit(".", 1)[-1]
+        inherited = self._inherited(class_qualname, name, near_path, depth=0)
+        if inherited:
+            return inherited
         family = self._family(near_path)
-        return [
-            m for m in self.by_name.get((family, name), []) if m.is_method and m.parent.rsplit(".", 1)[-1] == simple
-        ]
+        if family == "go":
+            package = posixpath.dirname(near_path)
+            simple = class_qualname.rsplit(".", 1)[-1]
+            return [
+                m
+                for m in self.by_name.get((family, name), [])
+                if m.is_method and m.parent.rsplit(".", 1)[-1] == simple and posixpath.dirname(m.path) == package
+            ]
+        if family == "rust":
+            simple = class_qualname.rsplit(".", 1)[-1]
+            return [
+                m for m in self.by_name.get((family, name), []) if m.is_method and m.parent.rsplit(".", 1)[-1] == simple
+            ]
+        return []
+
+    def _inherited(self, class_qualname: str, name: str, path: str, depth: int) -> list[SymbolRecord]:
+        """`name` defined on a base class (resolved as written in the class's file)."""
+        if depth > 6:
+            return []
+        owner = next((s for s in self.by_file[path] if s.kind == "Class" and s.qualname == class_qualname), None)
+        if owner is None or not owner.bases:
+            return []
+        found: list[SymbolRecord] = []
+        for base in owner.bases.split(","):
+            for base_class in self._classes_named(base, path):
+                direct = [m for m in self.methods.get((base_class.qualname, name), []) if m.path == base_class.path]
+                found.extend(direct or self._inherited(base_class.qualname, name, base_class.path, depth + 1))
+        return list(dict.fromkeys(found))
 
     def _constructors(self, targets: list[SymbolRecord]) -> list[SymbolRecord]:
         """Calling a class constructs it: link to its constructor when it has one."""

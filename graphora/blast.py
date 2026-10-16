@@ -45,7 +45,7 @@ class BlastRadius:
             lines.append(f"- defined at {impact.path}:{impact.line} `{impact.signature}`")
             lines.append(_relation_line("callers", impact.callers))
             lines.append(_relation_line("calls", impact.callees))
-            lines.append(_relation_line("tests", impact.tests))
+            lines.append(_relation_line("tests (direct)", impact.tests))
             if impact.importers:
                 lines.append(f"- imported by ({len(impact.importers)}): {', '.join(impact.importers)}")
         if self.unresolved:

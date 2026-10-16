@@ -53,6 +53,7 @@ class ParsedSymbol:
     returns: str = ""  # declared return type name, when the source states one
     is_test: bool = False  # test code inside a non-test file (Rust #[cfg(test)] / #[test])
     attributes: str = ""  # classes: "field=Type;other=Type" for fields whose type is stated
+    bases: str = ""  # classes: comma-separated base classes as written ("Base,mixins.Mixin")
 
     def __post_init__(self) -> None:
         if not self.qualname:
@@ -381,6 +382,7 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
             if returns in {"Self", "self", "this", "static"} and parent_kind == "Class":
                 returns = parent.rsplit(".", 1)[-1]
             in_test = any(f.test for f in scope) or _is_test_item(language, node, definition.name, content_bytes)
+            bases = ",".join(_base_classes(language, node, content_bytes)) if definition.kind == "Class" else ""
             if definition.emit:
                 symbols.append(
                     ParsedSymbol(
@@ -395,6 +397,7 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
                         parent_kind=parent_kind,
                         returns=returns,
                         is_test=in_test,
+                        bases=bases,
                     )
                 )
             child_scope = scope + (_Frame(qualname, definition.kind, in_test),)
@@ -436,6 +439,37 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
         parser_used="tree-sitter",
         bindings=_dedupe_bindings(bindings),
     )
+
+
+# Nodes holding a class's base classes, per grammar (implements/interfaces are not bases:
+# interface methods are signatures, not the code that runs).
+_BASE_NODES = {"class_heritage", "extends_clause", "superclass", "base_clause", "base_class_clause"}
+
+
+def _base_classes(language: str, node: Any, content: bytes) -> list[str]:
+    """Base classes named in a class definition: Foo(Base), extends B, < B, : public B."""
+    found: list[str] = []
+    if language == "python":
+        supers = node.child_by_field_name("superclasses")
+        for child in supers.named_children if supers is not None else []:
+            if child.type in {"identifier", "attribute"}:
+                found.append(_node_text(child, content))
+        return found
+    stack = [c for c in node.children if c.type in _BASE_NODES]
+    while stack:
+        current = stack.pop(0)
+        if current.type == "extends_clause" or current.type in _BASE_NODES:
+            for child in current.named_children:
+                if child.type in {"implements_clause", "class_interface_clause", "access_specifier"}:
+                    continue
+                if child.type in _BASE_NODES:
+                    stack.append(child)
+                elif child.type in {
+                    "identifier", "type_identifier", "constant", "name", "qualified_name",
+                    "scope_resolution", "member_expression", "qualified_identifier", "generic_type",
+                }:
+                    found.append(_node_text(child, content).split("<")[0].strip())
+    return [name for name in found if name]
 
 
 def _is_test_item(language: str, node: Any, name: str, content: bytes) -> bool:
