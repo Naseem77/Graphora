@@ -19,7 +19,7 @@ from graphora.resolve import CallSite, FileRecord, SymbolRecord, records_for, re
 _BATCH = 2000
 _SYMBOL_FIELDS = (
     "name", "qualname", "kind", "path", "line", "end_line", "signature", "parent", "parent_kind", "is_test", "confidence",
-    "returns",
+    "returns", "attributes", "bases",
 )
 _INDEXES = (
     ("File", "path"),
@@ -42,6 +42,8 @@ class GraphStore:
 
     def __init__(self, project: str, host: str = "localhost", port: int = 6379, graph: Any | None = None):
         self.project = project
+        self.host, self.port = host, port
+        self._db: Any | None = None
         if graph is not None:
             self._graph = graph
         else:
@@ -49,7 +51,8 @@ class GraphStore:
                 from falkordb import FalkorDB
             except ImportError as exc:  # pragma: no cover
                 raise RuntimeError("The 'falkordb' package is required: pip install falkordb") from exc
-            self._graph = FalkorDB(host=host, port=port).select_graph(self.graph_name)
+            self._db = FalkorDB(host=host, port=port)
+            self._graph = self._db.select_graph(self.graph_name)
         self._indexed = False
 
     @property
@@ -143,7 +146,7 @@ class GraphStore:
                 path=path,
                 language=language,
                 is_test=bool(is_test),
-                bindings=tuple(tuple(b) for b in json.loads(bindings or "[]")),
+                bindings=tuple((*b, "")[:4] for b in json.loads(bindings or "[]")),
                 calls=tuple(CallSite(*c) for c in json.loads(raw_calls or "[]")),
             )
             for path, language, is_test, bindings, raw_calls in self.query(
@@ -253,7 +256,15 @@ class GraphStore:
         counts["edges"] = int(rows[0][0]) if rows else 0
         return counts
 
+    def exists(self) -> bool:
+        """Whether the graph exists, checked without querying it (a query creates it)."""
+        if self._db is None:
+            return True
+        return self.graph_name in self._db.list_graphs()
+
     def has_files(self) -> bool:
+        if not self.exists():
+            return False
         rows = self.query("MATCH (f:File) RETURN count(f)")
         return bool(rows and int(rows[0][0]) > 0)
 
@@ -311,6 +322,26 @@ class GraphStore:
             {"key": caller_key, "line": line},
         )
         return sorted((_record(r) for r in rows), key=lambda r: (r["path"], r["line"]))
+
+    def call_sites_named(self, name: str) -> list[dict]:
+        """Every stored call site whose callee is `name`, and whether it resolved."""
+        out = []
+        for (raw_calls,) in self.query("MATCH (f:File) RETURN f.raw_calls"):
+            for caller_key, callee, receiver, line in json.loads(raw_calls or "[]"):
+                if callee != name:
+                    continue
+                caller = self.get_symbol(caller_key)
+                if caller is None:
+                    continue
+                # Only a certain edge counts: an AMBIGUOUS one may be a same-named survivor.
+                rows = self.query(
+                    "MATCH (:Function {stable_key: $key})-[r:CALLS {line: $line}]->(t {name: $name}) "
+                    "WHERE r.confidence <> 'AMBIGUOUS' RETURN count(r)",
+                    {"key": caller_key, "line": line, "name": name},
+                )
+                resolved = bool(rows and int(rows[0][0]))
+                out.append({"caller": caller, "line": line, "receiver": receiver, "resolved": resolved})
+        return sorted(out, key=lambda s: (s["caller"]["path"], s["line"]))
 
     def file_importers(self, path: str) -> list[str]:
         rows = self.query("MATCH (a:File)-[:IMPORTS_FILE]->(:File {path: $path}) RETURN DISTINCT a.path", {"path": path})
@@ -375,6 +406,8 @@ def _record(row: list) -> dict:
     record["end_line"] = int(record["end_line"] or record["line"])
     record["is_test"] = bool(record["is_test"])
     record["returns"] = record.get("returns") or ""
+    record["attributes"] = record.get("attributes") or ""
+    record["bases"] = record.get("bases") or ""
     return record
 
 

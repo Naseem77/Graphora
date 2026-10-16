@@ -174,3 +174,62 @@ def test_falkordb_gives_the_same_answers(store, tmp_path):
             assert what_could_break(falkor, names, depth=3).to_dict() == what_could_break(store, names, depth=3).to_dict()
     finally:
         falkor.delete_graph()
+
+
+def test_path_selector_picks_one_of_same_named_definitions(tmp_path):
+    from graphora.blast import blast_radius
+    from graphora.impact import select_symbols
+
+    repo = tmp_path / "twins"
+    (repo / "falkordb" / "asyncio").mkdir(parents=True)
+    (repo / "falkordb" / "db.py").write_text("class FalkorDB:\n    def select_graph(self):\n        return 1\n")
+    (repo / "falkordb" / "asyncio" / "db.py").write_text("class FalkorDB:\n    def select_graph(self):\n        return 2\n")
+    store = EmbeddedGraphStore("twins", data_dir=tmp_path / "data")
+    index_repository(repo, project="twins", store=store)
+
+    assert len(select_symbols(store, "FalkorDB.select_graph")) == 2
+    picked = select_symbols(store, "falkordb/asyncio/db.py:FalkorDB.select_graph")
+    assert [s["path"] for s in picked] == ["falkordb/asyncio/db.py"]
+    assert [s["path"] for s in select_symbols(store, "asyncio/db.py:FalkorDB.select_graph")] == [
+        "falkordb/asyncio/db.py"
+    ]
+    assert select_symbols(store, "falkordb/db.py:Nope") == []
+    assert [t["path"] for t in what_could_break(store, ["falkordb/db.py:FalkorDB"]).targets] == ["falkordb/db.py"]
+    assert [s.path for s in blast_radius(store, ["falkordb/db.py:FalkorDB.select_graph"]).symbols] == ["falkordb/db.py"]
+    assert "pass its file too, e.g. `falkordb/asyncio/db.py:FalkorDB.select_graph`" in what_could_break(
+        store, ["select_graph"]
+    ).to_text()
+
+
+def test_double_colon_names_are_accepted(tmp_path):
+    from graphora.impact import select_symbols
+
+    repo = tmp_path / "cpp"
+    repo.mkdir()
+    (repo / "geo.cpp").write_text("namespace geo { double total(int n) { return n; } }\n")
+    store = EmbeddedGraphStore("cpp", data_dir=tmp_path / "data")
+    index_repository(repo, project="cpp", store=store)
+    assert [s["qualname"] for s in select_symbols(store, "geo::total")] == ["geo.total"]
+
+
+def test_e2e_page_objects_are_test_code_and_lead_to_specs(tmp_path):
+    from graphora.parser import is_test_path
+
+    assert is_test_path("e2e/logic/pom/homePage.ts")
+    assert is_test_path("cypress/support/commands.js")
+    repo = tmp_path / "web"
+    (repo / "src").mkdir(parents=True)
+    (repo / "e2e" / "pom").mkdir(parents=True)
+    (repo / "e2e" / "tests").mkdir(parents=True)
+    (repo / "src" / "wait.ts").write_text("export function waitFor(sel: string) { return sel; }\n")
+    (repo / "e2e" / "pom" / "home.ts").write_text(
+        "import { waitFor } from '../../src/wait';\nexport class HomePage { open() { return waitFor('#app'); } }\n"
+    )
+    (repo / "e2e" / "tests" / "home.spec.ts").write_text(
+        "import { HomePage } from '../pom/home';\ntest('opens', async () => { new HomePage().open(); });\n"
+    )
+    store = EmbeddedGraphStore("web", data_dir=tmp_path / "data")
+    index_repository(repo, project="web", store=store)
+    result = what_could_break(store, ["waitFor"], depth=2)
+    assert result.will_break == []
+    assert {b.caller["qualname"] for b in result.tests} == {"HomePage.open", "test_opens"}

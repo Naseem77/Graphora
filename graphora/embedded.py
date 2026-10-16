@@ -128,7 +128,7 @@ class EmbeddedGraphStore:
                 path=path,
                 language=f["language"],
                 is_test=f["is_test"],
-                bindings=tuple(tuple(b) for b in f.get("bindings", [])),
+                bindings=tuple((*b, "")[:4] for b in f.get("bindings", [])),
                 calls=tuple(CallSite(*c) for c in f.get("calls", [])),
             )
             for path, f in self._data["files"].items()
@@ -255,6 +255,23 @@ class EmbeddedGraphStore:
         """Every target one call site resolved to (the alternatives of an AMBIGUOUS call)."""
         keys = [e["b"] for e in self._outgoing.get(caller_key, []) if e["line"] == line]
         return sorted((self._record(k) for k in dict.fromkeys(keys)), key=lambda r: (r["path"], r["line"]))
+
+    def call_sites_named(self, name: str) -> list[dict]:
+        """Every stored call site whose callee is `name`, and whether it resolved."""
+        out = []
+        for f in self._data["files"].values():
+            for caller_key, callee, receiver, line in f.get("calls", []):
+                if callee != name or caller_key not in self._data["symbols"]:
+                    continue
+                # Only a certain edge counts: an AMBIGUOUS one may be a same-named survivor.
+                resolved = any(
+                    e["line"] == line
+                    and e["confidence"] != "AMBIGUOUS"
+                    and self._data["symbols"].get(e["b"], {}).get("name") == name
+                    for e in self._outgoing.get(caller_key, [])
+                )
+                out.append({"caller": self._record(caller_key), "line": line, "receiver": receiver, "resolved": resolved})
+        return sorted(out, key=lambda s: (s["caller"]["path"], s["line"]))
 
     def file_importers(self, path: str) -> list[str]:
         return sorted({a for a, b in self._data["file_imports"] if b == path})

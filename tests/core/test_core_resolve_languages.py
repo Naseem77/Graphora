@@ -244,3 +244,234 @@ def test_unknown_receiver_in_other_language_stays_ambiguous():
         }
     )
     assert {edges[("Main.run", p, q)][0] for p, q in _targets(edges, "Main.run") if q.endswith("go")} == {AMBIGUOUS}
+
+
+def test_rust_crate_name_imports_external_types_and_inline_tests():
+    from graphora.embedded import EmbeddedGraphStore
+    from graphora.impact import what_could_break
+    from graphora.indexer import index_repository
+
+    files = {
+        "Cargo.toml": '[package]\nname = "text-to-cypher"\nversion = "0.1.0"\n',
+        "src/lib.rs": (
+            "pub mod client;\n"
+            "pub use client::TextToCypherClient;\n"
+        ),
+        "src/client.rs": (
+            "pub struct TextToCypherClient { url: String }\n"
+            "impl TextToCypherClient {\n"
+            "    pub fn new(url: &str) -> Self { TextToCypherClient { url: String::new() } }\n"
+            "}\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    use super::*;\n"
+            "    #[test]\n"
+            "    fn test_creation() { TextToCypherClient::new(\"x\"); }\n"
+            "}\n"
+        ),
+        "src/runtime.rs": "pub struct Engine;\nimpl Engine { pub fn new() -> Self { Engine } }\n",
+        "examples/usage.rs": (
+            "use text_to_cypher::TextToCypherClient;\n"
+            "fn main() {\n"
+            "    let c = TextToCypherClient::new(\"u\");\n"
+            "    let s = String::new();\n"
+            "    let r = Runtime::new();\n"
+            "}\n"
+        ),
+    }
+    edges = _resolve({k: v for k, v in files.items() if k.endswith(".rs") or k == "Cargo.toml"})
+    assert _targets(edges, "main") == {("src/client.rs", "TextToCypherClient.new")}
+    assert edges[("main", "src/client.rs", "TextToCypherClient.new")][0] == EXTRACTED
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "repo"
+        for path, text in files.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text(text)
+        store = EmbeddedGraphStore("rust", data_dir=Path(tmp) / "data")
+        index_repository(root, project="rust", store=store)
+        result = what_could_break(store, ["TextToCypherClient.new"], depth=1)
+        assert {b.caller["qualname"] for b in result.will_break} == {"main"}
+        assert {b.caller["qualname"] for b in result.tests} == {"tests.test_creation"}
+        assert result.might_break == []
+
+
+def test_capitalized_types_outside_the_repo_are_external():
+    edges = _resolve(
+        {
+            "src/util.js": "export class Stats { max(a) { return a; } keys(o) { return o; } }\n",
+            "src/app.js": "export function run(o) { Math.max(1, 2); Object.keys(o); }\n",
+            "src/Sorter.java": "class Sorter { void sort(Object x) {} }\n",
+            "src/Main.java": "class Main { void run(java.util.List<String> l) { Collections.sort(l); } }\n",
+            "app/stats.py": "class Stats:\n    def home(self):\n        return 1\n",
+            "app/main.py": "def run():\n    return Path.home()\n",
+        }
+    )
+    assert _targets(edges, "run") == set()
+    assert _targets(edges, "Main.run") == set()
+
+
+def test_generic_wrappers_are_not_their_inner_type():
+    edges = _resolve(
+        {
+            "src/Report.java": "class Report { int get() { return 1; } }\n",
+            "src/S.java": "class S { void run(Future<Report> f) { f.get(); } }\n",
+            "src/foo.rs": "pub struct Foo;\nimpl Foo { pub fn map(&self) {} }\n",
+            "src/use.rs": "fn go(x: Option<Foo>) { x.map(); }\n",
+            "src/graph.ts": "export class Graph { query() { return 1; } }\n",
+            "src/app.ts": (
+                "import { Graph } from './graph';\n"
+                "async function load(): Promise<Graph> { return new Graph(); }\n"
+                "export async function run() { const g = await load(); g.query(); }\n"
+            ),
+        }
+    )
+    assert _targets(edges, "S.run") == set()
+    assert _targets(edges, "go") == set()
+    assert ("src/graph.ts", "Graph.query") in _targets(edges, "run")
+
+
+def test_parameters_and_loop_variables_shadow_outer_types():
+    edges = _resolve(
+        {
+            "a.py": "class A:\n    def go(self):\n        return 1\n",
+            "b.py": "class B:\n    def go(self):\n        return 2\n",
+            "use.py": (
+                "from a import A\nfrom b import B\n\n"
+                "x = A()\n\n"
+                "def untyped(x):\n    return x.go()\n\n"
+                "def loop(items):\n    x = A()\n    for x in items:\n        x.go()\n\n"
+                "def module_level():\n    return x.go()\n"
+            ),
+        }
+    )
+    def go_confidences(caller):
+        return {edges[(caller, p, q)][0] for p, q in _targets(edges, caller) if q.endswith(".go")}
+
+    assert go_confidences("untyped") == {AMBIGUOUS}
+    assert go_confidences("loop") == {AMBIGUOUS}
+    assert _targets(edges, "module_level") == {("a.py", "A.go")}
+
+
+def test_builtin_method_names_on_unknown_receivers_are_not_linked():
+    edges = _resolve(
+        {
+            "ledger.py": "class EvidenceLedger:\n    def get(self, k):\n        return k\n    def summarize(self):\n        return 1\n",
+            "use.py": (
+                "from ledger import EvidenceLedger\n\n"
+                "def read(item, ledger: EvidenceLedger):\n"
+                "    item.metadata.get('a')\n"
+                "    item.summarize()\n"
+                "    ledger.get('b')\n"
+            ),
+        }
+    )
+    assert _targets(edges, "read") == {("ledger.py", "EvidenceLedger.get"), ("ledger.py", "EvidenceLedger.summarize")}
+    assert edges[("read", "ledger.py", "EvidenceLedger.get")][0] == EXTRACTED  # typed receiver still links
+    assert edges[("read", "ledger.py", "EvidenceLedger.summarize")][0] == AMBIGUOUS  # unknown, but not a builtin name
+    lines = _edge_lines(
+        {
+            "ledger.py": "class EvidenceLedger:\n    def get(self, k):\n        return k\n",
+            "use.py": "def read(item):\n    item.metadata.get('a')\n",
+        }
+    )
+    assert lines == []  # item.metadata.get is almost surely dict.get
+
+
+def _edge_lines(files: dict[str, str]) -> list[tuple[str, int]]:
+    symbols, records = [], []
+    for path, source in files.items():
+        file_symbols, record = records_for(parse_code_file(path, source))
+        symbols.extend(file_symbols)
+        records.append(record)
+    by_key = {s.key: s for s in symbols}
+    return [(by_key[e.b].qualname, e.line) for e in resolve(symbols, records).edges]
+
+
+def test_attribute_chains_resolve_through_field_types():
+    edges = _resolve(
+        {
+            "tools.py": (
+                "from dataclasses import dataclass, field\n\n"
+                "class EvidenceLedger:\n    def get(self, n):\n        return n\n\n"
+                "@dataclass\nclass AgentState:\n    evidence: EvidenceLedger = field(default_factory=EvidenceLedger)\n\n"
+                "class Runner:\n"
+                "    def __init__(self):\n        self.state = AgentState()\n"
+                "    def first(self):\n        return self.state.evidence.get(1)\n"
+            ),
+            "test_tools.py": (
+                "from tools import AgentState\n\n"
+                "def test_evidence():\n    state = AgentState()\n    assert state.evidence.get(1)\n\n"
+                "def make() -> AgentState:\n    return AgentState()\n\n"
+                "def test_helper():\n    state = make()\n    assert state.evidence.get(2)\n"
+            ),
+        }
+    )
+    assert ("tools.py", "EvidenceLedger.get") in _targets(edges, "test_evidence")
+    assert edges[("test_evidence", "tools.py", "EvidenceLedger.get")][0] == EXTRACTED
+    assert ("tools.py", "EvidenceLedger.get") in _targets(edges, "Runner.first")
+    assert ("tools.py", "EvidenceLedger.get") in _targets(edges, "test_helper")
+    # Class-body annotations do not leak into module scope.
+    assert not any(q == "EvidenceLedger.get" for (a, _, q) in edges if a == "<module>")
+
+
+def test_production_never_reaches_test_code_through_any_rule():
+    edges = _resolve(
+        {
+            "src/app.js": "export function boot() { api.load(); }\n",
+            "tests/api.test.js": "const api = { load() { return 0; } };\n",
+            "src/other.js": "const api = { load() { return 1; } };\n",
+            "app/run.py": "def make():\n    return object()\n\ndef go():\n    make().send()\n",
+            "tests/conftest.py": "class Client:\n    def send(self):\n        return 1\n",
+        }
+    )
+    # `api` is neither defined in app.js nor imported: it may be a global. Never the test file,
+    # and the other file's object only as an uncertain candidate.
+    assert ("tests/api.test.js", "api.load") not in _targets(edges, "boot")
+    assert {edges[("boot", p, q)][0] for p, q in _targets(edges, "boot")} <= {AMBIGUOUS}
+    assert _targets(edges, "go") == {("app/run.py", "make")}
+
+
+def test_javascript_test_blocks_are_test_callers():
+    from graphora.parser import parse_code_file
+
+    source = (
+        "import { Graph } from '../src/graph';\n"
+        "describe('Graph', () => {\n"
+        "  beforeEach(() => { reset(); });\n"
+        "  it('runs a query', async () => {\n"
+        "    const g = new Graph();\n"
+        "    await g.query('MATCH (n) RETURN n');\n"
+        "  });\n"
+        "  test.only('second', () => { new Graph().query('x'); });\n"
+        "});\n"
+    )
+    parsed = parse_code_file("tests/graph.spec.ts", source)
+    names = {s.qualname for s in parsed.symbols}
+    assert {"describe_Graph", "describe_Graph.it_runs_a_query", "describe_Graph.test_second"} <= names
+    edges = _resolve({"src/graph.ts": "export class Graph { query(q: string) { return q; } }\n", "tests/graph.spec.ts": source})
+    assert ("src/graph.ts", "Graph.query") in _targets(edges, "describe_Graph.it_runs_a_query")
+    assert edges[("describe_Graph.it_runs_a_query", "src/graph.ts", "Graph.query")][0] == EXTRACTED
+    assert ("src/graph.ts", "Graph.query") in _targets(edges, "describe_Graph.test_second")
+
+
+def test_ruby_paren_less_calls_are_calls():
+    edges = _resolve(
+        {
+            "lib/app.rb": (
+                "def helper\n  1\nend\n"
+                "def helper3\n  3\nend\n"
+                "def run(arg)\n"
+                "  helper\n"
+                "  x = helper3\n"
+                "  local = 2\n"
+                "  local\n"
+                "  arg\n"
+                "end\n"
+            )
+        }
+    )
+    assert _targets(edges, "run") == {("lib/app.rb", "helper"), ("lib/app.rb", "helper3")}

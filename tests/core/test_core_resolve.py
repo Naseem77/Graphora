@@ -92,14 +92,14 @@ def test_unknown_receiver_lists_every_candidate_as_ambiguous():
 
 
 def test_unknown_receiver_with_one_candidate_is_still_ambiguous():
-    # `items.append(x)` may well be list.append, not the repo's Buffer.append.
+    # `items.stage(x)` might be the repo's Buffer.stage, or a library object's method.
     edges, _ = _resolve(
         {
-            "buf.py": "class Buffer:\n    def append(self, x):\n        return x\n",
-            "use.py": "def collect(items):\n    items.append(1)\n",
+            "buf.py": "class Buffer:\n    def stage(self, x):\n        return x\n",
+            "use.py": "def collect(items):\n    items.stage(1)\n",
         }
     )
-    assert edges[("collect", "buf.py", "Buffer.append")][:2] == (AMBIGUOUS, 1)
+    assert edges[("collect", "buf.py", "Buffer.stage")][:2] == (AMBIGUOUS, 1)
 
 
 def test_bare_call_never_matches_a_method_in_python():
@@ -191,6 +191,7 @@ def test_javascript_relative_imports():
 def test_go_same_package_and_package_import():
     edges, _ = _resolve(
         {
+            "go.mod": "module example.com/proj\n",
             "shapes/area.go": "package shapes\nfunc Area() int { return helper() }\n",
             "shapes/helper.go": "package shapes\nfunc helper() int { return 1 }\n",
             "other/helper.go": "package other\nfunc helper() int { return 2 }\n",
@@ -320,3 +321,145 @@ def test_union_typed_receiver_lists_both_types():
     )
     assert _targets(edges, "lookup") == {("stores.py", "FalkorStore.find"), ("stores.py", "JsonStore.find")}
     assert edges[("lookup", "stores.py", "JsonStore.find")][::2] == (AMBIGUOUS, "union")
+
+
+def test_from_dot_import_module_then_call():
+    edges, _ = _resolve(
+        {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": "def f():\n    return 1\n",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/deep.py": "from .. import mod\n\ndef g():\n    return mod.f()\n",
+            "pkg/main.py": "from . import mod\n\ndef run():\n    return mod.f()\n",
+        }
+    )
+    assert edges[("run", "pkg/mod.py", "f")][0] == EXTRACTED
+    assert edges[("g", "pkg/mod.py", "f")][0] == EXTRACTED
+
+
+def test_relative_import_beyond_the_root_resolves_nowhere():
+    edges, _ = _resolve(
+        {"x.py": "def helper():\n    return 1\n", "a.py": "from ....x import helper\n\ndef run():\n    return helper()\n"}
+    )
+    assert _targets(edges, "run") == set()
+
+
+def test_stdlib_and_package_internal_names_do_not_capture_imports():
+    edges, result = _resolve(
+        {
+            "app/__init__.py": "",
+            "app/handlers/__init__.py": "",
+            "app/handlers/logging.py": "def info(m):\n    return m\n",
+            "app/handlers/requests.py": "def get(u):\n    return u\n",
+            "app/x.py": "import logging\nimport requests\n\ndef run():\n    logging.info('a')\n    requests.get('u')\n",
+            "app/y.py": "from app.handlers import logging\n\ndef ok():\n    logging.info('b')\n",
+        }
+    )
+    assert _targets(edges, "run") == set()
+    assert result.external == 2
+    assert _targets(edges, "ok") == {("app/handlers/logging.py", "info")}
+
+
+def test_go_imports_resolve_through_go_mod_only():
+    edges, _ = _resolve(
+        {
+            "go.mod": "module example.com/proj\n\ngo 1.22\n",
+            "internal/json/json.go": "package json\nfunc Marshal(v any) []byte { return nil }\n",
+            "pkg/errors/errors.go": "package errors\nfunc New(s string) error { return nil }\n",
+            "cmd/main.go": (
+                'package main\nimport (\n  "encoding/json"\n  "github.com/pkg/errors"\n'
+                '  myjson "example.com/proj/internal/json"\n)\n'
+                "func main() { json.Marshal(1); errors.New(\"x\"); myjson.Marshal(2) }\n"
+            ),
+        }
+    )
+    assert _targets(edges, "main") == {("internal/json/json.go", "Marshal")}
+
+
+def test_go_without_go_mod_needs_two_matching_path_segments():
+    edges, _ = _resolve(
+        {
+            "internal/json/json.go": "package json\nfunc Marshal(v any) []byte { return nil }\n",
+            "cmd/main.go": 'package main\nimport "encoding/json"\nfunc main() { json.Marshal(1) }\n',
+        }
+    )
+    assert _targets(edges, "main") == set()
+
+
+def test_function_local_and_try_except_imports():
+    edges, _ = _resolve(
+        {
+            "a.py": "def helper():\n    return 1\n",
+            "b.py": "def helper():\n    return 2\n",
+            "c.py": "def helper():\n    return 3\n",
+            "fast.py": (
+                "try:\n    from a import helper\nexcept ImportError:\n    from b import helper\n\n"
+                "def run():\n    return helper()\n"
+                "def local():\n    from c import helper\n    return helper()\n"
+            ),
+        }
+    )
+    assert _targets(edges, "run") == {("a.py", "helper"), ("b.py", "helper")}
+    assert {edges[("run", p, q)][0] for p, q in _targets(edges, "run")} == {AMBIGUOUS}
+    assert _targets(edges, "local") == {("c.py", "helper")}
+    assert edges[("local", "c.py", "helper")][0] == EXTRACTED
+
+
+def test_methods_of_a_same_named_class_in_another_file_are_not_borrowed():
+    edges, _ = _resolve(
+        {
+            "a.py": "class Base:\n    def go(self):\n        return 0\n\nclass Foo(Base):\n    pass\n",
+            "b.py": "class Foo:\n    def go(self):\n        return 1\n",
+            "main.py": "from a import Foo\n\ndef run(f: Foo):\n    return f.go()\n",
+        }
+    )
+    assert ("b.py", "Foo.go") not in _targets(edges, "run")
+
+
+def test_inherited_methods_resolve_through_base_classes():
+    edges, _ = _resolve(
+        {
+            "base.py": "class Base:\n    def save(self):\n        return 0\n",
+            "a.py": (
+                "from base import Base\n\n"
+                "class Foo(Base):\n    def run(self):\n        return self.save()\n"
+            ),
+            "b.py": "class Other:\n    def save(self):\n        return 1\n",
+            "main.py": "from a import Foo\n\ndef use(f: Foo):\n    return f.save()\n",
+            "web/base.ts": "export class Store { save() { return 0; } }\n",
+            "web/db.ts": "import { Store } from './base';\nexport class Db extends Store { run() { return this.save(); } }\n",
+        }
+    )
+    assert _targets(edges, "use") == {("base.py", "Base.save")}
+    assert _targets(edges, "Foo.run") == {("base.py", "Base.save")}
+    assert edges[("Foo.run", "base.py", "Base.save")][0] == EXTRACTED
+    assert _targets(edges, "Db.run") == {("web/base.ts", "Store.save")}
+
+
+def test_type_aliases_defined_in_the_repo_are_not_external():
+    edges, _ = _resolve(
+        {
+            "stores.py": (
+                "from typing import Union\n\n"
+                "class FalkorStore:\n    def find(self, n):\n        return n\n\n"
+                "class JsonStore:\n    def find(self, n):\n        return n\n\n"
+                "Backend = Union[FalkorStore, JsonStore]\n"
+                "Either = FalkorStore | JsonStore\n"
+            ),
+            "use.py": (
+                "from stores import Backend, Either\n\n"
+                "def lookup(store: Backend):\n    return store.find('x')\n\n"
+                "def other(store: Either):\n    return store.find('y')\n"
+            ),
+            "web/types.ts": (
+                "export class A { run() { return 1; } }\nexport class B { run() { return 2; } }\n"
+                "export type AorB = A | B;\n"
+            ),
+            "web/use.ts": "import { AorB } from './types';\nexport function go(x: AorB) { return x.run(); }\n",
+        }
+    )
+    both = {("stores.py", "FalkorStore.find"), ("stores.py", "JsonStore.find")}
+    assert _targets(edges, "lookup") == both
+    assert _targets(edges, "other") == both
+    assert {edges[("lookup", p, q)][0] for p, q in both} == {AMBIGUOUS}
+    assert _targets(edges, "go") == {("web/types.ts", "A.run"), ("web/types.ts", "B.run")}

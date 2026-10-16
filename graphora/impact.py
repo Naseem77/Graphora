@@ -16,20 +16,18 @@ Deterministic, read-only, no LLM.
 
 from __future__ import annotations
 
-import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from graphora.blast import members_of
-from graphora.parser import AMBIGUOUS, extract_symbols_from_diff
+from graphora.blast import members_of, select_symbols
+from graphora.parser import AMBIGUOUS, definition_names, parse_unified_diff
 
 if TYPE_CHECKING:
     from graphora.store import GraphBackend
 
 DEFAULT_DEPTH = 2
 MAX_TESTS_LISTED = 10  # text output only; to_dict() keeps every test
-_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 @dataclass(frozen=True)
@@ -75,6 +73,7 @@ class WhatCouldBreak:
     tests: list[Breakage] = field(default_factory=list)
     unresolved: list[str] = field(default_factory=list)
     depth: int = DEFAULT_DEPTH
+    deleted: list[str] = field(default_factory=list)  # removed by the diff, gone from the graph
 
     def to_dict(self) -> dict:
         return {
@@ -83,20 +82,29 @@ class WhatCouldBreak:
             "might_break": [b.to_dict() for b in self.might_break],
             "tests": [b.to_dict() for b in self.tests],
             "unresolved": self.unresolved,
+            "deleted": self.deleted,
             "depth": self.depth,
         }
 
     def to_text(self) -> str:
-        if not self.targets:
-            missing = ", ".join(f"`{n}`" for n in self.unresolved) or "nothing"
+        if not self.targets and not self.deleted:
+            if not self.unresolved:
+                return "The diff touches no function, method, or class in the code graph."
+            missing = ", ".join(f"`{n}`" for n in self.unresolved)
             return f"No definition found for {missing} in the code graph."
-        lines = [f"What could break if you change {_target_list(self.targets)}"]
+        lines = [f"What could break if you change {_target_list(self.targets) or 'this diff'}"]
+        if self.deleted:
+            lines.append(
+                "Deleted: " + ", ".join(f"`{n}`" for n in self.deleted)
+                + ". Callers below still call it and will break."
+            )
         names = [t["name"] for t in self.targets]
         repeated = sorted({n for n in names if names.count(n) > 1})
         if repeated:
+            example = next(t for t in self.targets if t["name"] == repeated[0])
             lines.append(
                 f"(several definitions are named {', '.join(f'`{n}`' for n in repeated)}; all are included."
-                " Pass a qualified name such as `Class.method` to pick one.)"
+                f" To pick one, pass its file too, e.g. `{example['path']}:{example['qualname']}`.)"
             )
         lines.append("")
         lines.append(f"Will break ({len(self.will_break)}):")
@@ -134,7 +142,7 @@ def what_could_break(store: GraphBackend, names: list[str], depth: int = DEFAULT
     targets: list[dict] = []
     unresolved: list[str] = []
     for name in names:
-        found = store.find_symbols(name)
+        found = select_symbols(store, name)
         if found:
             targets.extend(found)
         else:
@@ -143,9 +151,10 @@ def what_could_break(store: GraphBackend, names: list[str], depth: int = DEFAULT
 
 
 def what_could_break_for_diff(store: GraphBackend, diff: str, depth: int = DEFAULT_DEPTH) -> WhatCouldBreak:
-    """What could break for a unified diff: every symbol whose body a hunk touches."""
-    targets, unresolved = changed_symbols(store, diff)
-    return _walk(store, targets, unresolved, depth)
+    """What could break for a unified diff: every symbol whose body a hunk touches,
+    plus the callers of functions the diff deletes."""
+    targets, unresolved, deleted = _diff_targets(store, diff)
+    return _walk(store, targets, unresolved, depth, deleted=deleted)
 
 
 def changed_symbols(store: GraphBackend, diff: str) -> tuple[list[dict], list[str]]:
@@ -155,27 +164,66 @@ def changed_symbols(store: GraphBackend, diff: str) -> tuple[list[dict], list[st
     be indexed from the changed code. Definitions removed by the diff are
     looked up by name in the same file.
     """
+    targets, unresolved, _ = _diff_targets(store, diff)
+    return targets, unresolved
+
+
+def _diff_targets(store: GraphBackend, diff: str) -> tuple[list[dict], list[str], list[str]]:
+    """(changed symbols, names not found, names the diff deleted that the graph no longer has)."""
     targets: list[dict] = []
     unresolved: list[str] = []
-    for path, lines, removed_text in _diff_changes(diff):
-        symbols = store.symbols_in_file(path)
-        for line in sorted(lines):
+    deleted: list[str] = []
+    for change in parse_unified_diff(diff):
+        symbols = store.symbols_in_file(change.path)
+
+        def innermost(line: int) -> dict | None:
             enclosing = [s for s in symbols if s["line"] <= line <= s["end_line"]]
-            if enclosing:
-                targets.append(max(enclosing, key=lambda s: (s["line"], -s["end_line"])))
-        for name in extract_symbols_from_diff(removed_text):
-            found = [s for s in store.find_symbols(name) if s["path"] == path]
+            return max(enclosing, key=lambda s: (s["line"], -s["end_line"])) if enclosing else None
+
+        for line, _ in change.added:
+            hit = innermost(line)
+            if hit:
+                targets.append(hit)
+        removed_defs = definition_names(change.path, [t for _, _, t in change.removed])
+        for _, anchor, text in change.removed:
+            if not text.strip():
+                continue  # removing blank lines changes nothing
+            # A deletion sits between new lines anchor-1 and anchor: the end of the
+            # previous symbol is the likelier owner (deleting a function's last lines).
+            hit = innermost(anchor - 1) if anchor > 1 else None
+            hit = hit or innermost(anchor)
+            if hit and hit["kind"] == "Class" and removed_defs:
+                continue  # deleting a method is about that method, not every method of its class
+            if hit:
+                targets.append(hit)
+        added_defs = set(definition_names(change.path, [t for _, t in change.added]))
+        for name in removed_defs:
+            found = [s for s in select_symbols(store, name) if s["path"] == change.path]
             if found:
                 targets.extend(found)
-            elif not any(s["name"] == name for s in symbols):
-                unresolved.append(name)
-    return _unique(targets), list(dict.fromkeys(unresolved))
+            elif name not in added_defs and not any(s["name"] == name for s in symbols):
+                deleted.append(name)
+    return _unique(targets), list(dict.fromkeys(unresolved)), list(dict.fromkeys(deleted))
 
 
-def _walk(store: GraphBackend, targets: list[dict], unresolved: list[str], depth: int) -> WhatCouldBreak:
+def _walk(
+    store: GraphBackend, targets: list[dict], unresolved: list[str], depth: int, deleted: list[str] | None = None
+) -> WhatCouldBreak:
     target_keys = {member["key"] for t in targets for member in members_of(store, t)}
     best: dict[str, Breakage] = {}
     queue: deque[tuple[str, int, tuple[str, ...], bool]] = deque()
+    # Callers of deleted functions: their call sites no longer resolve to anything.
+    for name in deleted or []:
+        for site in store.call_sites_named(name):
+            if site["resolved"]:
+                continue
+            caller = site["caller"]
+            # A bare call certainly hit the deleted function; `obj.name()` might have meant another.
+            entry = Breakage(caller, name, site["line"], 1, (name,), certain=site["receiver"] == "")
+            previous = best.get(caller["key"])
+            if previous is None or (entry.certain, -entry.depth) > (previous.certain, -previous.depth):
+                best[caller["key"]] = entry
+            queue.append((caller["key"], 1, (caller["qualname"], name), entry.certain))
     for key in sorted(target_keys):
         record = store.get_symbol(key)
         queue.append((key, 0, (record["qualname"] if record else key,), True))
@@ -213,8 +261,9 @@ def _walk(store: GraphBackend, targets: list[dict], unresolved: list[str], depth
             previous = best.get(caller["key"])
             if previous is None or (entry.certain, -entry.depth) > (previous.certain, -previous.depth):
                 best[caller["key"]] = entry
-            if not caller["is_test"]:
-                queue.append((caller["key"], level + 1, (caller["qualname"], *chain), still_certain))
+            # Test helpers (page objects, fixtures) are walked too, so the tests that use
+            # them are found; everything reached through a test stays under "tests".
+            queue.append((caller["key"], level + 1, (caller["qualname"], *chain), still_certain))
     entries = sorted(best.values(), key=lambda b: (b.depth, b.caller["path"], b.caller["line"]))
     return WhatCouldBreak(
         targets=targets,
@@ -223,50 +272,8 @@ def _walk(store: GraphBackend, targets: list[dict], unresolved: list[str], depth
         tests=[b for b in entries if b.caller["is_test"]],
         unresolved=unresolved,
         depth=depth,
+        deleted=list(deleted or []),
     )
-
-
-def _diff_changes(diff: str) -> list[tuple[str, set[int], str]]:
-    """(path, changed new-side lines, removed-line text) per file of a unified diff."""
-    files: list[tuple[str, set[int], str]] = []
-    path = ""
-    lines: set[int] = set()
-    removed: list[str] = []
-    new_line = 0
-
-    def flush() -> None:
-        if path:
-            files.append((path, set(lines), "".join(removed)))
-
-    header = ""
-    for raw in diff.splitlines():
-        if raw.startswith("--- "):
-            header = raw
-            continue
-        if raw.startswith("+++ "):
-            flush()
-            target = raw[4:].strip()
-            path = "" if target == "/dev/null" else target.removeprefix("b/")
-            lines, removed = set(), []
-            if not path:  # deleted file: attribute its removals to the old path
-                path = header[4:].strip().removeprefix("a/")
-            continue
-        match = _HUNK.match(raw)
-        if match:
-            new_line = int(match.group(3))
-            continue
-        if not path:
-            continue
-        if raw.startswith("+"):
-            lines.add(new_line)
-            new_line += 1
-        elif raw.startswith("-"):
-            lines.add(max(new_line, 1))  # the deletion sits just before this new-side line
-            removed.append(f"+++ b/{path}\n{raw}\n")
-        elif raw.startswith(" ") or raw == "":
-            new_line += 1
-    flush()
-    return files
 
 
 def _unique(records: list[dict]) -> list[dict]:

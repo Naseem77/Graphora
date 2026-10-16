@@ -34,7 +34,9 @@ CODE_EXTENSIONS = {
 # Languages with regex symbol patterns; used for diff attribution too.
 REGEX_LANGUAGES = ("python", "typescript", "go", "java", "rust", "c", "cpp", "ruby", "php")
 
-_TEST_PATH_PATTERN = re.compile(r"(^|/)(tests?|__tests__|spec)(/|_)|(_test\.|\.test\.|\.spec\.|^test_)")
+_TEST_PATH_PATTERN = re.compile(
+    r"(^|/)(tests?|__tests__|spec|e2e|cypress)(/|_)|(_test\.|\.test\.|\.spec\.|^test_|/test_)"
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,9 @@ class ParsedSymbol:
     parent: str = ""  # qualified name of the enclosing scope ("" at top level)
     parent_kind: str = ""  # "Class", "Function", "Namespace", or ""
     returns: str = ""  # declared return type name, when the source states one
+    is_test: bool = False  # test code inside a non-test file (Rust #[cfg(test)] / #[test])
+    attributes: str = ""  # classes: "field=Type;other=Type" for fields whose type is stated
+    bases: str = ""  # classes: comma-separated base classes as written ("Base,mixins.Mixin")
 
     def __post_init__(self) -> None:
         if not self.qualname:
@@ -88,6 +93,7 @@ class ParsedBinding:
     local: str
     module: str
     name: str = ""
+    scope: str = ""  # qualified name of the function the import is in ("" = module level)
 
 
 @dataclass(frozen=True)
@@ -103,8 +109,12 @@ class ParsedFile:
     bindings: list[ParsedBinding] = field(default_factory=list)
 
 
+# Manifests that say which imports are local: Go's module path, Rust's crate name.
+MANIFESTS = {"go.mod": "gomod", "Cargo.toml": "cargo"}
+
+
 def is_supported_code_file(path: str) -> bool:
-    return Path(path).suffix.lower() in CODE_EXTENSIONS
+    return Path(path).suffix.lower() in CODE_EXTENSIONS or Path(path).name in MANIFESTS
 
 
 def is_test_path(path: str) -> bool:
@@ -112,6 +122,8 @@ def is_test_path(path: str) -> bool:
 
 
 def language_for_path(path: str) -> str:
+    if Path(path).name in MANIFESTS:
+        return MANIFESTS[Path(path).name]
     suffix = Path(path).suffix.lower()
     return {
         ".py": "python",
@@ -137,57 +149,164 @@ def language_for_path(path: str) -> str:
 def parse_code_file(path: str, content: str) -> ParsedFile:
     """Parse one source file. Tree-sitter first, regex fallback."""
     language = language_for_path(path)
+    if language == "gomod":
+        return _parse_go_mod(path, content)
+    if language == "cargo":
+        return _parse_cargo_toml(path, content)
     parsed = _parse_with_tree_sitter(path, content, language)
     if parsed is not None:
         return parsed
     return _parse_with_regex(path, content, language)
 
 
+def _parse_go_mod(path: str, content: str) -> ParsedFile:
+    """go.mod declares the module path that makes an import local to the repository."""
+    match = re.search(r"(?m)^\s*module\s+(\S+)", content)
+    bindings = [ParsedBinding("<module>", match.group(1).strip('"'))] if match else []
+    return ParsedFile(path, "gomod", [], [], [], content, parser_used="regex", bindings=bindings)
+
+
+def _parse_cargo_toml(path: str, content: str) -> ParsedFile:
+    """Cargo.toml names the crate: `use my_crate::x` inside the repository is local."""
+    name = ""
+    section = ""
+    for raw in content.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            section = line.strip("[] ")
+            continue
+        match = re.match(r'name\s*=\s*"([^"]+)"', line)
+        if match and section in {"package", "lib"}:
+            name = match.group(1)  # [lib] name, when given, wins over [package]
+    bindings = [ParsedBinding("<crate>", name.replace("-", "_"))] if name else []
+    return ParsedFile(path, "cargo", [], [], [], content, parser_used="regex", bindings=bindings)
+
+
+@dataclass(frozen=True)
+class DiffFile:
+    """One file of a unified diff."""
+
+    path: str  # new path, or the old path when the file was deleted
+    deleted: bool
+    added: list[tuple[int, str]]  # (new-side line, text)
+    removed: list[tuple[int, int, str]]  # (old-side line, new-side line it sits before, text)
+
+
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_unified_diff(diff: str) -> list[DiffFile]:
+    """Parse git and GNU unified diffs.
+
+    Hunk line counts are tracked, so a removed line whose text starts with
+    "--" (raw "--- ...") is content, not a file header; GNU timestamps after
+    a tab and git's quoted paths ("b/sp\\303\\244ce.py") are handled.
+    """
+    files: list[DiffFile] = []
+    old_path = new_path = ""
+    added: list[tuple[int, str]] = []
+    removed: list[tuple[int, int, str]] = []
+    old_left = new_left = 0
+    old_line = new_line = 0
+
+    def flush() -> None:
+        if new_path or old_path:
+            deleted = new_path in ("", "/dev/null")
+            files.append(DiffFile(old_path if deleted else new_path, deleted, list(added), list(removed)))
+
+    lines = diff.splitlines()
+    for index, raw in enumerate(lines):
+        if (old_left > 0 or new_left > 0) and _starts_file_header(lines, index):
+            old_left = new_left = 0  # hand-written hunk with wrong counts: a new file starts here
+        if old_left > 0 or new_left > 0:  # inside a hunk
+            if raw.startswith("\\"):
+                continue  # "\ No newline at end of file"
+            if raw.startswith("+"):
+                added.append((new_line, raw[1:]))
+                new_line += 1
+                new_left -= 1
+            elif raw.startswith("-"):
+                removed.append((old_line, new_line, raw[1:]))
+                old_line += 1
+                old_left -= 1
+            else:  # context (" text", or "" for an empty context line)
+                old_line += 1
+                new_line += 1
+                old_left -= 1
+                new_left -= 1
+            continue
+        if raw.startswith("--- "):
+            flush()
+            old_path, new_path = _diff_path(raw[4:]), ""
+            added, removed = [], []
+        elif raw.startswith("+++ "):
+            new_path = _diff_path(raw[4:])
+        else:
+            match = _HUNK_HEADER.match(raw)
+            if match:
+                old_line, new_line = int(match.group(1)), int(match.group(3))
+                old_left = int(match.group(2)) if match.group(2) is not None else 1
+                new_left = int(match.group(4)) if match.group(4) is not None else 1
+    flush()
+    return files
+
+
+def _starts_file_header(lines: list[str], index: int) -> bool:
+    return (
+        lines[index].startswith("--- ")
+        and index + 2 < len(lines)
+        and lines[index + 1].startswith("+++ ")
+        and lines[index + 2].startswith("@@ ")
+    )
+
+
+def _diff_path(text: str) -> str:
+    text = text.rstrip("\n").split("\t", 1)[0].strip()  # GNU diff: "path<TAB>timestamp"
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
+        text = text.encode("latin-1").decode("utf-8", "replace")
+    if text == "/dev/null":
+        return text
+    return text[2:] if text.startswith(("a/", "b/")) else text
+
+
+def definition_names(path: str, texts: list[str]) -> list[str]:
+    """Names of symbols defined on the given lines of `path` (its language's patterns only)."""
+    language = language_for_path(path)
+    languages: tuple[str, ...] = ("typescript",) if language == "javascript" else (language,)
+    if language == "text":
+        languages = REGEX_LANGUAGES
+    names: list[str] = []
+    for text in texts:
+        for lang in languages:
+            names.extend(name for _, name in _extract_symbols(lang, text.strip()))
+    return list(dict.fromkeys(names))
+
+
 def extract_symbols_from_diff(diff: str) -> list[str]:
     """Names of symbols defined on added/removed diff lines.
 
     Each line is matched only with the definition patterns of its file's
-    language (from the ---/+++ headers); C's patterns used to read Python's
-    `return len(` as a definition of `len`.
+    language; C's patterns used to read Python's `return len(` as a
+    definition of `len`.
     """
-    symbols: list[str] = []
-    seen: set[str] = set()
-    languages: tuple[str, ...] = REGEX_LANGUAGES
-    for line in diff.splitlines():
-        if line.startswith(("+++ ", "--- ")):
-            target = line[4:].strip()
-            if target != "/dev/null":
-                language = language_for_path(target.removeprefix("a/").removeprefix("b/"))
-                languages = ("typescript",) if language == "javascript" else (language,)
-                if language == "text":
-                    languages = REGEX_LANGUAGES
-            continue
-        if not line.startswith(("+", "-")):
-            continue
-        stripped = line[1:].strip()
-        for language in languages:
-            for _, name in _extract_symbols(language, stripped):
-                if name not in seen:
-                    seen.add(name)
-                    symbols.append(name)
-    return symbols
+    names: list[str] = []
+    for f in parse_unified_diff(diff):
+        names.extend(definition_names(f.path, [t for _, _, t in f.removed] + [t for _, t in f.added]))
+    return list(dict.fromkeys(names))
 
 
 def extract_files_from_diff(diff: str) -> list[str]:
-    """File paths touched by a unified diff."""
-    files: list[str] = []
-    for line in diff.splitlines():
-        match = re.match(r"^\+\+\+ (?:b/)?(.+)$", line)
-        if match and match.group(1) != "/dev/null" and match.group(1) not in files:
-            files.append(match.group(1))
-    return files
+    """Paths of the files a unified diff changes or adds (not those it deletes)."""
+    return list(dict.fromkeys(f.path for f in parse_unified_diff(diff) if not f.deleted))
 
 
 # --- tree-sitter path -------------------------------------------------------
 
 # Values that make a variable, property, or class field a function definition.
 _JS_FUNCTION_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
-_NAME_PATTERN = re.compile(r"^~?[A-Za-z_][\w$]*[?!=]?$")
+# Identifiers in any script (Ñ, π), with JS `$`/`#private`, C++ `~Dtor`, Ruby `paid?`/`name=`.
+_NAME_PATTERN = re.compile(r"^(?:[~#$]?[^\W\d][\w$]*[?!=]?|\$+)$")
 _UNKNOWN_QUALIFIER_KIND = "?"
 
 
@@ -204,6 +323,7 @@ class _Definition:
 class _Frame:
     qualname: str
     kind: str
+    test: bool = False
 
 
 def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFile | None:
@@ -212,7 +332,7 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
     if parser is None:
         return None
 
-    content_bytes = content.encode("utf-8")
+    content_bytes = content.encode("utf-8", errors="replace")  # lone surrogates must not crash
     root = parser.parse(content_bytes).root_node
     symbols: list[ParsedSymbol] = []
     imports: list[ParsedImport] = []
@@ -221,6 +341,8 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
 
     # Variable -> type facts, keyed by the scope that owns them ("" = module).
     types: dict[str, dict[str, str]] = {}
+    # Ruby local variable names per method: a bare identifier that is not one is a call.
+    ruby_locals: dict[str, set[str]] = {}
 
     # Iterative pre-order walk carrying the enclosing scopes (deep trees overflow recursion).
     stack: list[tuple[Any, tuple[_Frame, ...]]] = [(root, ())]
@@ -229,13 +351,24 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
         child_scope = scope
 
         for target, kind in _tree_sitter_types(language, node, content_bytes):
+            if scope and scope[-1].kind == "Class" and not target.startswith(_SELF_PREFIXES):
+                if language in {"python", "javascript", "typescript"}:
+                    # A class-body annotation (`evidence: Ledger`, dataclass fields) types the attribute.
+                    target = ("self." if language == "python" else "this.") + target
+                else:
+                    # Java & co. use fields without `this.`: keep the bare name on the class.
+                    types.setdefault(scope[-1].qualname, {})[target] = kind
+                    continue
             owner = _type_owner(scope, target)
             types.setdefault(owner, {})[target] = kind
 
         imported = _tree_sitter_import(language, node, content_bytes)
         if imported:
             imports.append(ParsedImport(name=imported, confidence=EXTRACTED))
-        bindings.extend(_tree_sitter_bindings(language, node, content_bytes))
+        found_bindings = _tree_sitter_bindings(language, node, content_bytes)
+        if found_bindings:
+            owner = next((f.qualname for f in reversed(scope) if f.kind == "Function"), "")
+            bindings.extend(replace(b, scope=owner) for b in found_bindings)
 
         definition = _tree_sitter_definition(language, node, content_bytes)
         if definition is not None:
@@ -248,6 +381,8 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
             returns = _return_type(language, node, content_bytes) if definition.kind == "Function" else ""
             if returns in {"Self", "self", "this", "static"} and parent_kind == "Class":
                 returns = parent.rsplit(".", 1)[-1]
+            in_test = any(f.test for f in scope) or _is_test_item(language, node, definition.name, content_bytes)
+            bases = ",".join(_base_classes(language, node, content_bytes)) if definition.kind == "Class" else ""
             if definition.emit:
                 symbols.append(
                     ParsedSymbol(
@@ -261,9 +396,11 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
                         parent=parent,
                         parent_kind=parent_kind,
                         returns=returns,
+                        is_test=in_test,
+                        bases=bases,
                     )
                 )
-            child_scope = scope + (_Frame(qualname, definition.kind),)
+            child_scope = scope + (_Frame(qualname, definition.kind, in_test),)
 
         call = _tree_sitter_call(language, node, content_bytes)
         if call is not None:
@@ -275,9 +412,14 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
                 line = _point_row(node.start_point) + 1
                 calls.append(ParsedCall(caller=caller, callee=callee, line=line, confidence=INFERRED, receiver=receiver))
 
+        if language == "ruby":
+            bare = _ruby_bare_call(node, scope, ruby_locals, content_bytes)
+            if bare is not None:
+                calls.append(bare)
+
         stack.extend((child, child_scope) for child in reversed(node.children))
 
-    symbols = _settle_qualifier_kinds(symbols)
+    symbols = _settle_qualifier_kinds(_with_attributes(symbols, types))
 
     # Calls to a function defined in the same file are certain: promote to EXTRACTED.
     local_functions = {s.name for s in symbols if s.kind == "Function"}
@@ -299,6 +441,113 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
     )
 
 
+# Nodes holding a class's base classes, per grammar (implements/interfaces are not bases:
+# interface methods are signatures, not the code that runs).
+_BASE_NODES = {"class_heritage", "extends_clause", "superclass", "base_clause", "base_class_clause"}
+
+
+def _union_members(language: str, node: Any | None, content: bytes) -> list[str]:
+    """Members of a union type expression (Union[A, B], A | B), else []."""
+    if node is None:
+        return []
+    is_union = (
+        (language == "python" and node.type == "subscript"
+         and _node_text(node.child_by_field_name("value"), content) in {"Union", "typing.Union"})
+        or (language == "python" and node.type == "binary_operator" and "|" in _node_text(node, content))
+        or (language == "typescript" and node.type == "union_type")
+    )
+    if not is_union:
+        return []
+    names = _type_name(_node_text(node, content))
+    members = [m for m in names.split("|") if m] if names else []
+    return members if len(members) > 1 and all(m.rsplit(".", 1)[-1][:1].isupper() for m in members) else []
+
+
+def _base_classes(language: str, node: Any, content: bytes) -> list[str]:
+    """Base classes named in a class definition: Foo(Base), extends B, < B, : public B.
+    For a union type alias, its members (a call on it may run any of them)."""
+    found: list[str] = []
+    if language == "python" and node.type == "assignment":
+        return _union_members(language, node.child_by_field_name("right"), content)
+    if language == "typescript" and node.type == "type_alias_declaration":
+        return _union_members(language, node.child_by_field_name("value"), content)
+    if language == "python":
+        supers = node.child_by_field_name("superclasses")
+        for child in supers.named_children if supers is not None else []:
+            if child.type in {"identifier", "attribute"}:
+                found.append(_node_text(child, content))
+        return found
+    stack = [c for c in node.children if c.type in _BASE_NODES]
+    while stack:
+        current = stack.pop(0)
+        if current.type == "extends_clause" or current.type in _BASE_NODES:
+            for child in current.named_children:
+                if child.type in {"implements_clause", "class_interface_clause", "access_specifier"}:
+                    continue
+                if child.type in _BASE_NODES:
+                    stack.append(child)
+                elif child.type in {
+                    "identifier", "type_identifier", "constant", "name", "qualified_name",
+                    "scope_resolution", "member_expression", "qualified_identifier", "generic_type",
+                }:
+                    found.append(_node_text(child, content).split("<")[0].strip())
+    return [name for name in found if name]
+
+
+def _is_test_item(language: str, node: Any, name: str, content: bytes) -> bool:
+    """Rust inline tests: `#[cfg(test)] mod tests`, `#[test]`/`#[tokio::test]` functions."""
+    if language in {"javascript", "typescript"} and node.type == "call_expression":
+        return True  # a describe/it/test block (only those become definitions)
+    if language != "rust" or node.type not in {"mod_item", "function_item"}:
+        return False
+    if node.type == "mod_item" and name == "tests":
+        return True
+    sibling = node.prev_named_sibling
+    while sibling is not None and sibling.type == "attribute_item":
+        text = _node_text(sibling, content)
+        if "cfg(test)" in text or re.search(r"\btest\b", text):
+            return True
+        sibling = sibling.prev_named_sibling
+    return False
+
+
+_RUBY_BARE_CALL_PARENTS = {
+    "body_statement", "then", "else", "begin", "argument_list", "assignment", "binary", "return",
+    "parenthesized_statements", "if", "unless", "while", "until", "conditional", "array", "pair",
+    "interpolation", "do_block", "block_body", "ensure", "rescue",
+}
+
+
+def _ruby_bare_call(
+    node: Any, scope: tuple[_Frame, ...], locals_by_method: dict[str, set[str]], content: bytes
+) -> ParsedCall | None:
+    """Ruby calls a method without parentheses: `helper` alone is a call unless it is a local."""
+    method = next((f.qualname for f in reversed(scope) if f.kind == "Function"), None)
+    if method is None:
+        return None
+    known = locals_by_method.setdefault(method, set())
+    parent = node.parent
+    if node.type == "assignment":
+        left = node.child_by_field_name("left")
+        if left is not None and left.type == "identifier":
+            known.add(_node_text(left, content))
+        return None
+    if node.type in {"method_parameters", "block_parameters", "lambda_parameters"}:
+        for child in node.named_children:
+            name_node = child if child.type == "identifier" else child.child_by_field_name("name")
+            if name_node is not None:
+                known.add(_node_text(name_node, content))
+        return None
+    if node.type != "identifier" or parent is None or parent.type not in _RUBY_BARE_CALL_PARENTS:
+        return None
+    if parent.type == "assignment" and parent.child_by_field_name("left") == node:
+        return None
+    name = _node_text(node, content)
+    if name in known or not _NAME_PATTERN.match(name):
+        return None
+    return ParsedCall(method, name, _point_row(node.start_point) + 1, INFERRED, "")
+
+
 def _type_owner(scope: tuple[_Frame, ...], target: str) -> str:
     """`self.x`/`this.x`/`@x` belong to the enclosing class; other names to the innermost function."""
     wanted = "Class" if target.startswith(_SELF_PREFIXES) else "Function"
@@ -317,9 +566,9 @@ def _typed_receiver(receiver: str, scope: tuple[_Frame, ...], types: dict[str, d
     def lookup(key: str) -> str:
         key = _normal_target(key)
         for owner in owners:
-            kind = types.get(owner, {}).get(key)
-            if kind:
-                return kind
+            scope_types = types.get(owner, {})
+            if key in scope_types:
+                return scope_types[key]  # "" = shadowed by an untyped local: unknown
         return ""
 
     for _ in range(4):  # `g = db.select_graph()` where `db = FalkorDB()`: follow the chain
@@ -336,9 +585,17 @@ def _typed_receiver(receiver: str, scope: tuple[_Frame, ...], types: dict[str, d
                 return "<expr>"
             continue
         typed = lookup(receiver)
-        if not typed:
-            return receiver
-        receiver = typed
+        if typed:
+            receiver = typed
+            continue
+        # `state.evidence` where `state: AgentState`: the type, then the field chain
+        # ("AgentState#evidence"); the resolver reads the field types of the class.
+        parts = receiver.split(".")
+        for cut in range(len(parts) - 1, 0, -1):
+            typed = lookup(".".join(parts[:cut]))
+            if typed and "#" not in typed and "|" not in typed:
+                return f"{typed}#{'.'.join(parts[cut:])}"
+        return receiver
     return receiver
 
 
@@ -351,15 +608,31 @@ def _return_type(language: str, node: Any, content: bytes) -> str:
         value = field("value")
         return _return_type(language, value, content) if value is not None else ""
     if language in {"python", "javascript", "typescript", "rust", "php"}:
-        return _type_name(_node_text(field("return_type"), content))
+        return _type_name(_node_text(field("return_type"), content), returned=True)
     if language == "go":
         result = field("result")
         if result is None or result.type == "parameter_list":
             return ""
-        return _type_name(_node_text(result, content))
+        return _type_name(_node_text(result, content), returned=True)
     if language in {"java", "c", "cpp"}:
-        return _type_name(_node_text(field("type"), content))
+        return _type_name(_node_text(field("type"), content), returned=True)
     return ""
+
+
+def _with_attributes(symbols: list[ParsedSymbol], types: dict[str, dict[str, str]]) -> list[ParsedSymbol]:
+    """Record each class's typed fields so `obj.field.method()` can be resolved."""
+    out = []
+    for s in symbols:
+        if s.kind == "Class" and types.get(s.qualname):
+            fields = sorted(
+                f"{target.split('.', 1)[-1].lstrip('@')}={kind}"
+                for target, kind in types[s.qualname].items()
+                if kind and target.startswith(_SELF_PREFIXES) and target.count(".") <= 1 and "#" not in kind
+            )
+            if fields:
+                s = replace(s, attributes=";".join(fields))
+        out.append(s)
+    return out
 
 
 def _settle_qualifier_kinds(symbols: list[ParsedSymbol]) -> list[ParsedSymbol]:
@@ -494,17 +767,68 @@ def _python_definition(node: Any, content: bytes) -> _Definition | None:
         left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
         if left is not None and right is not None and left.type == "identifier" and right.type == "lambda":
             return _named("Function", node, content, field_name="left")
+        if left is not None and left.type == "identifier" and _union_members("python", right, content):
+            return _named("Class", node, content, field_name="left")  # Backend = Union[A, B]: a type alias
     return None
+
+
+_JS_TEST_BLOCKS = {"describe", "it", "test", "context", "suite", "specify",
+                   "beforeEach", "afterEach", "beforeAll", "afterAll", "before", "after"}
+
+
+def _js_test_block(node: Any, content: bytes) -> _Definition | None:
+    """`it("does x", () => {...})` and friends: a test symbol named after its label,
+    so the calls inside the callback count as test callers."""
+    function = node.child_by_field_name("function")
+    if function is None:
+        return None
+    base = ""
+    if function.type == "identifier":
+        base = _node_text(function, content)
+    elif function.type == "member_expression":  # test.only(...), it.skip(...), test.describe(...)
+        obj = _node_text(function.child_by_field_name("object"), content)
+        prop = _node_text(function.child_by_field_name("property"), content)
+        base = prop if prop in {"describe", "step"} else obj
+    if base not in _JS_TEST_BLOCKS and base != "step":
+        return None
+    args = node.child_by_field_name("arguments")
+    values = args.named_children if args is not None else []
+    if not any(v.type in _JS_FUNCTION_VALUES for v in values):
+        return None
+    label = next((_node_text(v, content).strip("\"'`") for v in values if v.type in {"string", "template_string"}), "")
+    slug = re.sub(r"\W+", "_", label).strip("_")[:60]
+    return _Definition("Function", f"{base}_{slug}" if slug else base)
+
+
+def _is_default_export(node: Any) -> bool:
+    parent = node.parent
+    return parent is not None and parent.type == "export_statement" and any(c.type == "default" for c in parent.children)
 
 
 def _js_definition(node: Any, content: bytes) -> _Definition | None:
     kind = node.type
+    if kind == "call_expression":
+        return _js_test_block(node, content)
     if kind in {"function_declaration", "generator_function_declaration", "method_definition"}:
         return _named("Function", node, content)
+    if kind in _JS_FUNCTION_VALUES and node.child_by_field_name("name") is None and _is_default_export(node):
+        return _Definition("Function", "default")  # export default function () {}
+    if kind == "assignment_expression":
+        return _js_exports_assignment(node, content)
     if kind in {"class_declaration", "abstract_class_declaration", "class", "interface_declaration", "enum_declaration"}:
-        return _named("Class", node, content)
+        named = _named("Class", node, content)
+        if named is not None or node.child_by_field_name("name") is not None:
+            return named
+        if _is_default_export(node):
+            return _Definition("Class", "default")  # export default class {}
+        if node.parent is not None and node.parent.type == "variable_declarator":
+            return None  # `const K = class {}` is named by the declarator
+        # An anonymous class still scopes its methods (they are not top-level functions).
+        return _Definition("Class", f"anonymous_{_point_row(node.start_point) + 1}", emit=False)
     if kind in {"internal_module", "module"}:
         return _named("Namespace", node, content, emit=False)
+    if kind == "type_alias_declaration" and _union_members("typescript", node.child_by_field_name("value"), content):
+        return _named("Class", node, content)  # type AorB = A | B: a type alias
     value = node.child_by_field_name("value")
     if value is None:
         return None
@@ -514,6 +838,8 @@ def _js_definition(node: Any, content: bytes) -> _Definition | None:
             return None
         if value.type in _JS_FUNCTION_VALUES:
             return _named("Function", node, content)
+        if value.type == "class":
+            return _named("Class", node, content)  # const K = class { ... }
         if value.type == "object":
             return _named("Namespace", node, content, emit=False)
         return None
@@ -526,6 +852,21 @@ def _js_definition(node: Any, content: bytes) -> _Definition | None:
         return _named("Function", node, content, field_name="property")
     if kind == "public_field_definition":
         return _named("Function", node, content)
+    return None
+
+
+def _js_exports_assignment(node: Any, content: bytes) -> _Definition | None:
+    """CommonJS: `module.exports = function x() {}`, `exports.foo = function () {}`."""
+    left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+    if left is None or right is None or left.type != "member_expression" or right.type not in _JS_FUNCTION_VALUES:
+        return None
+    target = _node_text(left, content).replace(" ", "")
+    if target == "module.exports":
+        own = _node_text(right.child_by_field_name("name"), content)
+        return _Definition("Function", own or "default")
+    if target.startswith(("exports.", "module.exports.")):
+        name = target.rsplit(".", 1)[-1]
+        return _Definition("Function", name) if _NAME_PATTERN.match(name) else None
     return None
 
 
@@ -566,6 +907,8 @@ def _rust_definition(node: Any, content: bytes) -> _Definition | None:
         return _named("Class", node, content)
     if node.type == "impl_item":
         type_text = _node_text(node.child_by_field_name("type"), content)
+        # `impl<'a> Tr for &'a mut Foo<i32>`: the type is Foo.
+        type_text = re.sub(r"^&\s*(?:'\w+\s+)?(?:mut\s+)?(?:dyn\s+)?", "", type_text.strip())
         name = type_text.split("<")[0].split("::")[-1].strip()
         return _Definition("Class", name, emit=False) if _NAME_PATTERN.match(name) else None
     if node.type == "mod_item":
@@ -583,8 +926,12 @@ def _c_family_definition(node: Any, content: bytes, cpp: bool) -> _Definition | 
             scope_text = _node_text(name_node.child_by_field_name("scope"), content)
             qualifiers = tuple(part for part in scope_text.split("::") if part)
             name_node = _innermost_name(name_node)
+        if name_node is not None and name_node.type == "template_function":  # template<> int f<int>(...)
+            name_node = name_node.child_by_field_name("name")
         name = _node_text(name_node, content).strip()
-        if not _NAME_PATTERN.match(name):
+        if name_node is not None and name_node.type == "operator_name":
+            name = "".join(name.split())  # operator+, operator==
+        elif not _NAME_PATTERN.match(name):
             return None
         if qualifiers:
             return _Definition("Function", name, qualifiers=qualifiers, qualifier_kind=_UNKNOWN_QUALIFIER_KIND)
@@ -632,6 +979,8 @@ def _php_definition(node: Any, content: bytes) -> _Definition | None:
         return _named("Function", node, content) if node.child_by_field_name("body") is not None else None
     if node.type in {"class_declaration", "interface_declaration", "trait_declaration", "enum_declaration"}:
         return _named("Class", node, content)
+    if node.type == "anonymous_class":  # new class { ... }: its methods are not top-level functions
+        return _Definition("Class", f"anonymous_{_point_row(node.start_point) + 1}", emit=False)
     return None
 
 
@@ -654,8 +1003,15 @@ def _c_declarator_name(node: Any) -> Any | None:
     declarator = node.child_by_field_name("declarator")
     depth = 0
     while declarator is not None and depth < 10:
-        if declarator.type in {"identifier", "field_identifier", "destructor_name", "qualified_identifier"}:
+        if declarator.type in {
+            "identifier", "field_identifier", "destructor_name", "qualified_identifier",
+            "operator_name", "template_function",
+        }:
             return declarator
+        if declarator.type == "parenthesized_declarator":  # int (*f(void))(int): f returns a pointer
+            declarator = declarator.named_children[0] if declarator.named_children else None
+            depth += 1
+            continue
         declarator = declarator.child_by_field_name("declarator")
         depth += 1
     return None
@@ -716,9 +1072,13 @@ def _tree_sitter_call(language: str, node: Any, content: bytes) -> tuple[str, st
         return _with_receiver(method, receiver)
     if language == "php":
         if t == "function_call_expression":
-            return _bare(_node_text(field("function"), content).split("\\")[-1])
-        if t == "member_call_expression":
-            return _with_receiver(_node_text(field("name"), content), _receiver_text(language, field("object"), content))
+            function = field("function")
+            if function is None or function.type == "variable_name":
+                return None  # `$helper()` calls whatever the variable holds
+            return _bare(_node_text(function, content).split("\\")[-1])
+        if t == "member_call_expression":  # $this->log(), $obj->save(): drop PHP's `$` sigil
+            receiver = _receiver_text(language, field("object"), content)
+            return _with_receiver(_node_text(field("name"), content), receiver.lstrip("$").replace("->$", "->"))
         if t == "scoped_call_expression":
             return _with_receiver(_node_text(field("name"), content), _node_text(field("scope"), content))
         if t == "object_creation_expression":
@@ -780,12 +1140,10 @@ def _bare(name: str) -> tuple[str, str] | None:
 
 
 def _with_receiver(name: str, receiver: str) -> tuple[str, str] | None:
-    name = name.strip().lstrip("$&")
+    name = name.strip().lstrip("&")
     if not _NAME_PATTERN.match(name):
         return None
     receiver = " ".join(receiver.split())
-    if receiver.startswith("$"):
-        receiver = receiver[1:]  # PHP $this / $obj
     constructed = _CONSTRUCTED_RECEIVER.match(receiver)
     if constructed:
         receiver = constructed.group(1)  # `Db().save()` / `new Db().save()`: the receiver is a Db
@@ -804,15 +1162,23 @@ def _with_receiver(name: str, receiver: str) -> tuple[str, str] | None:
 # variable are recorded with the type as their receiver, so `db.select_graph()`
 # resolves to FalkorDB.select_graph instead of every method of that name.
 
-_TYPE_NAME = re.compile(r"^[A-Za-z_]\w*(?:(?:\.|::|\\)[A-Za-z_]\w*)*$")
+_TYPE_NAME = re.compile(r"^[^\W\d]\w*(?:(?:\.|::|\\)[^\W\d]\w*)*$")
 _SELF_PREFIXES = ("self.", "this.", "@")
 
 
-def _type_name(text: str) -> str:
+# Wrappers whose methods are the inner type's: Optional (a union with None), and
+# Rust smart pointers (auto-deref). Option/Result/Future have methods of their own.
+_TRANSPARENT_WRAPPERS = ("Optional[", "Box<", "Rc<", "Arc<")
+# Unwrapped only as a return type, where callers `await` the value.
+_AWAITED_WRAPPERS = ("Awaitable[", "Promise<")
+
+
+def _type_name(text: str, returned: bool = False) -> str:
     text = " ".join(text.split()).lstrip(":").strip().strip("\"'")
     for prefix in ("&mut ", "&", "*", "?", "mut "):
         text = text.removeprefix(prefix).strip()
-    for wrapper in ("Optional[", "Awaitable[", "Promise<", "Future<", "Box<", "Rc<", "Arc<", "Option<", "Result<"):
+    wrappers = _TRANSPARENT_WRAPPERS + (_AWAITED_WRAPPERS if returned else ())
+    for wrapper in wrappers:
         if text.startswith(wrapper) and text.endswith(("]", ">")):
             text = text[len(wrapper) : -1].split(",")[0].strip().strip("\"'")
     if "|" in text or text.startswith("Union["):
@@ -839,8 +1205,8 @@ def _constructed_type(language: str, node: Any | None, content: bytes) -> str:
     if language == "go":
         if t == "unary_expression":
             return _constructed_type(language, node.child_by_field_name("operand"), content)
-        if t == "composite_literal":
-            return _type_name(_node_text(node.child_by_field_name("type"), content))
+        if t == "composite_literal":  # Foo{} and generic Foo[int]{}
+            return _type_name(_node_text(node.child_by_field_name("type"), content).split("[")[0])
     if language == "rust":
         if t == "struct_expression":
             return _type_name(_node_text(node.child_by_field_name("name"), content))
@@ -887,7 +1253,15 @@ def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[s
 
     out: list[tuple[str, str]] = []
     if language == "python":
-        if t == "typed_parameter":
+        if t == "parameters":
+            for child in node.named_children:  # untyped parameters shadow outer names
+                if child.type == "identifier":
+                    out.append((text(child), ""))
+                elif child.type == "default_parameter":
+                    out.append((text(child.child_by_field_name("name")), ""))
+        elif t == "for_statement" and field("left") is not None and field("left").type == "identifier":
+            out.append((text(field("left")), ""))
+        elif t == "typed_parameter":
             names = [c for c in node.named_children if c.type == "identifier"]
             if names:
                 out.append((text(names[0]), _type_name(text(field("type")))))
@@ -899,7 +1273,13 @@ def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[s
                 declared = _type_name(text(field("type"))) if field("type") is not None else ""
                 out.append((text(left), declared or _assigned_type(language, field("right"), content)))
     elif language in {"javascript", "typescript"}:
-        if t in {"required_parameter", "optional_parameter"}:
+        if t == "formal_parameters":
+            out.extend((text(c), "") for c in node.named_children if c.type == "identifier")
+        elif t in {"for_in_statement"} and field("left") is not None:
+            left = field("left")
+            names = [left] if left.type == "identifier" else [c for c in left.named_children if c.type == "identifier"]
+            out.extend((text(n), "") for n in names)
+        elif t in {"required_parameter", "optional_parameter"}:
             pattern = field("pattern")
             if pattern is not None and pattern.type == "identifier":
                 out.append((text(pattern), _type_name(text(field("type")))))
@@ -913,7 +1293,9 @@ def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[s
         elif t == "public_field_definition" and field("type") is not None:
             out.append((f"this.{text(field('name'))}", _type_name(text(field("type")))))
     elif language == "java":
-        if t == "formal_parameter":
+        if t == "enhanced_for_statement":
+            out.append((text(field("name")), _type_name(text(field("type")))))
+        elif t == "formal_parameter":
             out.append((text(field("name")), _type_name(text(field("type")))))
         elif t in {"local_variable_declaration", "field_declaration"}:
             declared = _type_name(text(field("type")))
@@ -947,7 +1329,14 @@ def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[s
             out.append((text(field("left")), _assigned_type(language, field("right"), content)))
     elif language == "ruby" and t == "assignment":
         out.append((text(field("left")), _assigned_type(language, field("right"), content)))
-    return [(_normal_target(target), kind) for target, kind in out if target and kind]
+    # An empty type is kept for plain names: it shadows an outer variable of the same
+    # name (a parameter or loop variable is not the module-level `x = A()`). A
+    # self./this. attribute keeps whatever type another method gave it.
+    return [
+        (_normal_target(target), kind)
+        for target, kind in out
+        if target and (kind or not target.startswith(_SELF_PREFIXES))
+    ]
 
 
 # --- import bindings ----------------------------------------------------------

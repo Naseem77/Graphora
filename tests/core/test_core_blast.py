@@ -81,7 +81,7 @@ def test_blast_radius_for_diff(store):
     assert any(s.name == "compute" for s in radius.symbols)
     context = radius.to_context()
     assert "callers (2)" in context
-    assert "tests (1)" in context
+    assert "tests (direct) (1)" in context
 
 
 def test_context_is_compact(store):

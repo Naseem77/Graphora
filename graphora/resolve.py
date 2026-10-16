@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -63,8 +64,8 @@ _SELF_RECEIVERS = {
 # Languages where a bare call `f()` inside a method may call a sibling method.
 _IMPLICIT_SELF = {"java", "c", "ruby"}
 _CONSTRUCTOR_NAMES = ("__init__", "constructor", "initialize", "__construct")
-# Rules that pick candidates by name rather than by what the source names.
-_GUESSED = {"name", "receiver-unknown", "self-inherited", "class"}
+# Rules where the source itself names the target (an import, the same file, self).
+_EXPLICIT = {"import", "same-file", "self"}
 _JS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 _C_SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx")
 
@@ -84,6 +85,8 @@ class SymbolRecord:
     is_test: bool
     confidence: str = EXTRACTED
     returns: str = ""  # declared return type name
+    attributes: str = ""  # classes: "field=Type;..." for fields whose type is stated
+    bases: str = ""  # classes: comma-separated base classes as written
 
     @property
     def is_method(self) -> bool:
@@ -106,7 +109,7 @@ class FileRecord:
     path: str
     language: str
     is_test: bool
-    bindings: tuple[tuple[str, str, str], ...]  # (local, module, name)
+    bindings: tuple[tuple[str, str, str, str], ...]  # (local, module, name, scope)
     calls: tuple[CallSite, ...]
 
 
@@ -127,6 +130,50 @@ class Resolution:
     external: int = 0  # call sites through imports that leave the repository
     unmatched: int = 0  # call sites with no definition anywhere (stdlib, builtins, dynamic)
     too_ambiguous: int = 0  # call sites with more than MAX_CANDIDATES candidates
+
+
+_STDLIB = frozenset(getattr(sys, "stdlib_module_names", ()))
+# Methods of each language's built-in containers, strings, and promises/iterators.
+_BUILTIN_METHODS: dict[str, frozenset[str]] = {
+    "python": frozenset(
+        "get items keys values append extend pop popitem update setdefault copy clear insert remove index "
+        "count sort reverse add discard union intersection difference join split rsplit splitlines strip "
+        "lstrip rstrip replace format startswith endswith lower upper title encode decode read readline "
+        "readlines write close find rfind isdigit isalpha".split()
+    ),
+    "js": frozenset(
+        "push pop shift unshift map filter reduce forEach find findIndex some every includes indexOf slice "
+        "splice concat join split trim replace replaceAll toString toLowerCase toUpperCase startsWith "
+        "endsWith match then catch finally keys values entries get set has delete add clear json text "
+        "padStart padEnd at flat flatMap sort reverse fill".split()
+    ),
+    "java": frozenset(
+        "get put add addAll remove contains containsKey size isEmpty equals hashCode toString length append "
+        "stream map filter collect forEach iterator next hasNext close getClass valueOf charAt substring "
+        "trim split replace startsWith endsWith toLowerCase toUpperCase".split()
+    ),
+    "rust": frozenset(
+        "unwrap expect map clone to_string to_owned as_str iter iter_mut into_iter collect push len is_empty "
+        "get get_mut insert remove contains ok err unwrap_or unwrap_or_else and_then as_ref as_mut is_some "
+        "is_none trim split join format".split()
+    ),
+    "ruby": frozenset(
+        "each map select reject to_s to_i to_a to_h length size empty? nil? include? push join split strip "
+        "keys values first last".split()
+    ),
+    "go": frozenset("Error String Len".split()),
+    "c": frozenset("size push_back emplace_back begin end find insert erase clear empty at c_str".split()),
+    "php": frozenset(),
+}
+# CamelCase: a type, not a variable or an ALL_CAPS constant.
+_TYPE_LIKE = re.compile(r"^[A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*$")
+
+
+def _submodule(module: str, *parts: str) -> str:
+    """Join a module path and member names: "." + "mod" is ".mod", not "..mod"."""
+    if not parts:
+        return module
+    return module + ".".join(parts) if module.endswith(".") else ".".join([module, *parts])
 
 
 def symbol_key(path: str, kind: str, qualname: str, occurrence: int = 1) -> str:
@@ -153,9 +200,11 @@ def records_for(parsed: ParsedFile) -> tuple[list[SymbolRecord], FileRecord]:
                 signature=s.signature,
                 parent=s.parent,
                 parent_kind=s.parent_kind,
-                is_test=parsed.is_test,
+                is_test=parsed.is_test or s.is_test,
                 confidence=s.confidence,
                 returns=s.returns,
+                attributes=s.attributes,
+                bases=s.bases,
             )
         )
     functions_by_qualname: dict[str, list[SymbolRecord]] = defaultdict(list)
@@ -173,7 +222,7 @@ def records_for(parsed: ParsedFile) -> tuple[list[SymbolRecord], FileRecord]:
         path=parsed.path,
         language=parsed.language,
         is_test=parsed.is_test,
-        bindings=tuple((b.local, b.module, b.name) for b in parsed.bindings),
+        bindings=tuple((b.local, b.module, b.name, b.scope) for b in parsed.bindings),
         calls=tuple(calls),
     )
     return symbols, file_record
@@ -203,7 +252,30 @@ class _Resolver:
         self.dir_files: dict[str, list[str]] = defaultdict(list)
         for path in self.paths:
             self.dir_files[posixpath.dirname(path)].append(path)
+        # (directory, module path) of every go.mod: imports under it are local.
+        self.go_modules = sorted(
+            (
+                (posixpath.dirname(f.path), module)
+                for f in files
+                if f.language == "gomod"
+                for local, module, _, _ in f.bindings
+                if local == "<module>"
+            ),
+            key=lambda item: -len(item[1]),
+        )
+        # (directory, crate name) of every Cargo.toml.
+        self.rust_crates = sorted(
+            (
+                (posixpath.dirname(f.path), module)
+                for f in files
+                if f.language == "cargo"
+                for local, module, _, _ in f.bindings
+                if local == "<crate>"
+            ),
+            key=lambda item: -len(item[0]),
+        )
         self.result = Resolution()
+        self._top_level_cache: dict[tuple[tuple[str, ...], str], list[SymbolRecord]] = {}
 
     # --- driver -------------------------------------------------------------
 
@@ -211,7 +283,7 @@ class _Resolver:
         file_imports: set[tuple[str, str]] = set()
         for path in self.paths:
             record = self.files[path]
-            for _, module, _ in record.bindings:
+            for _, module, _, _ in record.bindings:
                 for imported in self._module_files(record, module):
                     if imported != path:
                         file_imports.add((path, imported))
@@ -221,8 +293,9 @@ class _Resolver:
                     continue
                 targets, confidence, reason = self._resolve_call(record, caller, call)
                 targets = [t for t in dict.fromkeys(targets) if t.key != caller.key]
-                if not caller.is_test and reason in _GUESSED and any(not t.is_test for t in targets):
-                    targets = [t for t in targets if not t.is_test]  # production code never calls test doubles
+                if not caller.is_test and reason not in _EXPLICIT:
+                    # Production code never calls into another file's test code unless it imports it.
+                    targets = [t for t in targets if not t.is_test or t.path == caller.path]
                 if not targets:
                     continue
                 if len(targets) > MAX_CANDIDATES:
@@ -261,13 +334,36 @@ class _Resolver:
             if found:
                 return found, EXTRACTED if len(found) == 1 else AMBIGUOUS, "union"
             receiver = "<expr>"
+        if "#" in receiver:  # `state.evidence.get()` with `state: AgentState`
+            owners = self._field_classes(record, caller, receiver)
+            found = [m for owner in owners for m in self._methods_of(owner.qualname, call.callee, owner.path)]
+            if found:
+                return found, EXTRACTED if len(owners) == 1 else AMBIGUOUS, "field"
+            receiver = "<expr>"
         if receiver.endswith("()"):
             owners = self._result_classes(record, caller, receiver, depth=0)
             found = [m for owner in owners for m in self._methods_of(owner.qualname, call.callee, owner.path)]
             if found:
                 return found, EXTRACTED if len(owners) == 1 else AMBIGUOUS, "returns"
             receiver = "<expr>"
-        return self._resolve_attribute(record, family, call.callee, receiver)
+        return self._resolve_attribute(record, family, caller, call.callee, receiver)
+
+    def _bindings_for(
+        self, record: FileRecord, caller: SymbolRecord, local_name: str
+    ) -> list[tuple[str, str, str, str]]:
+        """Bindings of `local_name` visible from `caller`. The innermost scope wins
+        (a function-local import shadows a module one); several bindings in that
+        scope (try/except fallbacks) are all returned."""
+        visible = [
+            b
+            for b in record.bindings
+            if b[0] == local_name
+            and (not b[3] or caller.qualname == b[3] or caller.qualname.startswith(b[3] + "."))
+        ]
+        if not visible:
+            return []
+        innermost = max(len(b[3]) for b in visible)
+        return [b for b in visible if len(b[3]) == innermost]
 
     def _result_classes(
         self, record: FileRecord, caller: SymbolRecord, receiver: str, depth: int
@@ -297,6 +393,24 @@ class _Resolver:
                 owners.update((c.key, c) for c in self._classes_named(target.returns, target.path))
         return list(owners.values())
 
+    def _field_classes(self, record: FileRecord, caller: SymbolRecord, receiver: str) -> list[SymbolRecord]:
+        """Classes of `Type#field.subfield` (or `make()#field`): follow each field's declared type."""
+        type_name, chain = receiver.split("#", 1)
+        if type_name.endswith("()"):
+            owners = self._result_classes(record, caller, type_name, depth=0)
+        else:
+            owners = self._classes_named(type_name, record.path)
+        for attribute in chain.split("."):
+            following: dict[str, SymbolRecord] = {}
+            for owner in owners:
+                fields = dict(item.split("=", 1) for item in owner.attributes.split(";") if "=" in item)
+                if attribute in fields:
+                    following.update((c.key, c) for c in self._classes_named(fields[attribute], owner.path))
+            owners = list(following.values())
+            if not owners:
+                return []
+        return owners
+
     def _classes_named(self, type_name: str, from_path: str) -> list[SymbolRecord]:
         """Resolve a type name as written in `from_path`: same file, its imports, then the repo."""
         simple = re.split(r"\.|::|\\", type_name)[-1]
@@ -305,7 +419,7 @@ class _Resolver:
             return local
         record = self.files.get(from_path)
         if record is not None:
-            for local_name, module, member in record.bindings:
+            for local_name, module, member, _ in record.bindings:
                 if local_name == simple:
                     files = self._module_files(record, module)
                     found = [s for s in self._top_level(files, member or simple) if s.kind == "Class"]
@@ -331,23 +445,43 @@ class _Resolver:
                 if found:
                     return found, EXTRACTED, "self"
 
-        for local_name, module, member in record.bindings:
-            if local_name != name:
-                continue
-            files = self._module_files(record, module)
-            if not files:
+        bindings = self._bindings_for(record, caller, name)
+        if bindings:
+            found_all: list[SymbolRecord] = []
+            in_repo = False
+            for _, module, member, _ in bindings:
+                files = self._module_files(record, module)
+                if not files:
+                    continue
+                in_repo = True
+                if member == "default":
+                    found = self._default_export(files)
+                else:
+                    found = self._top_level(files, member or name)
+                if not found and member:
+                    # `from pkg import mod` imports a submodule, not a member.
+                    found = self._top_level(self._module_files(record, _submodule(module, member)), name)
+                if not found and member:
+                    # Java `import static a.b.Util.trim`: a method of the class the module names.
+                    owner_name = re.split(r"\.|::|\\", module)[-1]
+                    found = [
+                        m
+                        for f in files
+                        for owner in self.by_file[f]
+                        if owner.kind == "Class" and owner.name == owner_name
+                        for m in self._methods_of(owner.qualname, member, owner.path)
+                    ]
+                found_all.extend(found)
+            if found_all:
+                # Several bindings in one scope (try/except fallbacks): each is possible.
+                return self._constructors(found_all), EXTRACTED, "import"
+            if not in_repo:
                 self.result.external += 1
                 return [], EXTRACTED, "external"
-            if member == "default":
-                found = self._default_export(files)
-            else:
-                found = self._top_level(files, member or name)
-            if not found and member:
-                # `from pkg import mod` imports a submodule, not a member.
-                found = self._top_level(self._module_files(record, f"{module}.{member}"), name)
-            if found:
-                return self._constructors(found), EXTRACTED, "import"
-            break  # imported from a repo module that re-exports it: fall back to names
+            # Imported from a repo module that does not define it (dynamic or broken
+            # re-export): a same-named function elsewhere is not what the import names.
+            self.result.unmatched += 1
+            return [], EXTRACTED, "unmatched"
 
         if family == "go":
             package = [
@@ -360,7 +494,10 @@ class _Resolver:
                 return self._constructors(package), EXTRACTED, "package"
 
         wildcard_files = [
-            f for local_name, module, _ in record.bindings if local_name == "*" for f in self._module_files(record, module)
+            f
+            for local_name, module, _, _ in record.bindings
+            if local_name == "*"
+            for f in self._module_files(record, module)
         ]
         if wildcard_files:
             found = self._top_level(wildcard_files, name)
@@ -377,19 +514,23 @@ class _Resolver:
         return self._constructors(candidates), INFERRED if len(candidates) == 1 else AMBIGUOUS, "name"
 
     def _resolve_attribute(
-        self, record: FileRecord, family: str, name: str, receiver: str
+        self, record: FileRecord, family: str, caller: SymbolRecord, name: str, receiver: str
     ) -> tuple[list[SymbolRecord], str, str]:
         separator = "::" if "::" in receiver else ("\\" if "\\" in receiver else ".")
         parts = receiver.split(separator)
 
         # Receiver is an imported module, or a member of one (a submodule or a class).
-        for local_name, module, member in record.bindings:
-            if local_name == "*" or not (local_name == receiver or (local_name == parts[0] and len(parts) > 1)):
+        receiver_bindings = self._bindings_for(record, caller, receiver) or (
+            self._bindings_for(record, caller, parts[0]) if len(parts) > 1 else []
+        )
+        bound_in_repo = False
+        for local_name, module, member, _ in receiver_bindings:
+            if local_name == "*":
                 continue
             rest = parts[1:] if local_name != receiver else []
             imported = member if member not in ("", "default", "*") else ""
             # `from pkg import util; util.x()` / `import a; a.b.x()`: a module path.
-            module_path = ".".join([module, *([imported] if imported else []), *rest])
+            module_path = _submodule(module, *([imported] if imported else []), *rest)
             files = self._module_files(record, module_path) if (imported or rest) else []
             if files:
                 found = self._top_level(files, name)
@@ -412,6 +553,7 @@ class _Resolver:
             found = [m for owner in owners for m in self._methods_of(owner.qualname, name, owner.path)]
             if found:
                 return found, EXTRACTED, "import"
+            bound_in_repo = True  # imported from a repo module: not a library type
             break
 
         # Receiver names a class: `Foo.create()`, `Foo::new()`.
@@ -432,8 +574,26 @@ class _Resolver:
         ]
         if members:
             same_file = [s for s in members if s.path == record.path]
-            members = same_file or members
-            return members, EXTRACTED if len(members) == 1 else AMBIGUOUS, "namespace"
+            if same_file:
+                members = same_file
+            elif family in {"python", "js"}:
+                # An object literal in another file is only visible through an import.
+                visible = {target for _, target in self._imports_of(record)}
+                members = [s for s in members if s.path in visible]
+            if members:
+                return members, EXTRACTED if len(members) == 1 else AMBIGUOUS, "namespace"
+
+        # A type name that is not defined anywhere in the repository (`String::new()`,
+        # `Math.max()`, `Path.home()`): a library type, so not your code.
+        if _TYPE_LIKE.match(class_name) and not classes and not bound_in_repo:
+            self.result.external += 1
+            return [], EXTRACTED, "external"
+
+        # `x.get()`, `items.append()` on an unknown receiver are almost always the
+        # language's own containers/strings, not repo methods that share the name.
+        if name in _BUILTIN_METHODS.get(family, ()):
+            self.result.external += 1
+            return [], AMBIGUOUS, "builtin-name"
 
         # Unknown receiver type: any method with that name could be meant,
         # including one outside the repository, so even one match is AMBIGUOUS.
@@ -465,18 +625,48 @@ class _Resolver:
         return ""
 
     def _methods_of(self, class_qualname: str, name: str, near_path: str) -> list[SymbolRecord]:
+        """Methods `name` of the class `class_qualname` defined in `near_path`.
+
+        Most languages define methods inside the class body, so a same-named class
+        in another file is a different class. Go (same package) and Rust (impl
+        blocks anywhere in the crate) define methods outside the type.
+        """
         found = self.methods.get((class_qualname, name), [])
         same_file = [m for m in found if m.path == near_path]
         if same_file:
             return same_file
-        if found:
-            return found
-        # Go/Rust methods live outside the type's body (other files, impl blocks).
-        simple = class_qualname.rsplit(".", 1)[-1]
+        inherited = self._inherited(class_qualname, name, near_path, depth=0)
+        if inherited:
+            return inherited
         family = self._family(near_path)
-        return [
-            m for m in self.by_name.get((family, name), []) if m.is_method and m.parent.rsplit(".", 1)[-1] == simple
-        ]
+        if family == "go":
+            package = posixpath.dirname(near_path)
+            simple = class_qualname.rsplit(".", 1)[-1]
+            return [
+                m
+                for m in self.by_name.get((family, name), [])
+                if m.is_method and m.parent.rsplit(".", 1)[-1] == simple and posixpath.dirname(m.path) == package
+            ]
+        if family == "rust":
+            simple = class_qualname.rsplit(".", 1)[-1]
+            return [
+                m for m in self.by_name.get((family, name), []) if m.is_method and m.parent.rsplit(".", 1)[-1] == simple
+            ]
+        return []
+
+    def _inherited(self, class_qualname: str, name: str, path: str, depth: int) -> list[SymbolRecord]:
+        """`name` defined on a base class (resolved as written in the class's file)."""
+        if depth > 6:
+            return []
+        owner = next((s for s in self.by_file[path] if s.kind == "Class" and s.qualname == class_qualname), None)
+        if owner is None or not owner.bases:
+            return []
+        found: list[SymbolRecord] = []
+        for base in owner.bases.split(","):
+            for base_class in self._classes_named(base, path):
+                direct = [m for m in self.methods.get((base_class.qualname, name), []) if m.path == base_class.path]
+                found.extend(direct or self._inherited(base_class.qualname, name, base_class.path, depth + 1))
+        return list(dict.fromkeys(found))
 
     def _constructors(self, targets: list[SymbolRecord]) -> list[SymbolRecord]:
         """Calling a class constructs it: link to its constructor when it has one."""
@@ -507,26 +697,48 @@ class _Resolver:
                 return hits[-1:]  # a later redefinition shadows an earlier one
         return []  # only nested in other functions: not visible from here
 
-    def _top_level(self, files: list[str], name: str, depth: int = 0) -> list[SymbolRecord]:
+    def _top_level(self, files: list[str], name: str) -> list[SymbolRecord]:
         """Top-level definitions of `name` in `files`, following re-exports
-        (`from .impl import name` in a package __init__, `export { name } from`)."""
-        found = [s for path in files for s in self.by_file[path] if s.name == name and s.parent_kind in ("", "Namespace")]
-        if found or depth >= 4:
-            return found
-        for path in files:
-            record = self.files.get(path)
-            if record is None:
-                continue
-            for local, module, member in record.bindings:
-                if local == "*" or (local == name and member not in ("", "*", "default")):
-                    original = name if local == "*" else member
-                    found.extend(self._top_level(self._module_files(record, module), original, depth + 1))
-        return list(dict.fromkeys(found))
+        (`from .impl import name` in a package __init__, `export { name } from`).
+
+        Breadth-first over (file, name) pairs, each visited once, and memoized:
+        star-import meshes (30 modules importing each other) stay linear.
+        """
+        key = (tuple(files), name)
+        cached = self._top_level_cache.get(key)
+        if cached is not None:
+            return cached
+        found: list[SymbolRecord] = []
+        frontier = [(path, name) for path in files]
+        seen: set[tuple[str, str]] = set()
+        for _ in range(5):  # re-export hops
+            next_frontier: list[tuple[str, str]] = []
+            for path, wanted in frontier:
+                if (path, wanted) in seen:
+                    continue
+                seen.add((path, wanted))
+                found.extend(
+                    s for s in self.by_file[path] if s.name == wanted and s.parent_kind in ("", "Namespace")
+                )
+            if found or not frontier:
+                break
+            for path, wanted in frontier:
+                record = self.files.get(path)
+                if record is None:
+                    continue
+                for local, module, member, _ in record.bindings:
+                    if local == "*" or (local == wanted and member not in ("", "*", "default")):
+                        original = wanted if local == "*" else member
+                        next_frontier.extend((target, original) for target in self._module_files(record, module))
+            frontier = [item for item in dict.fromkeys(next_frontier) if item not in seen]
+        result = list(dict.fromkeys(found))
+        self._top_level_cache[key] = result
+        return result
 
     def _default_export(self, files: list[str]) -> list[SymbolRecord]:
         found: list[SymbolRecord] = []
         for path in files:
-            names = [name for local, _, name in self.files[path].bindings if local == "default"]
+            names = [name for local, _, name, _ in self.files[path].bindings if local == "default"]
             found.extend(s for s in self.by_file[path] if s.name in names and s.parent_kind == "")
         return found
 
@@ -546,7 +758,7 @@ class _Resolver:
 
     def _imports_of(self, record: FileRecord) -> list[tuple[str, str]]:
         return [
-            (record.path, target) for _, module, _ in record.bindings for target in self._module_files(record, module)
+            (record.path, target) for _, module, _, _ in record.bindings for target in self._module_files(record, module)
         ]
 
     # --- module specifiers -> repository files ------------------------------
@@ -572,16 +784,21 @@ class _Resolver:
         falkordb/__init__.py, not falkordb/asyncio/falkordb.py; among matches
         only those with the fewest leading directories are kept.
         """
-        matches: list[tuple[int, str]] = []
-        for relative in relatives:
-            relative = relative.lstrip("/")
-            for p in self.paths:
-                if p == relative or p.endswith("/" + relative):
-                    matches.append((p[: len(p) - len(relative)].count("/"), p))
+        matches = [(prefix.count("/"), p) for prefix, p in self._suffix_candidates(*relatives)]
         if not matches:
             return []
         nearest = min(depth for depth, _ in matches)
         return list(dict.fromkeys(p for depth, p in matches if depth == nearest))
+
+    def _suffix_candidates(self, *relatives: str) -> list[tuple[str, str]]:
+        """(leading directories, path) for every file ending in one of `relatives`."""
+        out = []
+        for relative in relatives:
+            relative = relative.lstrip("/")
+            for p in self.paths:
+                if p == relative or p.endswith("/" + relative):
+                    out.append((p[: len(p) - len(relative)], p))
+        return out
 
     def _exact(self, *candidates: str) -> list[str]:
         return [c for c in dict.fromkeys(posixpath.normpath(c) for c in candidates) if c in self.files]
@@ -591,12 +808,26 @@ class _Resolver:
             dots = len(module) - len(module.lstrip("."))
             base = posixpath.dirname(path)
             for _ in range(dots - 1):
+                if not base:
+                    return []  # `from ....x import y` climbs above the repository
                 base = posixpath.dirname(base)
             rest = module[dots:].replace(".", "/")
             target = posixpath.join(base, rest) if rest else base
-            return self._exact(f"{target}.py", f"{target}/__init__.py") if rest else self._exact(f"{target}/__init__.py")
+            init = posixpath.join(target, "__init__.py") if target else "__init__.py"
+            return self._exact(f"{target}.py", init) if rest else self._exact(init)
         relative = module.replace(".", "/")
-        return self._suffix_match(f"{relative}.py", f"{relative}/__init__.py")
+        top = module.split(".")[0]
+        matches = []
+        for prefix, candidate in self._suffix_candidates(f"{relative}.py", f"{relative}/__init__.py"):
+            if prefix and f"{prefix}__init__.py" in self.files:
+                continue  # app/handlers/logging.py is app.handlers.logging, not `logging`
+            if prefix not in ("", "src/") and top in _STDLIB:
+                continue  # `import logging` is the standard library
+            matches.append((prefix.count("/"), candidate))
+        if not matches:
+            return []
+        nearest = min(depth for depth, _ in matches)
+        return [candidate for depth, candidate in matches if depth == nearest]
 
     def _js_module(self, path: str, module: str) -> list[str]:
         if module.startswith("."):
@@ -611,19 +842,28 @@ class _Resolver:
         return []  # a package from node_modules
 
     def _go_module(self, path: str, module: str) -> list[str]:
+        if self.go_modules:
+            # go.mod says which import paths are local; everything else is external.
+            for root, declared in self.go_modules:
+                if module == declared or module.startswith(declared + "/"):
+                    directory = posixpath.normpath(posixpath.join(root, module[len(declared) :].lstrip("/")))
+                    directory = "" if directory == "." else directory
+                    return [f for f in self.dir_files.get(directory, []) if f.endswith(".go")]
+            return []
         segments = module.strip("/").split("/")
         best: list[str] = []
         best_score = 0
-        for directory, files in self.dir_files.items():
+        for directory in self.dir_files:
             dir_segments = directory.split("/") if directory else []
             score = 0
             while score < min(len(segments), len(dir_segments)) and segments[-1 - score] == dir_segments[-1 - score]:
                 score += 1
-            if score and score > best_score:
+            if score > best_score:
                 best, best_score = [directory], score
             elif score and score == best_score:
                 best.append(directory)
-        if not best or (best_score == 1 and len(best) > 1):
+        # Without go.mod, one matching segment ("encoding/json" vs internal/json) is too weak.
+        if best_score < 2:
             return []
         return [f for directory in best for f in self.dir_files[directory] if f.endswith(".go")]
 
@@ -635,6 +875,8 @@ class _Resolver:
         return [p for p in self.paths if posixpath.dirname(p).endswith(relative) and p.endswith(".java")]
 
     def _rust_module(self, path: str, module: str) -> list[str]:
+        if self.rust_crates:
+            return self._rust_crate_module(path, module)
         parts = [p for p in module.split("::") if p not in ("crate", "self", "super", "")]
         if not parts:
             return [path]
@@ -644,6 +886,49 @@ class _Resolver:
             parent = "/".join(parts[:-1])
             found = self._suffix_match(f"{parent}.rs", f"{parent}/mod.rs")
         return found
+
+    def _rust_crate_module(self, path: str, module: str) -> list[str]:
+        """Resolve `crate::a::b`, `my_crate::a::b`, `self::`/`super::` against Cargo crates;
+        any other first segment (std, tokio, ...) is an external crate.
+
+        A module's file is `x.rs` or `x/mod.rs` (`lib.rs`/`main.rs` at the crate root),
+        and its child modules live in the directory `x/`.
+        """
+        parts = [p for p in module.split("::") if p]
+        if not parts:
+            return []
+        first, rest = parts[0], parts[1:]
+        name = posixpath.basename(path)
+        is_dir_module = name in {"mod.rs", "lib.rs", "main.rs"}
+        children = posixpath.dirname(path) if is_dir_module else posixpath.splitext(path)[0]
+        if first == "self":
+            base, base_file = children, [path]
+        elif first == "super":
+            parent = posixpath.dirname(posixpath.dirname(path)) if is_dir_module else posixpath.dirname(path)
+            base, base_file = parent, self._rust_module_file(parent)
+        else:
+            if first == "crate":
+                root = next((r for r, _ in self.rust_crates if not r or path.startswith(r + "/")), None)
+            else:
+                root = next((r for r, crate in self.rust_crates if crate == first), None)
+            if root is None:
+                return []  # external crate
+            base = posixpath.join(root, "src") if root else "src"
+            base_file = self._exact(posixpath.join(base, "lib.rs"), posixpath.join(base, "main.rs"))[:1]
+        for depth in range(len(rest), 0, -1):
+            relative = posixpath.join(base, *rest[:depth])
+            found = self._exact(f"{relative}.rs", f"{relative}/mod.rs")
+            if found:
+                return found
+        return base_file
+
+    def _rust_module_file(self, directory: str) -> list[str]:
+        """The file of the module whose children live in `directory`."""
+        if not directory:
+            return self._exact("lib.rs", "main.rs", "mod.rs")[:1]
+        return self._exact(
+            f"{directory}/mod.rs", f"{directory}.rs", f"{directory}/lib.rs", f"{directory}/main.rs"
+        )[:1]
 
     def _c_module(self, path: str, module: str) -> list[str]:
         local = self._exact(posixpath.join(posixpath.dirname(path), module))

@@ -120,12 +120,22 @@ def index_repository(
     """Parse every supported file under `root` and build the graph.
 
     Returns the GraphStore for further queries. Zero LLM calls.
+
+    Raises FileNotFoundError / NotADirectoryError for a bad `root`, and
+    ValueError when it holds no supported source files, before touching the
+    store: re-indexing replaces the whole graph, so a typo must not wipe it.
     """
     root = Path(root).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"{root} does not exist")
+    if not root.is_dir():
+        raise NotADirectoryError(f"{root} is not a directory")
+    files = collect_source_files(root, ignores, include_generated=include_generated)
+    if not files:
+        raise ValueError(f"{root} has no supported source files; the existing graph was left unchanged")
     project = project or root.name
     store = store or GraphStore(project, host=host, port=port)
 
-    files = collect_source_files(root, ignores, include_generated=include_generated)
     total = len(files)
     parsed_files = []
     for index, path in enumerate(files, start=1):

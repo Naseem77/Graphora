@@ -8,6 +8,7 @@ confidence it came from.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -44,7 +45,7 @@ class BlastRadius:
             lines.append(f"- defined at {impact.path}:{impact.line} `{impact.signature}`")
             lines.append(_relation_line("callers", impact.callers))
             lines.append(_relation_line("calls", impact.callees))
-            lines.append(_relation_line("tests", impact.tests))
+            lines.append(_relation_line("tests (direct)", impact.tests))
             if impact.importers:
                 lines.append(f"- imported by ({len(impact.importers)}): {', '.join(impact.importers)}")
         if self.unresolved:
@@ -79,12 +80,32 @@ def _relation_line(label: str, rows: list[tuple[str, str, str]]) -> str:
     return f"- {label} ({len(rows)}): {rendered}"
 
 
+_SELECTOR = re.compile(r"^(?P<path>.+\.[A-Za-z0-9]+):(?P<name>[^:].*)$")
+
+
+def select_symbols(store: GraphBackend, selector: str) -> list[dict]:
+    """Symbols matching a name, a qualified name, or `path:qualified.name`.
+
+    `Db.save` may match several files (sync/async twins); prefix the file,
+    `falkordb/asyncio/db.py:Db.save` (or any path suffix), to pick one.
+    `geo::total` is accepted for `geo.total`.
+    """
+    match = _SELECTOR.match(selector)
+    path = ""
+    if match:
+        path, selector = match.group("path").lstrip("./"), match.group("name")
+    records = store.find_symbols(selector.replace("::", "."))
+    if path:
+        records = [r for r in records if r["path"] == path or r["path"].endswith("/" + path)]
+    return records
+
+
 def blast_radius(store: GraphBackend, symbol_names: list[str]) -> BlastRadius:
-    """Compute the blast radius for symbol names (plain or qualified, e.g. "Db.save")."""
+    """Compute the blast radius for symbols (see select_symbols for the accepted forms)."""
     impacts: list[SymbolImpact] = []
     unresolved: list[str] = []
     for name in symbol_names:
-        records = store.find_symbols(name)
+        records = select_symbols(store, name)
         if not records:
             unresolved.append(name)
             continue

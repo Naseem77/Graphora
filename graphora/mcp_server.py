@@ -60,8 +60,10 @@ def build_server(project: str, host: str = "localhost", port: int = 6379, backen
 
     @mcp.tool()
     def what_could_break(symbols: list[str], depth: int = 2, as_json: bool = False) -> str:
-        """What could break if these symbols change. Accepts names or
-        qualified names (e.g. "save" or "Db.save"). Walks callers up to
+        """What could break if these symbols change. Accepts names,
+        qualified names, or file-qualified names to pick one of several
+        same-named definitions (e.g. "save", "Db.save",
+        "app/db.py:Db.save"). Walks callers up to
         `depth` hops and returns: callers that WILL break (every call on the
         path is certain), callers that MIGHT break (some call is ambiguous;
         each lists the alternatives it could mean: "X or Y", possibly a
