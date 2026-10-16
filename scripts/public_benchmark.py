@@ -2,7 +2,8 @@
 """Public reproducible benchmark: Graphora vs baselines on pinned OSS repos.
 
 Clones each repository at an exact commit, indexes it with the embedded
-backend (no server needed), runs the deterministic token-cost benchmark,
+backend (no server needed), runs the deterministic benchmark (definition
+coverage against Python's ast, call-edge certainty, context size),
 and prints one summary table. Anyone can re-run this and get identical
 numbers.
 
@@ -54,9 +55,15 @@ def bench_one(repo_dir: Path, data_dir: Path) -> dict:
     index_repository(repo_dir, project=project, store=store)
     symbols = pick_symbols(store, count=3)
     result = run_benchmark(store, repo_dir, symbols=symbols)
+    calls = sum(result.call_confidence.values()) or 1
     return {
         "repo": repo_dir.name,
         "files": result.file_count,
+        "definitions": f"{result.python_definitions_found}/{result.python_definitions}",
+        "coverage": round(result.definition_coverage, 1),
+        "certain_calls": round(
+            100 * (result.call_confidence.get("EXTRACTED", 0) + result.call_confidence.get("INFERRED", 0)) / calls, 1
+        ),
         "symbols": symbols,
         "repo_tokens": result.repo_tokens,
         "relevant_tokens": result.changed_files_tokens,
@@ -75,13 +82,15 @@ def render(rows: list[dict], shas: dict[str, str]) -> str:
         "Embedded backend (no server), fixed 4 chars/token heuristic, symbols",
         "auto-picked deterministically (most-connected non-test functions).",
         "",
-        "| Repository | Commit | Files | Whole repo | Relevant files | Blast radius | Savings vs repo | vs relevant |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Repository | Commit | Files | Definitions found (vs ast) | Certain call edges "
+        "| Whole repo | Relevant files | Blast radius | Savings vs repo | vs relevant |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for r in rows:
         sha = shas.get(r["repo"], "HEAD")[:10]
         lines.append(
-            f"| {r['repo']} | `{sha}` | {r['files']} | {r['repo_tokens']:,} | {r['relevant_tokens']:,} "
+            f"| {r['repo']} | `{sha}` | {r['files']} | {r['definitions']} ({r['coverage']}%) | {r['certain_calls']}% "
+            f"| {r['repo_tokens']:,} | {r['relevant_tokens']:,} "
             f"| **{r['blast_tokens']:,}** | **{r['saving_vs_repo']}%** | {r['saving_vs_relevant']}% |"
         )
     lines += ["", "Symbols queried per repo:", ""]

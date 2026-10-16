@@ -78,3 +78,12 @@ def test_benchmark_render_contains_table(store, repo: Path):
     assert "| Context strategy | Prompt tokens |" in text
     assert "Whole-repo dump" in text
     assert "reproducible" in text
+
+
+def test_benchmark_reports_accuracy(store, repo: Path):
+    result = run_benchmark(store, repo, symbols=["hub"])
+    assert result.python_definitions > 0
+    assert result.definition_coverage == 100.0
+    assert sum(result.call_confidence.values()) == store.stats()["calls"]
+    text = result.render()
+    assert "## Accuracy" in text and "checked against Python's own `ast`" in text

@@ -315,6 +315,10 @@ class GraphStore:
         rows = self.query("MATCH (a:File)-[:IMPORTS_FILE]->(:File {path: $path}) RETURN DISTINCT a.path", {"path": path})
         return sorted(r[0] for r in rows)
 
+    def call_confidence_counts(self) -> dict[str, int]:
+        rows = self.query("MATCH ()-[r:CALLS]->() RETURN r.confidence, count(r)")
+        return {str(confidence): int(count) for confidence, count in rows}
+
     def top_connected_symbols(self, count: int = 3) -> list[str]:
         rows = self.query(
             """

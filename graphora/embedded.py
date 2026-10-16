@@ -259,6 +259,12 @@ class EmbeddedGraphStore:
     def file_importers(self, path: str) -> list[str]:
         return sorted({a for a, b in self._data["file_imports"] if b == path})
 
+    def call_confidence_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for edge in self._data["calls"]:
+            counts[edge["confidence"]] = counts.get(edge["confidence"], 0) + 1
+        return counts
+
     def top_connected_symbols(self, count: int = 3) -> list[str]:
         degree: dict[str, int] = {}
         for edge in self._data["calls"]:

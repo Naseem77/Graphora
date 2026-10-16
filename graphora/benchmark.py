@@ -1,8 +1,15 @@
-"""Reproducible token-cost benchmark. Deterministic, zero LLM, zero network.
+"""Reproducible benchmark. Deterministic, zero LLM, zero network.
 
-For a set of query symbols (auto-picked highest-connectivity functions by
-default), compares the prompt context an AI reviewer would need under three
-strategies:
+Accuracy first:
+
+- definition coverage: every def/class Python's own `ast` module finds in
+  the repository's .py files must be a node in the graph (by qualified name);
+- call-edge certainty: how many CALLS edges the source states explicitly
+  (EXTRACTED), match a unique name (INFERRED), or stay ambiguous.
+
+Then context size. For a set of query symbols (auto-picked
+highest-connectivity functions by default), compares the prompt context an
+AI reviewer would need under three strategies:
 
 1. whole-repo dump (the context-stuffing anti-pattern)
 2. equivalent-information file set: the changed files plus every file
@@ -16,7 +23,8 @@ reproducible on any machine with no tokenizer dependency.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import ast
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from graphora.blast import blast_radius
@@ -34,6 +42,15 @@ class BenchmarkResult:
     changed_files_tokens: int
     blast_tokens: int
     grounded_facts: dict[str, int]
+    python_definitions: int = 0  # def/class nodes Python's ast finds
+    python_definitions_found: int = 0  # of those, present in the graph
+    call_confidence: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def definition_coverage(self) -> float:
+        if not self.python_definitions:
+            return 100.0
+        return 100.0 * self.python_definitions_found / self.python_definitions
 
     @property
     def saving_vs_repo(self) -> float:
@@ -49,10 +66,19 @@ class BenchmarkResult:
 
     def render(self) -> str:
         lines = [
-            "# Graphora token-cost benchmark",
+            "# Graphora benchmark",
             "",
             f"Project: `{self.project}` ({self.file_count} indexed source files)",
             f"Query symbols: {', '.join(f'`{s}`' for s in self.symbols)}",
+            "",
+            "## Accuracy",
+            "",
+            f"- Definitions in the graph: **{self.python_definitions_found:,}/{self.python_definitions:,}**"
+            f" Python functions, methods, and classes ({self.definition_coverage:.1f}%), checked against"
+            " Python's own `ast` parser.",
+            f"- Call edges: {_confidence_line(self.call_confidence)}",
+            "",
+            "## Context size",
             "",
             "| Context strategy | Prompt tokens | Relative |",
             "| --- | ---: | ---: |",
@@ -122,6 +148,7 @@ def run_benchmark(
         "tests": sum(len(i.tests) for i in radius.symbols),
     }
 
+    total, found = _python_definition_coverage(store, contents)
     return BenchmarkResult(
         project=store.project,
         symbols=symbols,
@@ -130,4 +157,45 @@ def run_benchmark(
         changed_files_tokens=changed_files_tokens,
         blast_tokens=blast_tokens,
         grounded_facts=grounded,
+        python_definitions=total,
+        python_definitions_found=found,
+        call_confidence=store.call_confidence_counts(),
     )
+
+
+def _python_definition_coverage(store: GraphStore, contents: dict[str, str]) -> tuple[int, int]:
+    """(definitions Python's ast finds, how many of them the graph has), by qualified name."""
+    total = found = 0
+    for path, text in sorted(contents.items()):
+        if not path.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            continue
+        truth: set[str] = set()
+        _collect_definitions(tree, "", truth)
+        graph = {s["qualname"] for s in store.symbols_in_file(path)}
+        total += len(truth)
+        found += len(truth & graph)
+    return total, found
+
+
+def _collect_definitions(node: ast.AST, prefix: str, out: set[str]) -> None:
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            qualname = prefix + child.name
+            out.add(qualname)
+            _collect_definitions(child, qualname + ".", out)
+        else:
+            _collect_definitions(child, prefix, out)
+
+
+def _confidence_line(counts: dict[str, int]) -> str:
+    total = sum(counts.values()) or 1
+    parts = [
+        f"{counts.get('EXTRACTED', 0):,} EXTRACTED ({100 * counts.get('EXTRACTED', 0) / total:.0f}%, the source names the target)",
+        f"{counts.get('INFERRED', 0):,} INFERRED ({100 * counts.get('INFERRED', 0) / total:.0f}%, unique name)",
+        f"{counts.get('AMBIGUOUS', 0):,} AMBIGUOUS ({100 * counts.get('AMBIGUOUS', 0) / total:.0f}%, shown as 'X or Y')",
+    ]
+    return ", ".join(parts)
