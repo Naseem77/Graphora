@@ -46,7 +46,9 @@ def cmd_index(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     project = args.project or root.name
     store = open_store(project, backend=args.backend, host=args.host, port=args.port)
-    index_repository(root, project=project, store=store, on_progress=progress)
+    index_repository(
+        root, project=project, store=store, on_progress=progress, include_generated=args.include_generated
+    )
     sys.stderr.write("\n")
     print(json.dumps({"project": project, "graph": store.graph_name, "backend": store.backend, **store.stats()}, indent=2))
     return 0
@@ -215,6 +217,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_index = sub.add_parser("index", parents=[common], help="Index a repository into the graph (no LLM)")
     p_index.add_argument("path")
+    p_index.add_argument(
+        "--include-generated",
+        action="store_true",
+        help="Also index generated files (ANTLR/protobuf output, '@generated', minified JS)",
+    )
     p_index.set_defaults(func=cmd_index)
 
     p_stats = sub.add_parser("stats", parents=[common], help="Show graph stats")
