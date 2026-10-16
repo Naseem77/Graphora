@@ -42,6 +42,8 @@ class GraphStore:
 
     def __init__(self, project: str, host: str = "localhost", port: int = 6379, graph: Any | None = None):
         self.project = project
+        self.host, self.port = host, port
+        self._db: Any | None = None
         if graph is not None:
             self._graph = graph
         else:
@@ -49,7 +51,8 @@ class GraphStore:
                 from falkordb import FalkorDB
             except ImportError as exc:  # pragma: no cover
                 raise RuntimeError("The 'falkordb' package is required: pip install falkordb") from exc
-            self._graph = FalkorDB(host=host, port=port).select_graph(self.graph_name)
+            self._db = FalkorDB(host=host, port=port)
+            self._graph = self._db.select_graph(self.graph_name)
         self._indexed = False
 
     @property
@@ -253,7 +256,15 @@ class GraphStore:
         counts["edges"] = int(rows[0][0]) if rows else 0
         return counts
 
+    def exists(self) -> bool:
+        """Whether the graph exists, checked without querying it (a query creates it)."""
+        if self._db is None:
+            return True
+        return self.graph_name in self._db.list_graphs()
+
     def has_files(self) -> bool:
+        if not self.exists():
+            return False
         rows = self.query("MATCH (f:File) RETURN count(f)")
         return bool(rows and int(rows[0][0]) > 0)
 

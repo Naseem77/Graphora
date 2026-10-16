@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,17 +24,30 @@ from graphora import __version__
 from graphora.store import open_store
 
 
+class CliError(Exception):
+    """A user-facing error: printed as one line, exit code 1."""
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def _store(args: argparse.Namespace):
-    """Open the project graph for a read command, warning if nothing is indexed."""
+    """Open the project graph for a read command; an empty graph is an error."""
     store = open_store(args.project, backend=args.backend, host=args.host, port=args.port)
-    if not store.has_files():
-        print(
-            f"graphora: warning: graph {store.graph_name!r} ({store.backend}) is empty. "
-            f"Run 'graphora index <repo-path>' first, or pass --project "
-            f"(it defaults to the current directory name).",
-            file=sys.stderr,
-        )
+    _require_files(store)
     return store
+
+
+def _require_files(store) -> None:
+    if not store.has_files():
+        raise CliError(
+            f"graph {store.graph_name!r} ({store.backend}) is empty. Run 'graphora index <repo-path>' "
+            f"first, or pass --project (it defaults to the current directory name)."
+        )
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -51,8 +65,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             root, project=project, store=store, on_progress=progress, include_generated=args.include_generated
         )
     except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
-        print(f"graphora: error: {exc}", file=sys.stderr)
-        return 1
+        raise CliError(str(exc)) from exc
     sys.stderr.write("\n")
     print(json.dumps({"project": project, "graph": store.graph_name, "backend": store.backend, **store.stats()}, indent=2))
     return 0
@@ -68,18 +81,25 @@ def cmd_blast(args: argparse.Namespace) -> int:
 
     radius = blast_radius(_store(args), args.symbols)
     print(json.dumps(radius.to_dict(), indent=2) if args.json else radius.to_context())
-    return 0
+    return 0 if radius.symbols else 1
 
 
 def _read_diff(args: argparse.Namespace, allow_stdin: bool = True) -> str:
     if args.diff:
-        return Path(args.diff).read_text()
+        try:
+            return Path(args.diff).read_text()
+        except OSError as exc:
+            raise CliError(f"cannot read diff file {args.diff}: {exc.strerror or exc}") from exc
     if args.git_range:
         repo = Path(args.repo or ".").resolve()
-        return subprocess.run(
-            ["git", "--no-pager", "diff", args.git_range],
-            cwd=repo, capture_output=True, text=True, check=True,
-        ).stdout
+        try:
+            return subprocess.run(
+                ["git", "--no-pager", "diff", args.git_range],
+                cwd=repo, capture_output=True, text=True, check=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = (getattr(exc, "stderr", "") or str(exc)).strip().splitlines()
+            raise CliError(f"git diff {args.git_range} failed in {repo}: {detail[0] if detail else exc}") from exc
     return sys.stdin.read() if allow_stdin else ""
 
 
@@ -89,6 +109,9 @@ def cmd_breaks(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.symbols:
         result = what_could_break(store, args.symbols, depth=args.depth)
+        if not result.targets:
+            print(result.to_text())
+            return 1
     else:
         diff = _read_diff(args)
         if not diff.strip():
@@ -117,6 +140,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     project = args.project or root.name
     store = open_store(project, backend=args.backend, host=args.host, port=args.port)
+    _require_files(store)
     symbols = [s for s in (args.symbols or "").split(",") if s] or None
     result = run_benchmark(store, root, symbols=symbols)
     print(result.render())
@@ -138,6 +162,8 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
     if args.list:
         print("\n".join(list_agents()))
         return 0
+    if not Path(args.repo).is_dir():
+        raise CliError(f"repository {args.repo} does not exist")
     agents = None if not args.agents or args.agents == ["all"] else args.agents
     kinds = ["code", "sessions"] if args.skill == "all" else [args.skill]
     try:
@@ -222,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
         "breaks", parents=[common], help="What could break if you change these symbols (or this diff)"
     )
     p_breaks.add_argument("symbols", nargs="*", help="Names or qualified names (Class.method); omit to read a diff")
-    p_breaks.add_argument("--depth", type=int, default=2, help="Caller hops to follow (default: 2)")
+    p_breaks.add_argument("--depth", type=_positive_int, default=2, help="Caller hops to follow (default: 2)")
     p_breaks.add_argument("--diff", help="Path to a unified diff file")
     p_breaks.add_argument("--git-range", help="Git range, e.g. main...HEAD")
     p_breaks.add_argument("--repo", help="Repo path for --git-range (default: cwd)")
@@ -286,7 +312,33 @@ def main(argv: list[str] | None = None) -> int:
             args.project = "agent-sessions"
         else:
             args.project = Path.cwd().name
-    return args.func(args)
+    try:
+        return args.func(args)
+    except CliError as exc:
+        print(f"graphora: error: {exc}", file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        # Output piped into `head` & co.: stop quietly, like other CLI tools.
+        try:
+            sys.stdout = open(os.devnull, "w")  # noqa: SIM115 - keep interpreter shutdown from re-raising
+        except OSError:
+            pass
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        if _is_connection_error(exc):
+            print(
+                f"graphora: error: cannot reach FalkorDB at {args.host}:{args.port} ({exc}). "
+                "Start it, or use --backend embedded.",
+                file=sys.stderr,
+            )
+            return 1
+        raise
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    return isinstance(exc, ConnectionError) or (
+        type(exc).__module__.startswith("redis") and "Connection" in type(exc).__name__
+    )
 
 
 if __name__ == "__main__":

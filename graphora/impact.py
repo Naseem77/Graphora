@@ -88,7 +88,9 @@ class WhatCouldBreak:
 
     def to_text(self) -> str:
         if not self.targets:
-            missing = ", ".join(f"`{n}`" for n in self.unresolved) or "nothing"
+            if not self.unresolved:
+                return "The diff touches no function, method, or class in the code graph."
+            missing = ", ".join(f"`{n}`" for n in self.unresolved)
             return f"No definition found for {missing} in the code graph."
         lines = [f"What could break if you change {_target_list(self.targets)}"]
         names = [t["name"] for t in self.targets]
