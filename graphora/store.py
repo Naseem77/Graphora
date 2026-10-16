@@ -303,7 +303,7 @@ class GraphStore:
     def _write_symbols(self, parsed: ParsedFile) -> None:
         for symbol in parsed.symbols:
             label = "Function" if symbol.kind == "Function" else "Class"
-            stable_key = f"{parsed.path}:{symbol.kind}:{symbol.name}"
+            stable_key = f"{parsed.path}:{symbol.kind}:{symbol.qualname}"
             self.query(
                 f"""
                 MATCH (f:File {{path: $path}})
@@ -332,7 +332,7 @@ class GraphStore:
             )
 
     def _write_local_calls(self, parsed: ParsedFile) -> None:
-        local_functions = {s.name for s in parsed.symbols if s.kind == "Function"}
+        local_functions = {s.name: s.qualname for s in parsed.symbols if s.kind == "Function"}
         pending: dict[str, list[str]] = {}
         for call in parsed.calls:
             if call.callee in local_functions:
@@ -344,7 +344,7 @@ class GraphStore:
                     """,
                     {
                         "a": f"{parsed.path}:Function:{call.caller}",
-                        "b": f"{parsed.path}:Function:{call.callee}",
+                        "b": f"{parsed.path}:Function:{local_functions[call.callee]}",
                         "line": call.line,
                         "confidence": call.confidence,
                     },

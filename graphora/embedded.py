@@ -84,7 +84,7 @@ class EmbeddedGraphStore:
                 )
             for symbol in parsed.symbols:
                 kind = "Function" if symbol.kind == "Function" else "Class"
-                key = f"{parsed.path}:{kind}:{symbol.name}"
+                key = f"{parsed.path}:{kind}:{symbol.qualname}"
                 self._data["symbols"][key] = {
                     "name": symbol.name,
                     "kind": kind,
@@ -95,11 +95,12 @@ class EmbeddedGraphStore:
                     "is_test": parsed.is_test,
                     "pending_calls": [],
                 }
-            local_functions = {s.name for s in parsed.symbols if s.kind == "Function"}
+            local_functions = {s.name: s.qualname for s in parsed.symbols if s.kind == "Function"}
             for call in parsed.calls:
                 caller_key = f"{parsed.path}:Function:{call.caller}"
                 if call.callee in local_functions:
-                    self._merge_call(caller_key, f"{parsed.path}:Function:{call.callee}", call.line, call.confidence)
+                    callee_key = f"{parsed.path}:Function:{local_functions[call.callee]}"
+                    self._merge_call(caller_key, callee_key, call.line, call.confidence)
                 elif caller_key in self._data["symbols"]:
                     self._data["symbols"][caller_key]["pending_calls"].append(f"{call.callee}@{call.line}")
         if save:
@@ -250,14 +251,14 @@ class EmbeddedGraphStore:
         return self._call_neighbors(name, path, direction="in", tests=True)
 
     def _call_neighbors(self, name: str, path: str, direction: str, tests: bool | None = None):
-        key = f"{path}:Function:{name}"
+        keys = {k for k, s in self._data["symbols"].items() if s["path"] == path and s["name"] == name}
         seen: set[tuple[str, str, str]] = set()
         out: list[tuple[str, str, str]] = []
         for edge in self._data["calls"]:
             other_key = None
-            if direction == "in" and edge["b"] == key:
+            if direction == "in" and edge["b"] in keys:
                 other_key = edge["a"]
-            elif direction == "out" and edge["a"] == key:
+            elif direction == "out" and edge["a"] in keys:
                 other_key = edge["b"]
             if other_key is None:
                 continue

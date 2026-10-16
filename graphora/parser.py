@@ -9,10 +9,10 @@ uncertain (AMBIGUOUS).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 try:
     from tree_sitter import Language, Parser
@@ -44,20 +44,49 @@ class ParsedSymbol:
     line: int
     signature: str
     confidence: str = EXTRACTED
+    qualname: str = ""  # dotted path through enclosing scopes, e.g. "Widget.render"
+    end_line: int = 0
+    parent: str = ""  # qualified name of the enclosing scope ("" at top level)
+    parent_kind: str = ""  # "Class", "Function", "Namespace", or ""
+
+    def __post_init__(self) -> None:
+        if not self.qualname:
+            object.__setattr__(self, "qualname", self.name)
+        if not self.end_line:
+            object.__setattr__(self, "end_line", self.line)
+
+    @property
+    def is_method(self) -> bool:
+        return self.kind == "Function" and self.parent_kind == "Class"
 
 
 @dataclass(frozen=True)
 class ParsedCall:
-    caller: str
-    callee: str
+    caller: str  # qualified name of the calling function
+    callee: str  # called name, without its receiver
     line: int
     confidence: str = INFERRED
+    receiver: str = ""  # "" for a bare call; otherwise the text before the name ("self", "os.path")
 
 
 @dataclass(frozen=True)
 class ParsedImport:
     name: str
     confidence: str = EXTRACTED
+
+
+@dataclass(frozen=True)
+class ParsedBinding:
+    """A name an import makes visible in a file.
+
+    `local` is the name used in the file, `module` the module or path as
+    written, and `name` the imported member: "" when `local` is the module
+    itself, "*" for a wildcard import or #include.
+    """
+
+    local: str
+    module: str
+    name: str = ""
 
 
 @dataclass(frozen=True)
@@ -70,6 +99,7 @@ class ParsedFile:
     source_text: str
     is_test: bool = False
     parser_used: str = "tree-sitter"
+    bindings: list[ParsedBinding] = field(default_factory=list)
 
 
 def is_supported_code_file(path: str) -> bool:
@@ -140,9 +170,30 @@ def extract_files_from_diff(diff: str) -> list[str]:
 
 # --- tree-sitter path -------------------------------------------------------
 
+# Values that make a variable, property, or class field a function definition.
+_JS_FUNCTION_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
+_NAME_PATTERN = re.compile(r"^~?[A-Za-z_][\w$]*[?!=]?$")
+_UNKNOWN_QUALIFIER_KIND = "?"
+
+
+@dataclass(frozen=True)
+class _Definition:
+    kind: str  # "Function", "Class", or "Namespace"
+    name: str
+    emit: bool = True  # False: opens a scope without being a symbol (impl blocks, namespaces)
+    qualifiers: tuple[str, ...] = ()  # scope named in the definition itself (C++ A::f, Go receivers)
+    qualifier_kind: str = ""
+
+
+@dataclass(frozen=True)
+class _Frame:
+    qualname: str
+    kind: str
+
 
 def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFile | None:
-    parser = _tree_sitter_parser(language)
+    grammar = "tsx" if path.lower().endswith(".tsx") else language
+    parser = _tree_sitter_parser(grammar)
     if parser is None:
         return None
 
@@ -150,31 +201,61 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
     root = parser.parse(content_bytes).root_node
     symbols: list[ParsedSymbol] = []
     imports: list[ParsedImport] = []
+    bindings: list[ParsedBinding] = []
     calls: list[ParsedCall] = []
-    function_ranges: list[tuple[str, int, int]] = []
 
-    for node in _walk_nodes(root):
+    # Iterative pre-order walk carrying the enclosing scopes (deep trees overflow recursion).
+    stack: list[tuple[Any, tuple[_Frame, ...]]] = [(root, ())]
+    while stack:
+        node, scope = stack.pop()
+        child_scope = scope
+
         imported = _tree_sitter_import(language, node, content_bytes)
         if imported:
             imports.append(ParsedImport(name=imported, confidence=EXTRACTED))
+        bindings.extend(_tree_sitter_bindings(language, node, content_bytes))
 
-        symbol = _tree_sitter_symbol(language, node, content_bytes, content)
-        if symbol:
-            symbols.append(symbol)
-            if symbol.kind == "Function":
-                function_ranges.append((symbol.name, _point_row(node.start_point) + 1, _point_row(node.end_point) + 1))
+        definition = _tree_sitter_definition(language, node, content_bytes)
+        if definition is not None:
+            parent = scope[-1].qualname if scope else ""
+            parent_kind = scope[-1].kind if scope else ""
+            if definition.qualifiers:
+                parent = ".".join(part for part in (parent, *definition.qualifiers) if part)
+                parent_kind = definition.qualifier_kind
+            qualname = f"{parent}.{definition.name}" if parent else definition.name
+            if definition.emit:
+                symbols.append(
+                    ParsedSymbol(
+                        kind=definition.kind,
+                        name=definition.name,
+                        line=_point_row(node.start_point) + 1,
+                        signature=_source_line_at(content_bytes, node.start_byte),
+                        confidence=EXTRACTED,
+                        qualname=qualname,
+                        end_line=_point_row(node.end_point) + 1,
+                        parent=parent,
+                        parent_kind=parent_kind,
+                    )
+                )
+            child_scope = scope + (_Frame(qualname, definition.kind),)
 
-        call_name = _tree_sitter_call(language, node, content_bytes)
-        if call_name:
-            line = _point_row(node.start_point) + 1
-            caller = _caller_for_line(function_ranges, line)
-            if caller and caller != call_name:
-                calls.append(ParsedCall(caller=caller, callee=call_name, line=line, confidence=INFERRED))
+        call = _tree_sitter_call(language, node, content_bytes)
+        if call is not None:
+            callee, receiver = call
+            caller = next((f.qualname for f in reversed(scope) if f.kind == "Function"), None)
+            # Self-recursion adds no impact information; drop it as before.
+            if caller and not (receiver == "" and caller.rsplit(".", 1)[-1] == callee):
+                line = _point_row(node.start_point) + 1
+                calls.append(ParsedCall(caller=caller, callee=callee, line=line, confidence=INFERRED, receiver=receiver))
+
+        stack.extend((child, child_scope) for child in reversed(node.children))
+
+    symbols = _settle_qualifier_kinds(symbols)
 
     # Calls to a function defined in the same file are certain: promote to EXTRACTED.
     local_functions = {s.name for s in symbols if s.kind == "Function"}
     calls = [
-        ParsedCall(c.caller, c.callee, c.line, EXTRACTED if c.callee in local_functions else INFERRED)
+        ParsedCall(c.caller, c.callee, c.line, EXTRACTED if c.callee in local_functions else INFERRED, c.receiver)
         for c in calls
     ]
 
@@ -187,7 +268,23 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
         source_text=content,
         is_test=is_test_path(path),
         parser_used="tree-sitter",
+        bindings=_dedupe_bindings(bindings),
     )
+
+
+def _settle_qualifier_kinds(symbols: list[ParsedSymbol]) -> list[ParsedSymbol]:
+    """C++ `A::f` names a class or a namespace; decide by whether A is a class here."""
+    if not any(s.parent_kind == _UNKNOWN_QUALIFIER_KIND for s in symbols):
+        return symbols
+    classes = {s.qualname for s in symbols if s.kind == "Class"}
+    classes |= {s.name for s in symbols if s.kind == "Class"}
+    settled = []
+    for s in symbols:
+        if s.parent_kind == _UNKNOWN_QUALIFIER_KIND:
+            kind = "Class" if s.parent in classes or s.parent.rsplit(".", 1)[-1] in classes else "Namespace"
+            s = replace(s, parent_kind=kind)
+        settled.append(s)
+    return settled
 
 
 @lru_cache(maxsize=None)
@@ -198,6 +295,7 @@ def _tree_sitter_parser(language: str) -> Any | None:
         "python": ("tree_sitter_python", "language"),
         "javascript": ("tree_sitter_javascript", "language"),
         "typescript": ("tree_sitter_typescript", "language_typescript"),
+        "tsx": ("tree_sitter_typescript", "language_tsx"),
         "go": ("tree_sitter_go", "language"),
         "java": ("tree_sitter_java", "language"),
         "rust": ("tree_sitter_rust", "language"),
@@ -230,19 +328,28 @@ def _point_row(point: Any) -> int:
     return point[0]
 
 
-def _walk_nodes(node: Any) -> Iterator[Any]:
-    """Pre-order walk without recursion (deep expressions overflow the stack)."""
-    stack = [node]
-    while stack:
-        current = stack.pop()
-        yield current
-        stack.extend(reversed(current.children))
-
-
 def _node_text(node: Any | None, content: bytes) -> str:
     if node is None:
         return ""
     return content[node.start_byte : node.end_byte].decode("utf-8", errors="ignore")
+
+
+def _field_children(node: Any, field_name: str) -> list[Any]:
+    return [child for i, child in enumerate(node.children) if node.field_name_for_child(i) == field_name]
+
+
+def _source_line_at(content: bytes, offset: int) -> str:
+    """The stripped source line containing byte `offset`.
+
+    Splits on newline bytes only, matching tree-sitter's row numbering;
+    str.splitlines() also breaks on form feeds and Unicode separators, and
+    re-splitting the whole file per symbol made parsing quadratic.
+    """
+    start = content.rfind(b"\n", 0, offset) + 1
+    end = content.find(b"\n", offset)
+    if end == -1:
+        end = len(content)
+    return content[start:end].decode("utf-8", errors="replace").strip()
 
 
 def _tree_sitter_import(language: str, node: Any, content: bytes) -> str | None:
@@ -273,125 +380,490 @@ def _tree_sitter_import(language: str, node: Any, content: bytes) -> str | None:
     return None
 
 
-def _tree_sitter_symbol(language: str, node: Any, content_bytes: bytes, content: str) -> ParsedSymbol | None:
-    kind = None
-    name_node = None
-    if language == "python" and node.type == "function_definition":
-        kind, name_node = "Function", node.child_by_field_name("name")
-    elif language == "python" and node.type == "class_definition":
-        kind, name_node = "Class", node.child_by_field_name("name")
-    elif language in {"javascript", "typescript"} and node.type in {"function_declaration", "method_definition"}:
-        kind, name_node = "Function", node.child_by_field_name("name")
-    elif language in {"javascript", "typescript"} and node.type == "class_declaration":
-        kind, name_node = "Class", node.child_by_field_name("name")
-    elif language == "go" and node.type in {"function_declaration", "method_declaration"}:
-        kind, name_node = "Function", node.child_by_field_name("name")
-    elif language == "go" and node.type == "type_spec":
-        kind, name_node = "Class", node.child_by_field_name("name")
-    elif language == "java" and node.type == "method_declaration":
-        kind, name_node = "Function", node.child_by_field_name("name")
-    elif language == "java" and node.type == "class_declaration":
-        kind, name_node = "Class", node.child_by_field_name("name")
-    elif language == "rust" and node.type == "function_item":
-        kind, name_node = "Function", node.child_by_field_name("name")
-    elif language == "rust" and node.type in {"struct_item", "enum_item", "trait_item"}:
-        kind, name_node = "Class", node.child_by_field_name("name")
-    elif language in {"c", "cpp"} and node.type == "function_definition":
-        kind = "Function"
+# --- definitions --------------------------------------------------------------
+
+
+def _tree_sitter_definition(language: str, node: Any, content: bytes) -> _Definition | None:
+    handler = _DEFINITION_HANDLERS.get(language)
+    return handler(node, content) if handler else None
+
+
+def _named(kind: str, node: Any, content: bytes, field_name: str = "name", **extra: Any) -> _Definition | None:
+    name = _node_text(node.child_by_field_name(field_name), content).strip()
+    if not _NAME_PATTERN.match(name):
+        return None
+    return _Definition(kind=kind, name=name, **extra)
+
+
+def _python_definition(node: Any, content: bytes) -> _Definition | None:
+    if node.type == "function_definition":
+        return _named("Function", node, content)
+    if node.type == "class_definition":
+        return _named("Class", node, content)
+    if node.type == "assignment":
+        left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+        if left is not None and right is not None and left.type == "identifier" and right.type == "lambda":
+            return _named("Function", node, content, field_name="left")
+    return None
+
+
+def _js_definition(node: Any, content: bytes) -> _Definition | None:
+    kind = node.type
+    if kind in {"function_declaration", "generator_function_declaration", "method_definition"}:
+        return _named("Function", node, content)
+    if kind in {"class_declaration", "abstract_class_declaration", "class", "interface_declaration", "enum_declaration"}:
+        return _named("Class", node, content)
+    if kind in {"internal_module", "module"}:
+        return _named("Namespace", node, content, emit=False)
+    value = node.child_by_field_name("value")
+    if value is None:
+        return None
+    if kind == "variable_declarator":
+        name_node = node.child_by_field_name("name")
+        if name_node is None or name_node.type != "identifier":
+            return None
+        if value.type in _JS_FUNCTION_VALUES:
+            return _named("Function", node, content)
+        if value.type == "object":
+            return _named("Namespace", node, content, emit=False)
+        return None
+    if value.type not in _JS_FUNCTION_VALUES:
+        return None
+    if kind == "pair":
+        name = _node_text(node.child_by_field_name("key"), content).strip("\"'`")
+        return _Definition("Function", name) if _NAME_PATTERN.match(name) else None
+    if kind == "field_definition":
+        return _named("Function", node, content, field_name="property")
+    if kind == "public_field_definition":
+        return _named("Function", node, content)
+    return None
+
+
+def _go_definition(node: Any, content: bytes) -> _Definition | None:
+    if node.type == "function_declaration":
+        return _named("Function", node, content)
+    if node.type == "method_declaration":
+        receiver = node.child_by_field_name("receiver")
+        receiver_type = ""
+        if receiver is not None:
+            for param in receiver.named_children:
+                type_text = _node_text(param.child_by_field_name("type"), content)
+                receiver_type = type_text.lstrip("*").split("[")[0].strip()
+        qualifiers = (receiver_type,) if receiver_type else ()
+        return _named("Function", node, content, qualifiers=qualifiers, qualifier_kind="Class")
+    if node.type == "type_spec":
+        return _named("Class", node, content)
+    return None
+
+
+def _java_definition(node: Any, content: bytes) -> _Definition | None:
+    if node.type == "method_declaration":
+        return _named("Function", node, content) if node.child_by_field_name("body") is not None else None
+    if node.type in {"constructor_declaration", "compact_constructor_declaration"}:
+        return _named("Function", node, content)
+    if node.type in {
+        "class_declaration", "interface_declaration", "enum_declaration",
+        "record_declaration", "annotation_type_declaration",
+    }:
+        return _named("Class", node, content)
+    return None
+
+
+def _rust_definition(node: Any, content: bytes) -> _Definition | None:
+    if node.type == "function_item":
+        return _named("Function", node, content)
+    if node.type in {"struct_item", "enum_item", "trait_item", "union_item"}:
+        return _named("Class", node, content)
+    if node.type == "impl_item":
+        type_text = _node_text(node.child_by_field_name("type"), content)
+        name = type_text.split("<")[0].split("::")[-1].strip()
+        return _Definition("Class", name, emit=False) if _NAME_PATTERN.match(name) else None
+    if node.type == "mod_item":
+        return _named("Namespace", node, content, emit=False)
+    return None
+
+
+def _c_family_definition(node: Any, content: bytes, cpp: bool) -> _Definition | None:
+    if node.type == "function_definition":
         name_node = _c_declarator_name(node)
-    elif language == "c" and node.type == "struct_specifier":
-        kind, name_node = "Class", node.child_by_field_name("name")
-    elif language == "cpp" and node.type in {"class_specifier", "struct_specifier"}:
-        kind, name_node = "Class", node.child_by_field_name("name")
-    elif language == "ruby" and node.type == "method":
-        kind, name_node = "Function", node.child_by_field_name("name")
-    elif language == "ruby" and node.type in {"class", "module"}:
-        kind, name_node = "Class", node.child_by_field_name("name")
-    elif language == "php" and node.type in {"function_definition", "method_declaration"}:
-        kind, name_node = "Function", node.child_by_field_name("name")
-    elif language == "php" and node.type == "class_declaration":
-        kind, name_node = "Class", node.child_by_field_name("name")
+        if name_node is None:
+            return None
+        qualifiers: tuple[str, ...] = ()
+        if name_node.type == "qualified_identifier":
+            scope_text = _node_text(name_node.child_by_field_name("scope"), content)
+            qualifiers = tuple(part for part in scope_text.split("::") if part)
+            name_node = _innermost_name(name_node)
+        name = _node_text(name_node, content).strip()
+        if not _NAME_PATTERN.match(name):
+            return None
+        if qualifiers:
+            return _Definition("Function", name, qualifiers=qualifiers, qualifier_kind=_UNKNOWN_QUALIFIER_KIND)
+        return _Definition("Function", name)
+    type_specifiers = {"struct_specifier", "union_specifier", "enum_specifier"} | ({"class_specifier"} if cpp else set())
+    if node.type in type_specifiers and node.child_by_field_name("body") is not None:
+        return _named("Class", node, content)
+    if node.type == "type_definition":
+        inner = node.child_by_field_name("type")
+        if (
+            inner is not None
+            and inner.type in type_specifiers
+            and inner.child_by_field_name("body") is not None
+            and inner.child_by_field_name("name") is None
+        ):
+            return _named("Class", node, content, field_name="declarator")
+    if cpp and node.type == "namespace_definition":
+        return _named("Namespace", node, content, emit=False)
+    return None
 
-    if not kind or name_node is None:
-        return None
-    line = _point_row(node.start_point) + 1
-    signature = _source_line_at(content_bytes, node.start_byte)
-    name = _node_text(name_node, content_bytes).split("::")[-1]
-    if not re.match(r"^[A-Za-z_][\w$]*$", name):
-        return None
-    return ParsedSymbol(
-        kind=kind,
-        name=name,
-        line=line,
-        signature=signature,
-        confidence=EXTRACTED,
-    )
+
+def _innermost_name(node: Any) -> Any:
+    """`a::B::f` nests qualified_identifiers; return the final name node."""
+    while node is not None and node.type == "qualified_identifier":
+        node = node.child_by_field_name("name")
+    return node
 
 
-def _source_line_at(content: bytes, offset: int) -> str:
-    """The stripped source line containing byte `offset`.
+def _ruby_definition(node: Any, content: bytes) -> _Definition | None:
+    if node.type in {"method", "singleton_method"}:
+        return _named("Function", node, content)
+    if node.type in {"class", "module"}:
+        parts = _node_text(node.child_by_field_name("name"), content).split("::")
+        name = parts[-1].strip()
+        if not _NAME_PATTERN.match(name):
+            return None
+        return _Definition("Class", name, qualifiers=tuple(parts[:-1]), qualifier_kind="Class" if len(parts) > 1 else "")
+    return None
 
-    Splits on newline bytes only, matching tree-sitter's row numbering;
-    str.splitlines() also breaks on form feeds and Unicode separators, and
-    re-splitting the whole file per symbol made parsing quadratic.
-    """
-    start = content.rfind(b"\n", 0, offset) + 1
-    end = content.find(b"\n", offset)
-    if end == -1:
-        end = len(content)
-    return content[start:end].decode("utf-8", errors="replace").strip()
+
+def _php_definition(node: Any, content: bytes) -> _Definition | None:
+    if node.type == "function_definition":
+        return _named("Function", node, content)
+    if node.type == "method_declaration":
+        return _named("Function", node, content) if node.child_by_field_name("body") is not None else None
+    if node.type in {"class_declaration", "interface_declaration", "trait_declaration", "enum_declaration"}:
+        return _named("Class", node, content)
+    return None
+
+
+_DEFINITION_HANDLERS = {
+    "python": _python_definition,
+    "javascript": _js_definition,
+    "typescript": _js_definition,
+    "go": _go_definition,
+    "java": _java_definition,
+    "rust": _rust_definition,
+    "c": lambda node, content: _c_family_definition(node, content, cpp=False),
+    "cpp": lambda node, content: _c_family_definition(node, content, cpp=True),
+    "ruby": _ruby_definition,
+    "php": _php_definition,
+}
 
 
 def _c_declarator_name(node: Any) -> Any | None:
-    """Descend C/C++ declarators to the identifier that names the function."""
+    """Descend C/C++ declarators to the node that names the function."""
     declarator = node.child_by_field_name("declarator")
     depth = 0
     while declarator is not None and depth < 10:
-        if declarator.type in {"identifier", "field_identifier"}:
+        if declarator.type in {"identifier", "field_identifier", "destructor_name", "qualified_identifier"}:
             return declarator
-        if declarator.type == "qualified_identifier":
-            return declarator.child_by_field_name("name") or declarator
         declarator = declarator.child_by_field_name("declarator")
         depth += 1
     return None
 
 
-def _tree_sitter_call(language: str, node: Any, content: bytes) -> str | None:
-    if language in {"python", "javascript", "typescript", "go"} and node.type == "call":
-        return _call_function_name(_node_text(node.child_by_field_name("function"), content))
-    if language in {"javascript", "typescript"} and node.type == "call_expression":
-        return _call_function_name(_node_text(node.child_by_field_name("function"), content))
-    if language == "go" and node.type == "call_expression":
-        return _call_function_name(_node_text(node.child_by_field_name("function"), content))
-    if language == "java" and node.type == "method_invocation":
-        name = _node_text(node.child_by_field_name("name"), content)
-        return name or None
-    if language in {"rust", "c", "cpp"} and node.type == "call_expression":
-        return _call_function_name(_node_text(node.child_by_field_name("function"), content))
-    if language == "ruby" and node.type == "call":
-        method = _node_text(node.child_by_field_name("method"), content)
-        if method in {"require", "require_relative", "new"}:
-            return None
-        return _call_function_name(method)
-    if language == "php" and node.type == "function_call_expression":
-        return _call_function_name(_node_text(node.child_by_field_name("function"), content))
-    if language == "php" and node.type == "member_call_expression":
-        return _call_function_name(_node_text(node.child_by_field_name("name"), content))
-    return None
+# --- calls --------------------------------------------------------------------
 
 
-def _call_function_name(text: str) -> str | None:
-    if not text:
+def _tree_sitter_call(language: str, node: Any, content: bytes) -> tuple[str, str] | None:
+    """(callee name, receiver text) for a call node, else None.
+
+    The receiver is "" for a bare call `f()`, and the text before the last
+    `.`/`::`/`->` otherwise ("self", "os.path", "Foo"). Constructions such as
+    `new Foo()` are reported as a bare call to `Foo`.
+    """
+    t = node.type
+    field = node.child_by_field_name
+    if language == "python" and t == "call":
+        return _split_callee(field("function"), content, ("attribute", "object", "attribute"))
+    if language in {"javascript", "typescript"}:
+        if t == "call_expression":
+            return _split_callee(field("function"), content, ("member_expression", "object", "property"))
+        if t == "new_expression":
+            return _bare(_node_text(field("constructor"), content))
         return None
-    name = text.split(".")[-1].split("::")[-1].split("->")[-1].lstrip("$&")
-    return name if re.match(r"^[A-Za-z_][\w$]*$", name) else None
-
-
-def _caller_for_line(function_ranges: list[tuple[str, int, int]], line: int) -> str | None:
-    for name, start, end in reversed(function_ranges):
-        if start <= line <= end:
-            return name
+    if language == "go" and t == "call_expression":
+        return _split_callee(field("function"), content, ("selector_expression", "operand", "field"))
+    if language == "java":
+        if t == "method_invocation":
+            return _with_receiver(_node_text(field("name"), content), _node_text(field("object"), content))
+        if t == "object_creation_expression":
+            return _bare(_node_text(field("type"), content).split("<")[0])
+        return None
+    if language == "rust" and t == "call_expression":
+        function = field("function")
+        if function is not None and function.type == "scoped_identifier":
+            return _with_receiver(
+                _node_text(function.child_by_field_name("name"), content),
+                _node_text(function.child_by_field_name("path"), content),
+            )
+        return _split_callee(function, content, ("field_expression", "value", "field"))
+    if language in {"c", "cpp"} and t == "call_expression":
+        function = field("function")
+        if function is not None and function.type == "qualified_identifier":
+            return _with_receiver(
+                _node_text(_innermost_name(function), content),
+                _node_text(function.child_by_field_name("scope"), content),
+            )
+        return _split_callee(function, content, ("field_expression", "argument", "field"))
+    if language == "ruby" and t == "call":
+        method = _node_text(field("method"), content)
+        receiver = _node_text(field("receiver"), content)
+        if method in {"require", "require_relative"}:
+            return None
+        if method == "new":
+            # Invoice.new(...) constructs Invoice; a bare `new` is Class.new on self.
+            return _bare(receiver.split("::")[-1]) if receiver else None
+        return _with_receiver(method, receiver)
+    if language == "php":
+        if t == "function_call_expression":
+            return _bare(_node_text(field("function"), content).split("\\")[-1])
+        if t == "member_call_expression":
+            return _with_receiver(_node_text(field("name"), content), _node_text(field("object"), content))
+        if t == "scoped_call_expression":
+            return _with_receiver(_node_text(field("name"), content), _node_text(field("scope"), content))
+        if t == "object_creation_expression":
+            for child in node.named_children:
+                if child.type in {"name", "qualified_name"}:
+                    return _bare(_node_text(child, content).split("\\")[-1])
+        return None
     return None
+
+
+def _split_callee(function: Any | None, content: bytes, member: tuple[str, str, str]) -> tuple[str, str] | None:
+    if function is None:
+        return None
+    member_type, object_field, name_field = member
+    if function.type == member_type:
+        return _with_receiver(
+            _node_text(function.child_by_field_name(name_field), content),
+            _node_text(function.child_by_field_name(object_field), content),
+        )
+    if function.type in {"identifier", "name"}:
+        return _bare(_node_text(function, content))
+    return None
+
+
+def _bare(name: str) -> tuple[str, str] | None:
+    return _with_receiver(name, "")
+
+
+def _with_receiver(name: str, receiver: str) -> tuple[str, str] | None:
+    name = name.strip().lstrip("$&")
+    if not _NAME_PATTERN.match(name):
+        return None
+    receiver = " ".join(receiver.split())
+    if receiver.startswith("$"):
+        receiver = receiver[1:]  # PHP $this / $obj
+    if any(ch in receiver for ch in "()[]{}\"'") or len(receiver) > 120:
+        receiver = "<expr>"  # call chains, subscripts: receiver type is unknown
+    return name, receiver
+
+
+# --- import bindings ----------------------------------------------------------
+
+
+def _tree_sitter_bindings(language: str, node: Any, content: bytes) -> list[ParsedBinding]:
+    handler = _BINDING_HANDLERS.get(language)
+    return handler(node, content) if handler else []
+
+
+def _python_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type == "import_statement":
+        out = []
+        for child in _field_children(node, "name"):
+            if child.type == "aliased_import":
+                module = _node_text(child.child_by_field_name("name"), content)
+                out.append(ParsedBinding(_node_text(child.child_by_field_name("alias"), content), module))
+            else:
+                module = _node_text(child, content)
+                out.append(ParsedBinding(module, module))
+        return out
+    if node.type == "import_from_statement":
+        module = _node_text(node.child_by_field_name("module_name"), content).replace(" ", "")
+        out = []
+        if any(child.type == "wildcard_import" for child in node.named_children):
+            out.append(ParsedBinding("*", module, "*"))
+        for child in _field_children(node, "name"):
+            if child.type == "aliased_import":
+                name = _node_text(child.child_by_field_name("name"), content)
+                out.append(ParsedBinding(_node_text(child.child_by_field_name("alias"), content), module, name))
+            else:
+                name = _node_text(child, content)
+                out.append(ParsedBinding(name, module, name))
+        return out
+    return []
+
+
+def _js_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type == "import_statement":
+        source = _node_text(node.child_by_field_name("source"), content).strip("\"'`")
+        out = []
+        for clause in node.named_children:
+            if clause.type != "import_clause":
+                continue
+            for part in clause.named_children:
+                if part.type == "identifier":
+                    out.append(ParsedBinding(_node_text(part, content), source, "default"))
+                elif part.type == "namespace_import":
+                    for ident in part.named_children:
+                        out.append(ParsedBinding(_node_text(ident, content), source))
+                elif part.type == "named_imports":
+                    for spec in part.named_children:
+                        if spec.type != "import_specifier":
+                            continue
+                        name = _node_text(spec.child_by_field_name("name"), content)
+                        alias = _node_text(spec.child_by_field_name("alias"), content) or name
+                        out.append(ParsedBinding(alias, source, name))
+        return out
+    if node.type == "variable_declarator":
+        value = node.child_by_field_name("value")
+        if value is None or value.type != "call_expression":
+            return []
+        if _node_text(value.child_by_field_name("function"), content) != "require":
+            return []
+        args = value.child_by_field_name("arguments")
+        strings = [c for c in (args.named_children if args is not None else []) if c.type == "string"]
+        if not strings:
+            return []
+        source = _node_text(strings[0], content).strip("\"'`")
+        target = node.child_by_field_name("name")
+        if target is None:
+            return []
+        if target.type == "identifier":
+            return [ParsedBinding(_node_text(target, content), source)]
+        out = []
+        for prop in target.named_children:
+            if prop.type == "shorthand_property_identifier_pattern":
+                name = _node_text(prop, content)
+                out.append(ParsedBinding(name, source, name))
+            elif prop.type == "pair_pattern":
+                key = _node_text(prop.child_by_field_name("key"), content)
+                out.append(ParsedBinding(_node_text(prop.child_by_field_name("value"), content), source, key))
+        return out
+    return []
+
+
+def _go_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type != "import_spec":
+        return []
+    path = _node_text(node.child_by_field_name("path"), content).strip("\"`")
+    alias = _node_text(node.child_by_field_name("name"), content)
+    if alias == "_":
+        return []
+    if alias == ".":
+        return [ParsedBinding("*", path, "*")]
+    return [ParsedBinding(alias or path.rstrip("/").rsplit("/", 1)[-1], path)]
+
+
+def _java_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type != "import_declaration":
+        return []
+    text = _node_text(node, content).strip().removeprefix("import").strip().removesuffix(";").strip()
+    static = text.startswith("static ")
+    text = text.removeprefix("static ").strip()
+    if text.endswith(".*"):
+        return [ParsedBinding("*", text[:-2], "*")]
+    owner, _, last = text.rpartition(".")
+    if static:
+        return [ParsedBinding(last, owner, last)]
+    return [ParsedBinding(last, text)]
+
+
+def _rust_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type != "use_declaration":
+        return []
+    out: list[ParsedBinding] = []
+    _rust_use_tree(node.child_by_field_name("argument"), "", content, out)
+    return out
+
+
+def _rust_use_tree(node: Any | None, prefix: str, content: bytes, out: list[ParsedBinding]) -> None:
+    if node is None:
+        return
+    join = (lambda a, b: f"{a}::{b}" if a else b)
+    if node.type in {"identifier", "self", "crate", "super"}:
+        name = _node_text(node, content)
+        out.append(ParsedBinding(name, prefix, name) if prefix else ParsedBinding(name, name))
+    elif node.type == "scoped_identifier":
+        path = _node_text(node.child_by_field_name("path"), content)
+        name = _node_text(node.child_by_field_name("name"), content)
+        out.append(ParsedBinding(name, join(prefix, path), name))
+    elif node.type == "use_as_clause":
+        path = _node_text(node.child_by_field_name("path"), content)
+        alias = _node_text(node.child_by_field_name("alias"), content)
+        owner, _, name = join(prefix, path).rpartition("::")
+        out.append(ParsedBinding(alias, owner, name) if owner else ParsedBinding(alias, name))
+    elif node.type == "scoped_use_list":
+        path = _node_text(node.child_by_field_name("path"), content)
+        for child in (node.child_by_field_name("list").named_children if node.child_by_field_name("list") else []):
+            _rust_use_tree(child, join(prefix, path), content, out)
+    elif node.type == "use_list":
+        for child in node.named_children:
+            _rust_use_tree(child, prefix, content, out)
+    elif node.type == "use_wildcard":
+        path = _node_text(node, content).removesuffix("::*").removesuffix("*")
+        out.append(ParsedBinding("*", join(prefix, path), "*"))
+
+
+def _c_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type != "preproc_include":
+        return []
+    path_node = node.child_by_field_name("path")
+    if path_node is None or path_node.type == "system_lib_string":
+        return []  # <stdio.h>: outside the repository
+    return [ParsedBinding("*", _node_text(path_node, content).strip('"'), "*")]
+
+
+def _ruby_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type != "call":
+        return []
+    method = _node_text(node.child_by_field_name("method"), content)
+    if method not in {"require", "require_relative"}:
+        return []
+    target = _node_text(node.child_by_field_name("arguments"), content).strip("()\"' ")
+    if not target:
+        return []
+    if method == "require_relative" and not target.startswith("."):
+        target = f"./{target}"
+    return [ParsedBinding("*", target, "*")]
+
+
+def _php_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type != "namespace_use_clause":
+        return []
+    full = ""
+    alias = _node_text(node.child_by_field_name("alias"), content)
+    for child in node.named_children:
+        if child.type in {"qualified_name", "name"} and node.field_name_for_child(node.children.index(child)) != "alias":
+            full = _node_text(child, content).lstrip("\\")
+            break
+    if not full:
+        return []
+    return [ParsedBinding(alias or full.rsplit("\\", 1)[-1], full)]
+
+
+_BINDING_HANDLERS = {
+    "python": _python_bindings,
+    "javascript": _js_bindings,
+    "typescript": _js_bindings,
+    "go": _go_bindings,
+    "java": _java_bindings,
+    "rust": _rust_bindings,
+    "c": _c_bindings,
+    "cpp": _c_bindings,
+    "ruby": _ruby_bindings,
+    "php": _php_bindings,
+}
 
 
 # --- regex fallback path ----------------------------------------------------
@@ -550,6 +1022,10 @@ def _dedupe_calls(calls: list[ParsedCall]) -> list[ParsedCall]:
             seen.add(key)
             result.append(call)
     return result
+
+
+def _dedupe_bindings(items: list[ParsedBinding]) -> list[ParsedBinding]:
+    return list(dict.fromkeys(items))
 
 
 def _first_group(match: re.Match[str] | None) -> str | None:
