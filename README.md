@@ -35,9 +35,11 @@ as fact.
 | Problem | What Graphora does |
 | --- | --- |
 | Callers live outside the diff | Walks the call graph backwards (callers of callers, `--depth N`) from every changed function, method, or class. Edits inside a body count. |
-| Name matching guesses wrong | Resolves each call the way the language does: `self`/`this`, same file, imports (incl. re-exports and `src/` layouts), same Go package, declared types and return types. External library calls (`os.path.join`, `fmt.Println`) never link to your code. |
+| Name matching guesses wrong | Resolves each call the way the language does: `self`/`this` and base classes, same file, imports (incl. re-exports, `src/` layouts, `go.mod`, `Cargo.toml`), same Go package, declared types, field types, and return types. Library calls (`os.path.join`, `fmt.Println`, `String::new()`, `items.append()`) never link to your code. |
 | Guesses look like facts | When a call could mean several definitions, it says so: **"this `save(...)` call is either `Db.save` or `FileStore.save`, or a method outside this repository"**. |
 | Missing definitions | Every function, method, and class: 100% of the definitions Python's own `ast` finds, on every repo we measured (see [Benchmarks](#benchmarks)). |
+| Tests hide in callbacks | `describe`/`it`/`test` blocks, Rust `#[test]`, and `e2e/` page objects count as tests, so the answer lists the tests to run. |
+| Deleted code | A diff that deletes a function reports the call sites that still call it. |
 | Repo dumps cost tokens | The answer is a few hundred tokens of facts, not the files. |
 
 ## Quick start
@@ -50,6 +52,7 @@ cd /path/to/repo
 
 graphora breaks charge_card      # what could break if I change charge_card?
 graphora breaks Db.save --depth 3
+graphora breaks app/db.py:Db.save   # pick one of several same-named definitions
 git diff | graphora breaks       # ... for everything my diff touches
 ```
 
@@ -71,25 +74,21 @@ $ graphora breaks EmbeddedGraphStore.find_symbols --depth 1
 What could break if you change `EmbeddedGraphStore.find_symbols` (graphora/embedded.py:233)
 
 Will break (1):
-  - `EmbeddedGraphStore.find_symbol` (graphora/embedded.py:277) calls `EmbeddedGraphStore.find_symbols` at line 280
+  - `EmbeddedGraphStore.find_symbol` (graphora/embedded.py:294) calls `EmbeddedGraphStore.find_symbols` at line 297
 
-Might break (3): the call could mean something else
-  - `blast_radius` (graphora/blast.py:82) may call `EmbeddedGraphStore.find_symbols` at line 87
+Might break (1): the call could mean something else
+  - `select_symbols` (graphora/blast.py:86) may call `EmbeddedGraphStore.find_symbols` at line 97
       this `find_symbols(...)` call is either `EmbeddedGraphStore.find_symbols` (graphora/embedded.py:233)  <- the one you are changing
-      or `GraphStore.find_symbols` (graphora/store.py:267)
-      or a method outside this repository
-  ... (2 more: what_could_break, changed_symbols)
+      or `GraphStore.find_symbols` (graphora/store.py:278)
 
 Tests that reach it (0):
   none found: consider adding one
 ```
 
-With the default `--depth 2` the same question also reaches the CLI commands, the MCP tools,
-and 25 tests through those callers.
-
-`blast_radius` receives a store typed as either backend, so the graph cannot know which
-`find_symbols` runs; it shows both instead of picking one. Use `--json` for machine-readable
-output.
+`select_symbols` receives a store typed `GraphBackend = Union[GraphStore, EmbeddedGraphStore]`,
+so the graph cannot know which `find_symbols` runs; it shows both instead of picking one. With
+the default `--depth 2` the same question also reaches the CLI commands, the MCP tools, and the
+tests behind them. Use `--json` for machine-readable output.
 
 ### How certain is each link?
 
@@ -154,7 +153,7 @@ editing a symbol and to report uncertain callers as uncertain. Works with mcp 1.
 
 ```bash
 graphora install-skill all          # every supported agent, into the current repo
-graphora install-skill claude cursor copilot
+graphora install-skill claude-code cursor copilot
 graphora install-skill --list       # see all supported agents
 ```
 
@@ -171,11 +170,14 @@ regex fallback). Per language this includes, for example: Python nested function
 decorated and async defs; JS/TS arrow functions, class fields, object-literal methods,
 interfaces, enums; Go methods attached to their receiver type; Java constructors, records,
 enums, interfaces; Rust `impl` methods; C++ out-of-class `A::f` definitions and destructors;
-Ruby singleton methods; PHP traits and enums. Each symbol has a qualified name
-(`geo.Square.area`), a parent, and a line range.
+Ruby singleton methods; PHP traits and enums. Also CommonJS exports, `export default`
+functions and classes, class expressions, `$`/`#private` names, C++ operators and template
+specialisations, union type aliases, and identifiers in any script. Each symbol has a
+qualified name (`geo.Square.area`), a parent, base classes, and a line range.
 
 Indexing honours `.gitignore` inside a git work tree and skips generated files (ANTLR,
 protobuf, `@generated`/`DO NOT EDIT` headers, minified JS) unless `--include-generated`.
+`go.mod` and `Cargo.toml` are read to tell the repository's own imports from libraries.
 
 ## Agent session memory: graph your work, not just your code
 
@@ -197,20 +199,25 @@ Read-only on the sources, no LLM, idempotent. See [use case 6](USECASES.md).
 
 ## Benchmarks
 
-Measured on local checkouts with `graphora benchmark` (embedded backend, deterministic, no
-network). "Definitions found" compares the graph with Python's own `ast` parser; "certain"
-is the share of call edges tagged `EXTRACTED` or `INFERRED`.
+Measured with `graphora benchmark` on each repository's committed code at the listed commit
+(embedded backend, deterministic, no network). "Definitions found" compares the graph with
+Python's own `ast` parser (Python files only); "certain" is the share of call edges tagged
+`EXTRACTED` or `INFERRED`.
 
-| Repository | Commit | Files | Definitions found (vs `ast`) | Call edges | Certain | Context: repo → Graphora |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| [Shiftory](https://github.com/Naseem77/Shiftory) | `f4e1a03630` | 61 | 498/498 (100%) | 1,479 | 97% | 134,155 → 1,243 tokens |
-| [falkordb-py](https://github.com/FalkorDB/falkordb-py) | `e4230e1ce7` | 42 | 390/390 (100%) | 1,143 | 57% | 61,931 → 1,708 tokens |
-| [GraphRAG-SDK](https://github.com/FalkorDB/GraphRAG-SDK) | `93b760edd4` | 190 | 5,043/5,043 (100%) | 14,656 | 66% | 888,919 → 36,312 tokens |
+| Repository | Languages | Commit | Files | Definitions found (vs `ast`) | Call edges | Certain | Context: repo → Graphora |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| [Shiftory](https://github.com/Naseem77/Shiftory) | Python, TS | `f4e1a03630` | 61 | 498/498 (100%) | 1,474 | 99% | 134,155 → 1,250 tokens |
+| [falkordb-py](https://github.com/FalkorDB/falkordb-py) | Python | `e4230e1ce7` | 42 | 390/390 (100%) | 1,135 | 58% | 61,931 → 1,714 tokens |
+| [GraphRAG-SDK](https://github.com/FalkorDB/GraphRAG-SDK) | Python | `93b760edd4` | 190 | 5,038/5,038 (100%) | 13,026 | 75% | 888,503 → 38,273 tokens |
+| [QueryWeaver](https://github.com/FalkorDB/QueryWeaver) | Python, TS/TSX | `f37a7d9d84` | 180 | 1,228/1,228 (100%) | 2,766 | 84% | 347,816 → 2,595 tokens |
+| [falkordb-ts](https://github.com/FalkorDB/falkordb-ts) | TypeScript | `d3a354209a` | 75 | n/a | 1,871 | 39% | 65,311 → 6,551 tokens |
+| [text-to-cypher](https://github.com/FalkorDB/text-to-cypher) | Rust | `1480ccc504` | 31 | n/a | 471 | 88% | 92,730 → 739 tokens |
 
 The remaining ambiguous edges are mostly real polymorphism (several classes implement the
-same method) and values whose type the source never states (e.g. pytest fixtures); those are
-exactly the calls the answer lists as "X or Y". Indexing GraphRAG-SDK (190 files) takes 2.3 s
-embedded and 2.5 s on FalkorDB. Methodology and the pinned public benchmark (`scripts/public_benchmark.py`)
+same method, e.g. GraphRAG-SDK's providers) and values whose type the source never states
+(pytest fixtures, variables shared across `beforeEach` and test callbacks in falkordb-ts);
+those are exactly the calls the answer lists as "X or Y". Indexing GraphRAG-SDK (190 files)
+takes 1.7 s embedded and 2.5 s on FalkorDB. Methodology and the pinned public benchmark (`scripts/public_benchmark.py`)
 are in [BENCHMARKS.md](./BENCHMARKS.md).
 
 ## Architecture
@@ -253,7 +260,7 @@ write, so an incremental update (`update_files`) never drops callers in unchange
 
 ```bash
 pip install -e ".[dev,mcp]"
-python -m pytest tests -q           # 200 tests
+python -m pytest tests -q           # 251 tests
 ruff check graphora tests scripts && mypy graphora
 ```
 
