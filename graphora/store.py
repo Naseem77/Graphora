@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any, Union
 
 from graphora.parser import EXTRACTED, ParsedFile
 from graphora.resolve import CallSite, FileRecord, SymbolRecord, records_for, resolve
@@ -355,6 +355,13 @@ class GraphStore:
                 }
             )
         return sorted(out, key=lambda e: (e[label]["path"], e[label]["line"], e["line"]))
+
+
+if TYPE_CHECKING:
+    from graphora.embedded import EmbeddedGraphStore
+
+    # Either backend: they implement the same method surface.
+    GraphBackend = Union[GraphStore, EmbeddedGraphStore]
 
 
 def _symbol_row(symbol: SymbolRecord) -> dict:

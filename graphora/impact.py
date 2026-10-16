@@ -19,12 +19,16 @@ from __future__ import annotations
 import re
 from collections import deque
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from graphora.blast import members_of
 from graphora.parser import AMBIGUOUS, extract_symbols_from_diff
-from graphora.store import GraphStore
+
+if TYPE_CHECKING:
+    from graphora.store import GraphBackend
 
 DEFAULT_DEPTH = 2
+MAX_TESTS_LISTED = 10  # text output only; to_dict() keeps every test
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -114,7 +118,9 @@ class WhatCouldBreak:
             lines.append("  nothing found")
         lines.append("")
         lines.append(f"Tests that reach it ({len(self.tests)}):")
-        lines.extend(_line(b) for b in self.tests)
+        lines.extend(_line(b) for b in self.tests[:MAX_TESTS_LISTED])
+        if len(self.tests) > MAX_TESTS_LISTED:
+            lines.append(f"  ... and {len(self.tests) - MAX_TESTS_LISTED} more (use --json for all)")
         if not self.tests:
             lines.append("  none found: consider adding one")
         if self.unresolved:
@@ -123,7 +129,7 @@ class WhatCouldBreak:
         return "\n".join(lines)
 
 
-def what_could_break(store: GraphStore, names: list[str], depth: int = DEFAULT_DEPTH) -> WhatCouldBreak:
+def what_could_break(store: GraphBackend, names: list[str], depth: int = DEFAULT_DEPTH) -> WhatCouldBreak:
     """What could break if the named symbols change (plain or qualified names)."""
     targets: list[dict] = []
     unresolved: list[str] = []
@@ -136,13 +142,13 @@ def what_could_break(store: GraphStore, names: list[str], depth: int = DEFAULT_D
     return _walk(store, _unique(targets), unresolved, depth)
 
 
-def what_could_break_for_diff(store: GraphStore, diff: str, depth: int = DEFAULT_DEPTH) -> WhatCouldBreak:
+def what_could_break_for_diff(store: GraphBackend, diff: str, depth: int = DEFAULT_DEPTH) -> WhatCouldBreak:
     """What could break for a unified diff: every symbol whose body a hunk touches."""
     targets, unresolved = changed_symbols(store, diff)
     return _walk(store, targets, unresolved, depth)
 
 
-def changed_symbols(store: GraphStore, diff: str) -> tuple[list[dict], list[str]]:
+def changed_symbols(store: GraphBackend, diff: str) -> tuple[list[dict], list[str]]:
     """Innermost graph symbol enclosing each changed line of a unified diff.
 
     Line numbers are taken on the new side of the diff, so the graph should
@@ -166,7 +172,7 @@ def changed_symbols(store: GraphStore, diff: str) -> tuple[list[dict], list[str]
     return _unique(targets), list(dict.fromkeys(unresolved))
 
 
-def _walk(store: GraphStore, targets: list[dict], unresolved: list[str], depth: int) -> WhatCouldBreak:
+def _walk(store: GraphBackend, targets: list[dict], unresolved: list[str], depth: int) -> WhatCouldBreak:
     target_keys = {member["key"] for t in targets for member in members_of(store, t)}
     best: dict[str, Breakage] = {}
     queue: deque[tuple[str, int, tuple[str, ...], bool]] = deque()

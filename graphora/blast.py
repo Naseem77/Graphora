@@ -9,9 +9,12 @@ confidence it came from.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from graphora.parser import extract_files_from_diff
-from graphora.store import GraphStore
+
+if TYPE_CHECKING:
+    from graphora.store import GraphBackend
 
 
 @dataclass(frozen=True)
@@ -76,7 +79,7 @@ def _relation_line(label: str, rows: list[tuple[str, str, str]]) -> str:
     return f"- {label} ({len(rows)}): {rendered}"
 
 
-def blast_radius(store: GraphStore, symbol_names: list[str]) -> BlastRadius:
+def blast_radius(store: GraphBackend, symbol_names: list[str]) -> BlastRadius:
     """Compute the blast radius for symbol names (plain or qualified, e.g. "Db.save")."""
     impacts: list[SymbolImpact] = []
     unresolved: list[str] = []
@@ -89,7 +92,7 @@ def blast_radius(store: GraphStore, symbol_names: list[str]) -> BlastRadius:
     return BlastRadius(symbols=impacts, changed_files=[], unresolved=unresolved)
 
 
-def blast_radius_for_diff(store: GraphStore, diff: str) -> BlastRadius:
+def blast_radius_for_diff(store: GraphBackend, diff: str) -> BlastRadius:
     """Compute the blast radius for a unified diff: every symbol a hunk touches,
     including edits inside a body (not only changed definition lines)."""
     from graphora.impact import changed_symbols
@@ -102,7 +105,7 @@ def blast_radius_for_diff(store: GraphStore, diff: str) -> BlastRadius:
     )
 
 
-def members_of(store: GraphStore, record: dict) -> list[dict]:
+def members_of(store: GraphBackend, record: dict) -> list[dict]:
     """A symbol plus, for a class, everything defined inside it (its methods)."""
     if record["kind"] != "Class":
         return [record]
@@ -115,7 +118,7 @@ def members_of(store: GraphStore, record: dict) -> list[dict]:
     return [record, *inner]
 
 
-def _impact_for(store: GraphStore, record: dict) -> SymbolImpact:
+def _impact_for(store: GraphBackend, record: dict) -> SymbolImpact:
     targets = members_of(store, record)
     own = {t["key"] for t in targets}
     callers: set[tuple[str, str, str]] = set()

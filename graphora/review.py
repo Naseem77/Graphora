@@ -14,9 +14,12 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from graphora.impact import WhatCouldBreak, what_could_break_for_diff
-from graphora.store import GraphStore
+
+if TYPE_CHECKING:
+    from graphora.store import GraphBackend
 
 
 @dataclass(frozen=True)
@@ -56,7 +59,7 @@ def estimate_tokens(text: str) -> int:
 
 
 def review_diff(
-    store: GraphStore,
+    store: GraphBackend,
     diff: str,
     model: str | None = None,
     use_llm: bool = True,

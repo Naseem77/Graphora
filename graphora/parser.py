@@ -815,9 +815,11 @@ def _type_name(text: str) -> str:
     for wrapper in ("Optional[", "Awaitable[", "Promise<", "Future<", "Box<", "Rc<", "Arc<", "Option<", "Result<"):
         if text.startswith(wrapper) and text.endswith(("]", ">")):
             text = text[len(wrapper) : -1].split(",")[0].strip().strip("\"'")
-    if "|" in text:
-        parts = [p.strip() for p in text.split("|") if p.strip() not in ("None", "null", "undefined")]
-        text = parts[0] if len(parts) == 1 else ""
+    if "|" in text or text.startswith("Union["):
+        inner = text[len("Union[") : -1] if text.startswith("Union[") else text
+        parts = [p.strip() for p in re.split(r"[|,]", inner) if p.strip() not in ("None", "null", "undefined")]
+        names = [_type_name(p) for p in parts]
+        return "|".join(names) if names and all(names) else ""
     text = text.split("<")[0].strip()
     return text if _TYPE_NAME.match(text) else ""
 

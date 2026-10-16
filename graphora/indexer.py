@@ -6,10 +6,13 @@ import fnmatch
 import logging
 import subprocess
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from graphora.parser import ParsedFile, is_supported_code_file, parse_code_file
 from graphora.store import GraphStore
+
+if TYPE_CHECKING:
+    from graphora.store import GraphBackend
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +113,10 @@ def index_repository(
     host: str = "localhost",
     port: int = 6379,
     ignores: list[str] | None = None,
-    store: GraphStore | None = None,
+    store: GraphBackend | None = None,
     on_progress: ProgressCallback | None = None,
     include_generated: bool = False,
-) -> GraphStore:
+) -> GraphBackend:
     """Parse every supported file under `root` and build the graph.
 
     Returns the GraphStore for further queries. Zero LLM calls.
@@ -157,8 +160,8 @@ def update_files(
     project: str | None = None,
     host: str = "localhost",
     port: int = 6379,
-    store: GraphStore | None = None,
-) -> GraphStore:
+    store: GraphBackend | None = None,
+) -> GraphBackend:
     """Incremental update: re-parse only the given relative paths."""
     root = Path(root).resolve()
     project = project or root.name

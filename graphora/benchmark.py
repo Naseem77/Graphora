@@ -26,11 +26,14 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from graphora.blast import blast_radius
 from graphora.indexer import collect_source_files
 from graphora.review import estimate_tokens
-from graphora.store import GraphStore
+
+if TYPE_CHECKING:
+    from graphora.store import GraphBackend
 
 
 @dataclass(frozen=True)
@@ -105,13 +108,13 @@ class BenchmarkResult:
         return "\n".join(lines)
 
 
-def pick_symbols(store: GraphStore, count: int = 3) -> list[str]:
+def pick_symbols(store: GraphBackend, count: int = 3) -> list[str]:
     """Deterministically pick the most-connected non-test functions."""
     return store.top_connected_symbols(count)
 
 
 def run_benchmark(
-    store: GraphStore,
+    store: GraphBackend,
     root: str | Path,
     symbols: list[str] | None = None,
 ) -> BenchmarkResult:
@@ -163,7 +166,7 @@ def run_benchmark(
     )
 
 
-def _python_definition_coverage(store: GraphStore, contents: dict[str, str]) -> tuple[int, int]:
+def _python_definition_coverage(store: GraphBackend, contents: dict[str, str]) -> tuple[int, int]:
     """(definitions Python's ast finds, how many of them the graph has), by qualified name."""
     total = found = 0
     for path, text in sorted(contents.items()):

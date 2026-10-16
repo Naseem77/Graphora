@@ -305,3 +305,18 @@ def test_call_results_resolve_through_declared_return_types():
         ("falkordb/graph.py", "Graph.query"),
     }
     assert edges[("run", "falkordb/graph.py", "Graph.query")][::2] == (EXTRACTED, "returns")
+
+
+def test_union_typed_receiver_lists_both_types():
+    edges, _ = _resolve(
+        {
+            "stores.py": (
+                "class FalkorStore:\n    def find(self, n):\n        return n\n"
+                "class JsonStore:\n    def find(self, n):\n        return n\n"
+                "class Other:\n    def find(self, n):\n        return n\n"
+            ),
+            "use.py": "from stores import FalkorStore, JsonStore\n\ndef lookup(store: FalkorStore | JsonStore):\n    return store.find('x')\n",
+        }
+    )
+    assert _targets(edges, "lookup") == {("stores.py", "FalkorStore.find"), ("stores.py", "JsonStore.find")}
+    assert edges[("lookup", "stores.py", "JsonStore.find")][::2] == (AMBIGUOUS, "union")

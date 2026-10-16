@@ -255,6 +255,12 @@ class _Resolver:
 
         if receiver == "":
             return self._resolve_bare(record, family, caller, call.callee)
+        if "|" in receiver:  # `x: A | B`: either type's method
+            owners = [c for part in receiver.split("|") for c in self._classes_named(part, record.path)]
+            found = [m for owner in owners for m in self._methods_of(owner.qualname, call.callee, owner.path)]
+            if found:
+                return found, EXTRACTED if len(found) == 1 else AMBIGUOUS, "union"
+            receiver = "<expr>"
         if receiver.endswith("()"):
             owners = self._result_classes(record, caller, receiver, depth=0)
             found = [m for owner in owners for m in self._methods_of(owner.qualname, call.callee, owner.path)]
