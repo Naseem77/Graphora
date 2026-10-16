@@ -50,6 +50,11 @@ def _new_server():
 def build_server(project: str, host: str = "localhost", port: int = 6379, backend: str = "auto"):
     mcp = _new_server()
     store = open_store(project, backend=backend, host=host, port=port)
+    if not store.has_files():
+        print(
+            f"graphora: warning: graph {store.graph_name!r} is empty; index the repository first",
+            file=sys.stderr,
+        )
 
     @mcp.tool()
     def graph_stats() -> str:

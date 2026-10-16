@@ -24,7 +24,16 @@ from graphora.store import open_store
 
 
 def _store(args: argparse.Namespace):
-    return open_store(args.project, backend=args.backend, host=args.host, port=args.port)
+    """Open the project graph for a read command, warning if nothing is indexed."""
+    store = open_store(args.project, backend=args.backend, host=args.host, port=args.port)
+    if not store.has_files():
+        print(
+            f"graphora: warning: graph {store.graph_name!r} ({store.backend}) is empty. "
+            f"Run 'graphora index <repo-path>' first, or pass --project "
+            f"(it defaults to the current directory name).",
+            file=sys.stderr,
+        )
+    return store
 
 
 def cmd_index(args: argparse.Namespace) -> int:

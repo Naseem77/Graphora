@@ -65,3 +65,12 @@ def test_flags_before_nested_subcommand_are_kept():
     assert args.port == 7000
     args = build_parser().parse_args(["sessions", "connected", "file", "a.py"])
     assert (args.project, args.backend, args.port) == (None, "auto", 6379)
+
+
+def test_query_on_empty_graph_warns(tmp_path: Path, capsys, monkeypatch):
+    from graphora.cli import main
+
+    monkeypatch.setenv("GRAPHORA_DATA_DIR", str(tmp_path))
+    assert main(["blast", "anything", "--project", "never-indexed", "--backend", "embedded"]) == 0
+    err = capsys.readouterr().err
+    assert "never-indexed" in err and "graphora index" in err
