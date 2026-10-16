@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from graphora.parser import is_supported_code_file, parse_code_file
+from graphora.parser import ParsedFile, is_supported_code_file, parse_code_file
 from graphora.store import GraphStore
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,15 @@ def collect_source_files(root: str | Path, ignores: list[str] | None = None) -> 
             continue
         files.append(path)
     return files
+
+
+def _parse_or_skip(rel: str, content: str) -> ParsedFile | None:
+    """Parse one file; a parser failure skips that file instead of aborting the run."""
+    try:
+        return parse_code_file(rel, content)
+    except Exception as exc:  # noqa: BLE001 - one bad file must not kill the index
+        logger.warning("Skipping file that failed to parse %s: %s: %s", rel, type(exc).__name__, exc)
+        return None
 
 
 def index_repository(
@@ -65,7 +74,9 @@ def index_repository(
         except OSError as exc:
             logger.warning("Skipping unreadable file %s: %s", rel, exc)
             continue
-        parsed_files.append(parse_code_file(rel, content))
+        parsed = _parse_or_skip(rel, content)
+        if parsed is not None:
+            parsed_files.append(parsed)
 
     store.clear()
     for index, parsed in enumerate(parsed_files, start=1):
@@ -100,6 +111,10 @@ def update_files(
         if not is_supported_code_file(rel):
             continue
         content = full.read_text(encoding="utf-8", errors="replace")
-        store.write_files([parse_code_file(rel, content)])
+        parsed = _parse_or_skip(rel, content)
+        if parsed is None:
+            store.delete_file(rel)
+            continue
+        store.write_files([parsed])
     store.link_cross_file_calls()
     return store

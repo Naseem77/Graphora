@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 try:
     from tree_sitter import Language, Parser
@@ -230,11 +230,13 @@ def _point_row(point: Any) -> int:
     return point[0]
 
 
-def _walk_nodes(node: Any) -> list[Any]:
-    nodes = [node]
-    for child in node.children:
-        nodes.extend(_walk_nodes(child))
-    return nodes
+def _walk_nodes(node: Any) -> Iterator[Any]:
+    """Pre-order walk without recursion (deep expressions overflow the stack)."""
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(reversed(current.children))
 
 
 def _node_text(node: Any | None, content: bytes) -> str:
