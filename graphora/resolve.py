@@ -64,8 +64,8 @@ _SELF_RECEIVERS = {
 # Languages where a bare call `f()` inside a method may call a sibling method.
 _IMPLICIT_SELF = {"java", "c", "ruby"}
 _CONSTRUCTOR_NAMES = ("__init__", "constructor", "initialize", "__construct")
-# Rules that pick candidates by name rather than by what the source names.
-_GUESSED = {"name", "receiver-unknown", "self-inherited", "class"}
+# Rules where the source itself names the target (an import, the same file, self).
+_EXPLICIT = {"import", "same-file", "self"}
 _JS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 _C_SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx")
 
@@ -290,8 +290,9 @@ class _Resolver:
                     continue
                 targets, confidence, reason = self._resolve_call(record, caller, call)
                 targets = [t for t in dict.fromkeys(targets) if t.key != caller.key]
-                if not caller.is_test and reason in _GUESSED and any(not t.is_test for t in targets):
-                    targets = [t for t in targets if not t.is_test]  # production code never calls test doubles
+                if not caller.is_test and reason not in _EXPLICIT:
+                    # Production code never calls into another file's test code unless it imports it.
+                    targets = [t for t in targets if not t.is_test or t.path == caller.path]
                 if not targets:
                     continue
                 if len(targets) > MAX_CANDIDATES:
@@ -558,8 +559,14 @@ class _Resolver:
         ]
         if members:
             same_file = [s for s in members if s.path == record.path]
-            members = same_file or members
-            return members, EXTRACTED if len(members) == 1 else AMBIGUOUS, "namespace"
+            if same_file:
+                members = same_file
+            elif family in {"python", "js"}:
+                # An object literal in another file is only visible through an import.
+                visible = {target for _, target in self._imports_of(record)}
+                members = [s for s in members if s.path in visible]
+            if members:
+                return members, EXTRACTED if len(members) == 1 else AMBIGUOUS, "namespace"
 
         # A type name that is not defined anywhere in the repository (`String::new()`,
         # `Math.max()`, `Path.home()`): a library type, so not your code.

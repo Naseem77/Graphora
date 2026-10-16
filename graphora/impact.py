@@ -216,8 +216,9 @@ def _walk(store: GraphBackend, targets: list[dict], unresolved: list[str], depth
             previous = best.get(caller["key"])
             if previous is None or (entry.certain, -entry.depth) > (previous.certain, -previous.depth):
                 best[caller["key"]] = entry
-            if not caller["is_test"]:
-                queue.append((caller["key"], level + 1, (caller["qualname"], *chain), still_certain))
+            # Test helpers (page objects, fixtures) are walked too, so the tests that use
+            # them are found; everything reached through a test stays under "tests".
+            queue.append((caller["key"], level + 1, (caller["qualname"], *chain), still_certain))
     entries = sorted(best.values(), key=lambda b: (b.depth, b.caller["path"], b.caller["line"]))
     return WhatCouldBreak(
         targets=targets,

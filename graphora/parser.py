@@ -34,7 +34,9 @@ CODE_EXTENSIONS = {
 # Languages with regex symbol patterns; used for diff attribution too.
 REGEX_LANGUAGES = ("python", "typescript", "go", "java", "rust", "c", "cpp", "ruby", "php")
 
-_TEST_PATH_PATTERN = re.compile(r"(^|/)(tests?|__tests__|spec)(/|_)|(_test\.|\.test\.|\.spec\.|^test_)")
+_TEST_PATH_PATTERN = re.compile(
+    r"(^|/)(tests?|__tests__|spec|e2e|cypress)(/|_)|(_test\.|\.test\.|\.spec\.|^test_|/test_)"
+)
 
 
 @dataclass(frozen=True)
@@ -258,6 +260,8 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
 
     # Variable -> type facts, keyed by the scope that owns them ("" = module).
     types: dict[str, dict[str, str]] = {}
+    # Ruby local variable names per method: a bare identifier that is not one is a call.
+    ruby_locals: dict[str, set[str]] = {}
 
     # Iterative pre-order walk carrying the enclosing scopes (deep trees overflow recursion).
     stack: list[tuple[Any, tuple[_Frame, ...]]] = [(root, ())]
@@ -325,6 +329,11 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
                 line = _point_row(node.start_point) + 1
                 calls.append(ParsedCall(caller=caller, callee=callee, line=line, confidence=INFERRED, receiver=receiver))
 
+        if language == "ruby":
+            bare = _ruby_bare_call(node, scope, ruby_locals, content_bytes)
+            if bare is not None:
+                calls.append(bare)
+
         stack.extend((child, child_scope) for child in reversed(node.children))
 
     symbols = _settle_qualifier_kinds(_with_attributes(symbols, types))
@@ -351,6 +360,8 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
 
 def _is_test_item(language: str, node: Any, name: str, content: bytes) -> bool:
     """Rust inline tests: `#[cfg(test)] mod tests`, `#[test]`/`#[tokio::test]` functions."""
+    if language in {"javascript", "typescript"} and node.type == "call_expression":
+        return True  # a describe/it/test block (only those become definitions)
     if language != "rust" or node.type not in {"mod_item", "function_item"}:
         return False
     if node.type == "mod_item" and name == "tests":
@@ -362,6 +373,43 @@ def _is_test_item(language: str, node: Any, name: str, content: bytes) -> bool:
             return True
         sibling = sibling.prev_named_sibling
     return False
+
+
+_RUBY_BARE_CALL_PARENTS = {
+    "body_statement", "then", "else", "begin", "argument_list", "assignment", "binary", "return",
+    "parenthesized_statements", "if", "unless", "while", "until", "conditional", "array", "pair",
+    "interpolation", "do_block", "block_body", "ensure", "rescue",
+}
+
+
+def _ruby_bare_call(
+    node: Any, scope: tuple[_Frame, ...], locals_by_method: dict[str, set[str]], content: bytes
+) -> ParsedCall | None:
+    """Ruby calls a method without parentheses: `helper` alone is a call unless it is a local."""
+    method = next((f.qualname for f in reversed(scope) if f.kind == "Function"), None)
+    if method is None:
+        return None
+    known = locals_by_method.setdefault(method, set())
+    parent = node.parent
+    if node.type == "assignment":
+        left = node.child_by_field_name("left")
+        if left is not None and left.type == "identifier":
+            known.add(_node_text(left, content))
+        return None
+    if node.type in {"method_parameters", "block_parameters", "lambda_parameters"}:
+        for child in node.named_children:
+            name_node = child if child.type == "identifier" else child.child_by_field_name("name")
+            if name_node is not None:
+                known.add(_node_text(name_node, content))
+        return None
+    if node.type != "identifier" or parent is None or parent.type not in _RUBY_BARE_CALL_PARENTS:
+        return None
+    if parent.type == "assignment" and parent.child_by_field_name("left") == node:
+        return None
+    name = _node_text(node, content)
+    if name in known or not _NAME_PATTERN.match(name):
+        return None
+    return ParsedCall(method, name, _point_row(node.start_point) + 1, INFERRED, "")
 
 
 def _type_owner(scope: tuple[_Frame, ...], target: str) -> str:
@@ -586,8 +634,38 @@ def _python_definition(node: Any, content: bytes) -> _Definition | None:
     return None
 
 
+_JS_TEST_BLOCKS = {"describe", "it", "test", "context", "suite", "specify",
+                   "beforeEach", "afterEach", "beforeAll", "afterAll", "before", "after"}
+
+
+def _js_test_block(node: Any, content: bytes) -> _Definition | None:
+    """`it("does x", () => {...})` and friends: a test symbol named after its label,
+    so the calls inside the callback count as test callers."""
+    function = node.child_by_field_name("function")
+    if function is None:
+        return None
+    base = ""
+    if function.type == "identifier":
+        base = _node_text(function, content)
+    elif function.type == "member_expression":  # test.only(...), it.skip(...), test.describe(...)
+        obj = _node_text(function.child_by_field_name("object"), content)
+        prop = _node_text(function.child_by_field_name("property"), content)
+        base = prop if prop in {"describe", "step"} else obj
+    if base not in _JS_TEST_BLOCKS and base != "step":
+        return None
+    args = node.child_by_field_name("arguments")
+    values = args.named_children if args is not None else []
+    if not any(v.type in _JS_FUNCTION_VALUES for v in values):
+        return None
+    label = next((_node_text(v, content).strip("\"'`") for v in values if v.type in {"string", "template_string"}), "")
+    slug = re.sub(r"\W+", "_", label).strip("_")[:60]
+    return _Definition("Function", f"{base}_{slug}" if slug else base)
+
+
 def _js_definition(node: Any, content: bytes) -> _Definition | None:
     kind = node.type
+    if kind == "call_expression":
+        return _js_test_block(node, content)
     if kind in {"function_declaration", "generator_function_declaration", "method_definition"}:
         return _named("Function", node, content)
     if kind in {"class_declaration", "abstract_class_declaration", "class", "interface_declaration", "enum_declaration"}:

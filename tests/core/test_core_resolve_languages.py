@@ -416,3 +416,62 @@ def test_attribute_chains_resolve_through_field_types():
     assert ("tools.py", "EvidenceLedger.get") in _targets(edges, "test_helper")
     # Class-body annotations do not leak into module scope.
     assert not any(q == "EvidenceLedger.get" for (a, _, q) in edges if a == "<module>")
+
+
+def test_production_never_reaches_test_code_through_any_rule():
+    edges = _resolve(
+        {
+            "src/app.js": "export function boot() { api.load(); }\n",
+            "tests/api.test.js": "const api = { load() { return 0; } };\n",
+            "src/other.js": "const api = { load() { return 1; } };\n",
+            "app/run.py": "def make():\n    return object()\n\ndef go():\n    make().send()\n",
+            "tests/conftest.py": "class Client:\n    def send(self):\n        return 1\n",
+        }
+    )
+    # `api` is neither defined in app.js nor imported: it may be a global. Never the test file,
+    # and the other file's object only as an uncertain candidate.
+    assert ("tests/api.test.js", "api.load") not in _targets(edges, "boot")
+    assert {edges[("boot", p, q)][0] for p, q in _targets(edges, "boot")} <= {AMBIGUOUS}
+    assert _targets(edges, "go") == {("app/run.py", "make")}
+
+
+def test_javascript_test_blocks_are_test_callers():
+    from graphora.parser import parse_code_file
+
+    source = (
+        "import { Graph } from '../src/graph';\n"
+        "describe('Graph', () => {\n"
+        "  beforeEach(() => { reset(); });\n"
+        "  it('runs a query', async () => {\n"
+        "    const g = new Graph();\n"
+        "    await g.query('MATCH (n) RETURN n');\n"
+        "  });\n"
+        "  test.only('second', () => { new Graph().query('x'); });\n"
+        "});\n"
+    )
+    parsed = parse_code_file("tests/graph.spec.ts", source)
+    names = {s.qualname for s in parsed.symbols}
+    assert {"describe_Graph", "describe_Graph.it_runs_a_query", "describe_Graph.test_second"} <= names
+    edges = _resolve({"src/graph.ts": "export class Graph { query(q: string) { return q; } }\n", "tests/graph.spec.ts": source})
+    assert ("src/graph.ts", "Graph.query") in _targets(edges, "describe_Graph.it_runs_a_query")
+    assert edges[("describe_Graph.it_runs_a_query", "src/graph.ts", "Graph.query")][0] == EXTRACTED
+    assert ("src/graph.ts", "Graph.query") in _targets(edges, "describe_Graph.test_second")
+
+
+def test_ruby_paren_less_calls_are_calls():
+    edges = _resolve(
+        {
+            "lib/app.rb": (
+                "def helper\n  1\nend\n"
+                "def helper3\n  3\nend\n"
+                "def run(arg)\n"
+                "  helper\n"
+                "  x = helper3\n"
+                "  local = 2\n"
+                "  local\n"
+                "  arg\n"
+                "end\n"
+            )
+        }
+    )
+    assert _targets(edges, "run") == {("lib/app.rb", "helper"), ("lib/app.rb", "helper3")}

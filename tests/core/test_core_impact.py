@@ -210,3 +210,26 @@ def test_double_colon_names_are_accepted(tmp_path):
     store = EmbeddedGraphStore("cpp", data_dir=tmp_path / "data")
     index_repository(repo, project="cpp", store=store)
     assert [s["qualname"] for s in select_symbols(store, "geo::total")] == ["geo.total"]
+
+
+def test_e2e_page_objects_are_test_code_and_lead_to_specs(tmp_path):
+    from graphora.parser import is_test_path
+
+    assert is_test_path("e2e/logic/pom/homePage.ts")
+    assert is_test_path("cypress/support/commands.js")
+    repo = tmp_path / "web"
+    (repo / "src").mkdir(parents=True)
+    (repo / "e2e" / "pom").mkdir(parents=True)
+    (repo / "e2e" / "tests").mkdir(parents=True)
+    (repo / "src" / "wait.ts").write_text("export function waitFor(sel: string) { return sel; }\n")
+    (repo / "e2e" / "pom" / "home.ts").write_text(
+        "import { waitFor } from '../../src/wait';\nexport class HomePage { open() { return waitFor('#app'); } }\n"
+    )
+    (repo / "e2e" / "tests" / "home.spec.ts").write_text(
+        "import { HomePage } from '../pom/home';\ntest('opens', async () => { new HomePage().open(); });\n"
+    )
+    store = EmbeddedGraphStore("web", data_dir=tmp_path / "data")
+    index_repository(repo, project="web", store=store)
+    result = what_could_break(store, ["waitFor"], depth=2)
+    assert result.will_break == []
+    assert {b.caller["qualname"] for b in result.tests} == {"HomePage.open", "test_opens"}
