@@ -181,44 +181,123 @@ def _parse_cargo_toml(path: str, content: str) -> ParsedFile:
     return ParsedFile(path, "cargo", [], [], [], content, parser_used="regex", bindings=bindings)
 
 
+@dataclass(frozen=True)
+class DiffFile:
+    """One file of a unified diff."""
+
+    path: str  # new path, or the old path when the file was deleted
+    deleted: bool
+    added: list[tuple[int, str]]  # (new-side line, text)
+    removed: list[tuple[int, int, str]]  # (old-side line, new-side line it sits before, text)
+
+
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_unified_diff(diff: str) -> list[DiffFile]:
+    """Parse git and GNU unified diffs.
+
+    Hunk line counts are tracked, so a removed line whose text starts with
+    "--" (raw "--- ...") is content, not a file header; GNU timestamps after
+    a tab and git's quoted paths ("b/sp\\303\\244ce.py") are handled.
+    """
+    files: list[DiffFile] = []
+    old_path = new_path = ""
+    added: list[tuple[int, str]] = []
+    removed: list[tuple[int, int, str]] = []
+    old_left = new_left = 0
+    old_line = new_line = 0
+
+    def flush() -> None:
+        if new_path or old_path:
+            deleted = new_path in ("", "/dev/null")
+            files.append(DiffFile(old_path if deleted else new_path, deleted, list(added), list(removed)))
+
+    lines = diff.splitlines()
+    for index, raw in enumerate(lines):
+        if (old_left > 0 or new_left > 0) and _starts_file_header(lines, index):
+            old_left = new_left = 0  # hand-written hunk with wrong counts: a new file starts here
+        if old_left > 0 or new_left > 0:  # inside a hunk
+            if raw.startswith("\\"):
+                continue  # "\ No newline at end of file"
+            if raw.startswith("+"):
+                added.append((new_line, raw[1:]))
+                new_line += 1
+                new_left -= 1
+            elif raw.startswith("-"):
+                removed.append((old_line, new_line, raw[1:]))
+                old_line += 1
+                old_left -= 1
+            else:  # context (" text", or "" for an empty context line)
+                old_line += 1
+                new_line += 1
+                old_left -= 1
+                new_left -= 1
+            continue
+        if raw.startswith("--- "):
+            flush()
+            old_path, new_path = _diff_path(raw[4:]), ""
+            added, removed = [], []
+        elif raw.startswith("+++ "):
+            new_path = _diff_path(raw[4:])
+        else:
+            match = _HUNK_HEADER.match(raw)
+            if match:
+                old_line, new_line = int(match.group(1)), int(match.group(3))
+                old_left = int(match.group(2)) if match.group(2) is not None else 1
+                new_left = int(match.group(4)) if match.group(4) is not None else 1
+    flush()
+    return files
+
+
+def _starts_file_header(lines: list[str], index: int) -> bool:
+    return (
+        lines[index].startswith("--- ")
+        and index + 2 < len(lines)
+        and lines[index + 1].startswith("+++ ")
+        and lines[index + 2].startswith("@@ ")
+    )
+
+
+def _diff_path(text: str) -> str:
+    text = text.rstrip("\n").split("\t", 1)[0].strip()  # GNU diff: "path<TAB>timestamp"
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
+        text = text.encode("latin-1").decode("utf-8", "replace")
+    if text == "/dev/null":
+        return text
+    return text[2:] if text.startswith(("a/", "b/")) else text
+
+
+def definition_names(path: str, texts: list[str]) -> list[str]:
+    """Names of symbols defined on the given lines of `path` (its language's patterns only)."""
+    language = language_for_path(path)
+    languages: tuple[str, ...] = ("typescript",) if language == "javascript" else (language,)
+    if language == "text":
+        languages = REGEX_LANGUAGES
+    names: list[str] = []
+    for text in texts:
+        for lang in languages:
+            names.extend(name for _, name in _extract_symbols(lang, text.strip()))
+    return list(dict.fromkeys(names))
+
+
 def extract_symbols_from_diff(diff: str) -> list[str]:
     """Names of symbols defined on added/removed diff lines.
 
     Each line is matched only with the definition patterns of its file's
-    language (from the ---/+++ headers); C's patterns used to read Python's
-    `return len(` as a definition of `len`.
+    language; C's patterns used to read Python's `return len(` as a
+    definition of `len`.
     """
-    symbols: list[str] = []
-    seen: set[str] = set()
-    languages: tuple[str, ...] = REGEX_LANGUAGES
-    for line in diff.splitlines():
-        if line.startswith(("+++ ", "--- ")):
-            target = line[4:].strip()
-            if target != "/dev/null":
-                language = language_for_path(target.removeprefix("a/").removeprefix("b/"))
-                languages = ("typescript",) if language == "javascript" else (language,)
-                if language == "text":
-                    languages = REGEX_LANGUAGES
-            continue
-        if not line.startswith(("+", "-")):
-            continue
-        stripped = line[1:].strip()
-        for language in languages:
-            for _, name in _extract_symbols(language, stripped):
-                if name not in seen:
-                    seen.add(name)
-                    symbols.append(name)
-    return symbols
+    names: list[str] = []
+    for f in parse_unified_diff(diff):
+        names.extend(definition_names(f.path, [t for _, _, t in f.removed] + [t for _, t in f.added]))
+    return list(dict.fromkeys(names))
 
 
 def extract_files_from_diff(diff: str) -> list[str]:
-    """File paths touched by a unified diff."""
-    files: list[str] = []
-    for line in diff.splitlines():
-        match = re.match(r"^\+\+\+ (?:b/)?(.+)$", line)
-        if match and match.group(1) != "/dev/null" and match.group(1) not in files:
-            files.append(match.group(1))
-    return files
+    """Paths of the files a unified diff changes or adds (not those it deletes)."""
+    return list(dict.fromkeys(f.path for f in parse_unified_diff(diff) if not f.deleted))
 
 
 # --- tree-sitter path -------------------------------------------------------

@@ -323,6 +323,26 @@ class GraphStore:
         )
         return sorted((_record(r) for r in rows), key=lambda r: (r["path"], r["line"]))
 
+    def call_sites_named(self, name: str) -> list[dict]:
+        """Every stored call site whose callee is `name`, and whether it resolved."""
+        out = []
+        for (raw_calls,) in self.query("MATCH (f:File) RETURN f.raw_calls"):
+            for caller_key, callee, receiver, line in json.loads(raw_calls or "[]"):
+                if callee != name:
+                    continue
+                caller = self.get_symbol(caller_key)
+                if caller is None:
+                    continue
+                # Only a certain edge counts: an AMBIGUOUS one may be a same-named survivor.
+                rows = self.query(
+                    "MATCH (:Function {stable_key: $key})-[r:CALLS {line: $line}]->(t {name: $name}) "
+                    "WHERE r.confidence <> 'AMBIGUOUS' RETURN count(r)",
+                    {"key": caller_key, "line": line, "name": name},
+                )
+                resolved = bool(rows and int(rows[0][0]))
+                out.append({"caller": caller, "line": line, "receiver": receiver, "resolved": resolved})
+        return sorted(out, key=lambda s: (s["caller"]["path"], s["line"]))
+
     def file_importers(self, path: str) -> list[str]:
         rows = self.query("MATCH (a:File)-[:IMPORTS_FILE]->(:File {path: $path}) RETURN DISTINCT a.path", {"path": path})
         return sorted(r[0] for r in rows)

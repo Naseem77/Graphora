@@ -273,6 +273,7 @@ class _Resolver:
             key=lambda item: -len(item[0]),
         )
         self.result = Resolution()
+        self._top_level_cache: dict[tuple[tuple[str, ...], str], list[SymbolRecord]] = {}
 
     # --- driver -------------------------------------------------------------
 
@@ -652,21 +653,43 @@ class _Resolver:
                 return hits[-1:]  # a later redefinition shadows an earlier one
         return []  # only nested in other functions: not visible from here
 
-    def _top_level(self, files: list[str], name: str, depth: int = 0) -> list[SymbolRecord]:
+    def _top_level(self, files: list[str], name: str) -> list[SymbolRecord]:
         """Top-level definitions of `name` in `files`, following re-exports
-        (`from .impl import name` in a package __init__, `export { name } from`)."""
-        found = [s for path in files for s in self.by_file[path] if s.name == name and s.parent_kind in ("", "Namespace")]
-        if found or depth >= 4:
-            return found
-        for path in files:
-            record = self.files.get(path)
-            if record is None:
-                continue
-            for local, module, member, _ in record.bindings:
-                if local == "*" or (local == name and member not in ("", "*", "default")):
-                    original = name if local == "*" else member
-                    found.extend(self._top_level(self._module_files(record, module), original, depth + 1))
-        return list(dict.fromkeys(found))
+        (`from .impl import name` in a package __init__, `export { name } from`).
+
+        Breadth-first over (file, name) pairs, each visited once, and memoized:
+        star-import meshes (30 modules importing each other) stay linear.
+        """
+        key = (tuple(files), name)
+        cached = self._top_level_cache.get(key)
+        if cached is not None:
+            return cached
+        found: list[SymbolRecord] = []
+        frontier = [(path, name) for path in files]
+        seen: set[tuple[str, str]] = set()
+        for _ in range(5):  # re-export hops
+            next_frontier: list[tuple[str, str]] = []
+            for path, wanted in frontier:
+                if (path, wanted) in seen:
+                    continue
+                seen.add((path, wanted))
+                found.extend(
+                    s for s in self.by_file[path] if s.name == wanted and s.parent_kind in ("", "Namespace")
+                )
+            if found or not frontier:
+                break
+            for path, wanted in frontier:
+                record = self.files.get(path)
+                if record is None:
+                    continue
+                for local, module, member, _ in record.bindings:
+                    if local == "*" or (local == wanted and member not in ("", "*", "default")):
+                        original = wanted if local == "*" else member
+                        next_frontier.extend((target, original) for target in self._module_files(record, module))
+            frontier = [item for item in dict.fromkeys(next_frontier) if item not in seen]
+        result = list(dict.fromkeys(found))
+        self._top_level_cache[key] = result
+        return result
 
     def _default_export(self, files: list[str]) -> list[SymbolRecord]:
         found: list[SymbolRecord] = []
