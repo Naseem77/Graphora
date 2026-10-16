@@ -188,6 +188,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Graph storage: FalkorDB server, embedded JSON (no Docker), or auto-detect (default)",
     )
 
+    # Nested subcommands re-declare the common flags so they work after the
+    # sub-subcommand too; SUPPRESS keeps their defaults from overwriting values
+    # already given before it (argparse applies the inner parser's defaults last).
+    nested_common = argparse.ArgumentParser(add_help=False)
+    for action in common._actions:
+        nested_common.add_argument(
+            *action.option_strings,
+            dest=action.dest,
+            type=action.type,
+            choices=action.choices,
+            help=action.help,
+            default=argparse.SUPPRESS,
+        )
+
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_index = sub.add_parser("index", parents=[common], help="Index a repository into the graph (no LLM)")
@@ -212,12 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_risk = sub.add_parser("risk", parents=[common], help="Risk memory commands")
     risk_sub = p_risk.add_subparsers(dest="risk_command", required=True)
-    p_mine = risk_sub.add_parser("mine", parents=[common], help="Mine git fix/revert history into the graph")
+    p_mine = risk_sub.add_parser("mine", parents=[nested_common], help="Mine git fix/revert history into the graph")
     p_mine.add_argument("path")
     p_mine.add_argument("--since", default=None, help="e.g. '2 years ago'")
     p_mine.add_argument("--max-commits", type=int, default=2000)
     p_mine.set_defaults(func=cmd_risk_mine)
-    p_top = risk_sub.add_parser("top", parents=[common], help="Riskiest symbols")
+    p_top = risk_sub.add_parser("top", parents=[nested_common], help="Riskiest symbols")
     p_top.add_argument("--limit", type=int, default=15)
     p_top.add_argument("--json", action="store_true")
     p_top.set_defaults(func=cmd_risk_top)
@@ -233,7 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sess = sub.add_parser("sessions", parents=[common], help="Agent session-history graph commands")
     sess_sub = p_sess.add_subparsers(dest="sessions_command", required=True)
-    p_si = sess_sub.add_parser("ingest", parents=[common], help="Ingest agent session stores into the graph")
+    p_si = sess_sub.add_parser("ingest", parents=[nested_common], help="Ingest agent session stores into the graph")
     p_si.add_argument("--source", choices=["all", "copilot", "claude", "codex"], default="all",
                       help="Which agent's sessions to ingest (default: all found)")
     p_si.add_argument("--db", default=None, help="Copilot session-store.db path (default: ~/.copilot/session-store.db)")
@@ -241,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_si.add_argument("--codex-root", default=None, help="Codex CLI sessions dir (default: ~/.codex/sessions)")
     p_si.add_argument("--days", type=int, default=30, help="Only sessions updated in the last N days")
     p_si.set_defaults(func=cmd_sessions_ingest)
-    p_sc = sess_sub.add_parser("connected", parents=[common], help="Sessions connected to a file, repo, or PR/issue/commit")
+    p_sc = sess_sub.add_parser("connected", parents=[nested_common], help="Sessions connected to a file, repo, or PR/issue/commit")
     p_sc.add_argument("kind", choices=["file", "repo", "ref"])
     p_sc.add_argument("value")
     p_sc.set_defaults(func=cmd_sessions_connected)

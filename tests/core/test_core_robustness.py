@@ -52,3 +52,16 @@ def test_many_symbols_parse_in_linear_time():
     elapsed = time.perf_counter() - start
     assert len(parsed.symbols) == 20000
     assert elapsed < 10, f"parse took {elapsed:.1f}s (quadratic signature lookup?)"
+
+
+def test_flags_before_nested_subcommand_are_kept():
+    from graphora.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["sessions", "--project", "X", "--backend", "embedded", "connected", "file", "a.py"]
+    )
+    assert (args.project, args.backend) == ("X", "embedded")
+    args = build_parser().parse_args(["sessions", "connected", "--port", "7000", "file", "a.py"])
+    assert args.port == 7000
+    args = build_parser().parse_args(["sessions", "connected", "file", "a.py"])
+    assert (args.project, args.backend, args.port) == (None, "auto", 6379)
