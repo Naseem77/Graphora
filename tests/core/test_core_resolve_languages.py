@@ -312,3 +312,107 @@ def test_capitalized_types_outside_the_repo_are_external():
     )
     assert _targets(edges, "run") == set()
     assert _targets(edges, "Main.run") == set()
+
+
+def test_generic_wrappers_are_not_their_inner_type():
+    edges = _resolve(
+        {
+            "src/Report.java": "class Report { int get() { return 1; } }\n",
+            "src/S.java": "class S { void run(Future<Report> f) { f.get(); } }\n",
+            "src/foo.rs": "pub struct Foo;\nimpl Foo { pub fn map(&self) {} }\n",
+            "src/use.rs": "fn go(x: Option<Foo>) { x.map(); }\n",
+            "src/graph.ts": "export class Graph { query() { return 1; } }\n",
+            "src/app.ts": (
+                "import { Graph } from './graph';\n"
+                "async function load(): Promise<Graph> { return new Graph(); }\n"
+                "export async function run() { const g = await load(); g.query(); }\n"
+            ),
+        }
+    )
+    assert _targets(edges, "S.run") == set()
+    assert _targets(edges, "go") == set()
+    assert ("src/graph.ts", "Graph.query") in _targets(edges, "run")
+
+
+def test_parameters_and_loop_variables_shadow_outer_types():
+    edges = _resolve(
+        {
+            "a.py": "class A:\n    def go(self):\n        return 1\n",
+            "b.py": "class B:\n    def go(self):\n        return 2\n",
+            "use.py": (
+                "from a import A\nfrom b import B\n\n"
+                "x = A()\n\n"
+                "def untyped(x):\n    return x.go()\n\n"
+                "def loop(items):\n    x = A()\n    for x in items:\n        x.go()\n\n"
+                "def module_level():\n    return x.go()\n"
+            ),
+        }
+    )
+    def go_confidences(caller):
+        return {edges[(caller, p, q)][0] for p, q in _targets(edges, caller) if q.endswith(".go")}
+
+    assert go_confidences("untyped") == {AMBIGUOUS}
+    assert go_confidences("loop") == {AMBIGUOUS}
+    assert _targets(edges, "module_level") == {("a.py", "A.go")}
+
+
+def test_builtin_method_names_on_unknown_receivers_are_not_linked():
+    edges = _resolve(
+        {
+            "ledger.py": "class EvidenceLedger:\n    def get(self, k):\n        return k\n    def summarize(self):\n        return 1\n",
+            "use.py": (
+                "from ledger import EvidenceLedger\n\n"
+                "def read(item, ledger: EvidenceLedger):\n"
+                "    item.metadata.get('a')\n"
+                "    item.summarize()\n"
+                "    ledger.get('b')\n"
+            ),
+        }
+    )
+    assert _targets(edges, "read") == {("ledger.py", "EvidenceLedger.get"), ("ledger.py", "EvidenceLedger.summarize")}
+    assert edges[("read", "ledger.py", "EvidenceLedger.get")][0] == EXTRACTED  # typed receiver still links
+    assert edges[("read", "ledger.py", "EvidenceLedger.summarize")][0] == AMBIGUOUS  # unknown, but not a builtin name
+    lines = _edge_lines(
+        {
+            "ledger.py": "class EvidenceLedger:\n    def get(self, k):\n        return k\n",
+            "use.py": "def read(item):\n    item.metadata.get('a')\n",
+        }
+    )
+    assert lines == []  # item.metadata.get is almost surely dict.get
+
+
+def _edge_lines(files: dict[str, str]) -> list[tuple[str, int]]:
+    symbols, records = [], []
+    for path, source in files.items():
+        file_symbols, record = records_for(parse_code_file(path, source))
+        symbols.extend(file_symbols)
+        records.append(record)
+    by_key = {s.key: s for s in symbols}
+    return [(by_key[e.b].qualname, e.line) for e in resolve(symbols, records).edges]
+
+
+def test_attribute_chains_resolve_through_field_types():
+    edges = _resolve(
+        {
+            "tools.py": (
+                "from dataclasses import dataclass, field\n\n"
+                "class EvidenceLedger:\n    def get(self, n):\n        return n\n\n"
+                "@dataclass\nclass AgentState:\n    evidence: EvidenceLedger = field(default_factory=EvidenceLedger)\n\n"
+                "class Runner:\n"
+                "    def __init__(self):\n        self.state = AgentState()\n"
+                "    def first(self):\n        return self.state.evidence.get(1)\n"
+            ),
+            "test_tools.py": (
+                "from tools import AgentState\n\n"
+                "def test_evidence():\n    state = AgentState()\n    assert state.evidence.get(1)\n\n"
+                "def make() -> AgentState:\n    return AgentState()\n\n"
+                "def test_helper():\n    state = make()\n    assert state.evidence.get(2)\n"
+            ),
+        }
+    )
+    assert ("tools.py", "EvidenceLedger.get") in _targets(edges, "test_evidence")
+    assert edges[("test_evidence", "tools.py", "EvidenceLedger.get")][0] == EXTRACTED
+    assert ("tools.py", "EvidenceLedger.get") in _targets(edges, "Runner.first")
+    assert ("tools.py", "EvidenceLedger.get") in _targets(edges, "test_helper")
+    # Class-body annotations do not leak into module scope.
+    assert not any(q == "EvidenceLedger.get" for (a, _, q) in edges if a == "<module>")

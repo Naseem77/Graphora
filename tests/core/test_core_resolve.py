@@ -92,14 +92,14 @@ def test_unknown_receiver_lists_every_candidate_as_ambiguous():
 
 
 def test_unknown_receiver_with_one_candidate_is_still_ambiguous():
-    # `items.append(x)` may well be list.append, not the repo's Buffer.append.
+    # `items.stage(x)` might be the repo's Buffer.stage, or a library object's method.
     edges, _ = _resolve(
         {
-            "buf.py": "class Buffer:\n    def append(self, x):\n        return x\n",
-            "use.py": "def collect(items):\n    items.append(1)\n",
+            "buf.py": "class Buffer:\n    def stage(self, x):\n        return x\n",
+            "use.py": "def collect(items):\n    items.stage(1)\n",
         }
     )
-    assert edges[("collect", "buf.py", "Buffer.append")][:2] == (AMBIGUOUS, 1)
+    assert edges[("collect", "buf.py", "Buffer.stage")][:2] == (AMBIGUOUS, 1)
 
 
 def test_bare_call_never_matches_a_method_in_python():

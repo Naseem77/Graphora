@@ -50,6 +50,7 @@ class ParsedSymbol:
     parent_kind: str = ""  # "Class", "Function", "Namespace", or ""
     returns: str = ""  # declared return type name, when the source states one
     is_test: bool = False  # test code inside a non-test file (Rust #[cfg(test)] / #[test])
+    attributes: str = ""  # classes: "field=Type;other=Type" for fields whose type is stated
 
     def __post_init__(self) -> None:
         if not self.qualname:
@@ -265,6 +266,14 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
         child_scope = scope
 
         for target, kind in _tree_sitter_types(language, node, content_bytes):
+            if scope and scope[-1].kind == "Class" and not target.startswith(_SELF_PREFIXES):
+                if language in {"python", "javascript", "typescript"}:
+                    # A class-body annotation (`evidence: Ledger`, dataclass fields) types the attribute.
+                    target = ("self." if language == "python" else "this.") + target
+                else:
+                    # Java & co. use fields without `this.`: keep the bare name on the class.
+                    types.setdefault(scope[-1].qualname, {})[target] = kind
+                    continue
             owner = _type_owner(scope, target)
             types.setdefault(owner, {})[target] = kind
 
@@ -318,7 +327,7 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
 
         stack.extend((child, child_scope) for child in reversed(node.children))
 
-    symbols = _settle_qualifier_kinds(symbols)
+    symbols = _settle_qualifier_kinds(_with_attributes(symbols, types))
 
     # Calls to a function defined in the same file are certain: promote to EXTRACTED.
     local_functions = {s.name for s in symbols if s.kind == "Function"}
@@ -373,9 +382,9 @@ def _typed_receiver(receiver: str, scope: tuple[_Frame, ...], types: dict[str, d
     def lookup(key: str) -> str:
         key = _normal_target(key)
         for owner in owners:
-            kind = types.get(owner, {}).get(key)
-            if kind:
-                return kind
+            scope_types = types.get(owner, {})
+            if key in scope_types:
+                return scope_types[key]  # "" = shadowed by an untyped local: unknown
         return ""
 
     for _ in range(4):  # `g = db.select_graph()` where `db = FalkorDB()`: follow the chain
@@ -392,9 +401,17 @@ def _typed_receiver(receiver: str, scope: tuple[_Frame, ...], types: dict[str, d
                 return "<expr>"
             continue
         typed = lookup(receiver)
-        if not typed:
-            return receiver
-        receiver = typed
+        if typed:
+            receiver = typed
+            continue
+        # `state.evidence` where `state: AgentState`: the type, then the field chain
+        # ("AgentState#evidence"); the resolver reads the field types of the class.
+        parts = receiver.split(".")
+        for cut in range(len(parts) - 1, 0, -1):
+            typed = lookup(".".join(parts[:cut]))
+            if typed and "#" not in typed and "|" not in typed:
+                return f"{typed}#{'.'.join(parts[cut:])}"
+        return receiver
     return receiver
 
 
@@ -407,15 +424,31 @@ def _return_type(language: str, node: Any, content: bytes) -> str:
         value = field("value")
         return _return_type(language, value, content) if value is not None else ""
     if language in {"python", "javascript", "typescript", "rust", "php"}:
-        return _type_name(_node_text(field("return_type"), content))
+        return _type_name(_node_text(field("return_type"), content), returned=True)
     if language == "go":
         result = field("result")
         if result is None or result.type == "parameter_list":
             return ""
-        return _type_name(_node_text(result, content))
+        return _type_name(_node_text(result, content), returned=True)
     if language in {"java", "c", "cpp"}:
-        return _type_name(_node_text(field("type"), content))
+        return _type_name(_node_text(field("type"), content), returned=True)
     return ""
+
+
+def _with_attributes(symbols: list[ParsedSymbol], types: dict[str, dict[str, str]]) -> list[ParsedSymbol]:
+    """Record each class's typed fields so `obj.field.method()` can be resolved."""
+    out = []
+    for s in symbols:
+        if s.kind == "Class" and types.get(s.qualname):
+            fields = sorted(
+                f"{target.split('.', 1)[-1].lstrip('@')}={kind}"
+                for target, kind in types[s.qualname].items()
+                if kind and target.startswith(_SELF_PREFIXES) and target.count(".") <= 1 and "#" not in kind
+            )
+            if fields:
+                s = replace(s, attributes=";".join(fields))
+        out.append(s)
+    return out
 
 
 def _settle_qualifier_kinds(symbols: list[ParsedSymbol]) -> list[ParsedSymbol]:
@@ -864,11 +897,19 @@ _TYPE_NAME = re.compile(r"^[A-Za-z_]\w*(?:(?:\.|::|\\)[A-Za-z_]\w*)*$")
 _SELF_PREFIXES = ("self.", "this.", "@")
 
 
-def _type_name(text: str) -> str:
+# Wrappers whose methods are the inner type's: Optional (a union with None), and
+# Rust smart pointers (auto-deref). Option/Result/Future have methods of their own.
+_TRANSPARENT_WRAPPERS = ("Optional[", "Box<", "Rc<", "Arc<")
+# Unwrapped only as a return type, where callers `await` the value.
+_AWAITED_WRAPPERS = ("Awaitable[", "Promise<")
+
+
+def _type_name(text: str, returned: bool = False) -> str:
     text = " ".join(text.split()).lstrip(":").strip().strip("\"'")
     for prefix in ("&mut ", "&", "*", "?", "mut "):
         text = text.removeprefix(prefix).strip()
-    for wrapper in ("Optional[", "Awaitable[", "Promise<", "Future<", "Box<", "Rc<", "Arc<", "Option<", "Result<"):
+    wrappers = _TRANSPARENT_WRAPPERS + (_AWAITED_WRAPPERS if returned else ())
+    for wrapper in wrappers:
         if text.startswith(wrapper) and text.endswith(("]", ">")):
             text = text[len(wrapper) : -1].split(",")[0].strip().strip("\"'")
     if "|" in text or text.startswith("Union["):
@@ -943,7 +984,15 @@ def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[s
 
     out: list[tuple[str, str]] = []
     if language == "python":
-        if t == "typed_parameter":
+        if t == "parameters":
+            for child in node.named_children:  # untyped parameters shadow outer names
+                if child.type == "identifier":
+                    out.append((text(child), ""))
+                elif child.type == "default_parameter":
+                    out.append((text(child.child_by_field_name("name")), ""))
+        elif t == "for_statement" and field("left") is not None and field("left").type == "identifier":
+            out.append((text(field("left")), ""))
+        elif t == "typed_parameter":
             names = [c for c in node.named_children if c.type == "identifier"]
             if names:
                 out.append((text(names[0]), _type_name(text(field("type")))))
@@ -955,7 +1004,13 @@ def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[s
                 declared = _type_name(text(field("type"))) if field("type") is not None else ""
                 out.append((text(left), declared or _assigned_type(language, field("right"), content)))
     elif language in {"javascript", "typescript"}:
-        if t in {"required_parameter", "optional_parameter"}:
+        if t == "formal_parameters":
+            out.extend((text(c), "") for c in node.named_children if c.type == "identifier")
+        elif t in {"for_in_statement"} and field("left") is not None:
+            left = field("left")
+            names = [left] if left.type == "identifier" else [c for c in left.named_children if c.type == "identifier"]
+            out.extend((text(n), "") for n in names)
+        elif t in {"required_parameter", "optional_parameter"}:
             pattern = field("pattern")
             if pattern is not None and pattern.type == "identifier":
                 out.append((text(pattern), _type_name(text(field("type")))))
@@ -969,7 +1024,9 @@ def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[s
         elif t == "public_field_definition" and field("type") is not None:
             out.append((f"this.{text(field('name'))}", _type_name(text(field("type")))))
     elif language == "java":
-        if t == "formal_parameter":
+        if t == "enhanced_for_statement":
+            out.append((text(field("name")), _type_name(text(field("type")))))
+        elif t == "formal_parameter":
             out.append((text(field("name")), _type_name(text(field("type")))))
         elif t in {"local_variable_declaration", "field_declaration"}:
             declared = _type_name(text(field("type")))
@@ -1003,7 +1060,14 @@ def _tree_sitter_types(language: str, node: Any, content: bytes) -> list[tuple[s
             out.append((text(field("left")), _assigned_type(language, field("right"), content)))
     elif language == "ruby" and t == "assignment":
         out.append((text(field("left")), _assigned_type(language, field("right"), content)))
-    return [(_normal_target(target), kind) for target, kind in out if target and kind]
+    # An empty type is kept for plain names: it shadows an outer variable of the same
+    # name (a parameter or loop variable is not the module-level `x = A()`). A
+    # self./this. attribute keeps whatever type another method gave it.
+    return [
+        (_normal_target(target), kind)
+        for target, kind in out
+        if target and (kind or not target.startswith(_SELF_PREFIXES))
+    ]
 
 
 # --- import bindings ----------------------------------------------------------

@@ -19,7 +19,7 @@ from graphora.resolve import CallSite, FileRecord, SymbolRecord, records_for, re
 _BATCH = 2000
 _SYMBOL_FIELDS = (
     "name", "qualname", "kind", "path", "line", "end_line", "signature", "parent", "parent_kind", "is_test", "confidence",
-    "returns",
+    "returns", "attributes",
 )
 _INDEXES = (
     ("File", "path"),
@@ -386,6 +386,7 @@ def _record(row: list) -> dict:
     record["end_line"] = int(record["end_line"] or record["line"])
     record["is_test"] = bool(record["is_test"])
     record["returns"] = record.get("returns") or ""
+    record["attributes"] = record.get("attributes") or ""
     return record
 
 

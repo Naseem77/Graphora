@@ -85,6 +85,7 @@ class SymbolRecord:
     is_test: bool
     confidence: str = EXTRACTED
     returns: str = ""  # declared return type name
+    attributes: str = ""  # classes: "field=Type;..." for fields whose type is stated
 
     @property
     def is_method(self) -> bool:
@@ -131,6 +132,38 @@ class Resolution:
 
 
 _STDLIB = frozenset(getattr(sys, "stdlib_module_names", ()))
+# Methods of each language's built-in containers, strings, and promises/iterators.
+_BUILTIN_METHODS: dict[str, frozenset[str]] = {
+    "python": frozenset(
+        "get items keys values append extend pop popitem update setdefault copy clear insert remove index "
+        "count sort reverse add discard union intersection difference join split rsplit splitlines strip "
+        "lstrip rstrip replace format startswith endswith lower upper title encode decode read readline "
+        "readlines write close find rfind isdigit isalpha".split()
+    ),
+    "js": frozenset(
+        "push pop shift unshift map filter reduce forEach find findIndex some every includes indexOf slice "
+        "splice concat join split trim replace replaceAll toString toLowerCase toUpperCase startsWith "
+        "endsWith match then catch finally keys values entries get set has delete add clear json text "
+        "padStart padEnd at flat flatMap sort reverse fill".split()
+    ),
+    "java": frozenset(
+        "get put add addAll remove contains containsKey size isEmpty equals hashCode toString length append "
+        "stream map filter collect forEach iterator next hasNext close getClass valueOf charAt substring "
+        "trim split replace startsWith endsWith toLowerCase toUpperCase".split()
+    ),
+    "rust": frozenset(
+        "unwrap expect map clone to_string to_owned as_str iter iter_mut into_iter collect push len is_empty "
+        "get get_mut insert remove contains ok err unwrap_or unwrap_or_else and_then as_ref as_mut is_some "
+        "is_none trim split join format".split()
+    ),
+    "ruby": frozenset(
+        "each map select reject to_s to_i to_a to_h length size empty? nil? include? push join split strip "
+        "keys values first last".split()
+    ),
+    "go": frozenset("Error String Len".split()),
+    "c": frozenset("size push_back emplace_back begin end find insert erase clear empty at c_str".split()),
+    "php": frozenset(),
+}
 # CamelCase: a type, not a variable or an ALL_CAPS constant.
 _TYPE_LIKE = re.compile(r"^[A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*$")
 
@@ -169,6 +202,7 @@ def records_for(parsed: ParsedFile) -> tuple[list[SymbolRecord], FileRecord]:
                 is_test=parsed.is_test or s.is_test,
                 confidence=s.confidence,
                 returns=s.returns,
+                attributes=s.attributes,
             )
         )
     functions_by_qualname: dict[str, list[SymbolRecord]] = defaultdict(list)
@@ -296,6 +330,12 @@ class _Resolver:
             if found:
                 return found, EXTRACTED if len(found) == 1 else AMBIGUOUS, "union"
             receiver = "<expr>"
+        if "#" in receiver:  # `state.evidence.get()` with `state: AgentState`
+            owners = self._field_classes(record, caller, receiver)
+            found = [m for owner in owners for m in self._methods_of(owner.qualname, call.callee, owner.path)]
+            if found:
+                return found, EXTRACTED if len(owners) == 1 else AMBIGUOUS, "field"
+            receiver = "<expr>"
         if receiver.endswith("()"):
             owners = self._result_classes(record, caller, receiver, depth=0)
             found = [m for owner in owners for m in self._methods_of(owner.qualname, call.callee, owner.path)]
@@ -348,6 +388,24 @@ class _Resolver:
             elif target.returns:
                 owners.update((c.key, c) for c in self._classes_named(target.returns, target.path))
         return list(owners.values())
+
+    def _field_classes(self, record: FileRecord, caller: SymbolRecord, receiver: str) -> list[SymbolRecord]:
+        """Classes of `Type#field.subfield` (or `make()#field`): follow each field's declared type."""
+        type_name, chain = receiver.split("#", 1)
+        if type_name.endswith("()"):
+            owners = self._result_classes(record, caller, type_name, depth=0)
+        else:
+            owners = self._classes_named(type_name, record.path)
+        for attribute in chain.split("."):
+            following: dict[str, SymbolRecord] = {}
+            for owner in owners:
+                fields = dict(item.split("=", 1) for item in owner.attributes.split(";") if "=" in item)
+                if attribute in fields:
+                    following.update((c.key, c) for c in self._classes_named(fields[attribute], owner.path))
+            owners = list(following.values())
+            if not owners:
+                return []
+        return owners
 
     def _classes_named(self, type_name: str, from_path: str) -> list[SymbolRecord]:
         """Resolve a type name as written in `from_path`: same file, its imports, then the repo."""
@@ -508,6 +566,12 @@ class _Resolver:
         if _TYPE_LIKE.match(class_name) and not classes:
             self.result.external += 1
             return [], EXTRACTED, "external"
+
+        # `x.get()`, `items.append()` on an unknown receiver are almost always the
+        # language's own containers/strings, not repo methods that share the name.
+        if name in _BUILTIN_METHODS.get(family, ()):
+            self.result.external += 1
+            return [], AMBIGUOUS, "builtin-name"
 
         # Unknown receiver type: any method with that name could be meant,
         # including one outside the repository, so even one match is AMBIGUOUS.
