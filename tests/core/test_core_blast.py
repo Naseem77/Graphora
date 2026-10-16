@@ -59,7 +59,7 @@ def test_blast_radius_confidence_tags(store):
     impact = blast_radius(store, ["compute"]).symbols[0]
     confidences = {name: conf for name, _, conf in impact.callers}
     assert confidences["pipeline"] == "EXTRACTED"  # same file
-    assert confidences["handler"] == "INFERRED"  # cross file
+    assert confidences["handler"] == "EXTRACTED"  # cross file, via `from pkg.core import compute`
 
 
 def test_blast_radius_unresolved_symbol(store):

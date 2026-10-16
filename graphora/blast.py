@@ -77,16 +77,15 @@ def _relation_line(label: str, rows: list[tuple[str, str, str]]) -> str:
 
 
 def blast_radius(store: GraphStore, symbol_names: list[str]) -> BlastRadius:
-    """Compute the blast radius for a list of symbol names."""
+    """Compute the blast radius for symbol names (plain or qualified, e.g. "Db.save")."""
     impacts: list[SymbolImpact] = []
     unresolved: list[str] = []
     for name in symbol_names:
-        definitions = store.find_definitions(name)
-        if not definitions:
+        records = store.find_symbols(name)
+        if not records:
             unresolved.append(name)
             continue
-        for row in definitions:
-            impacts.append(_impact_for(store, row))
+        impacts.extend(_impact_for(store, record) for record in records)
     return BlastRadius(symbols=impacts, changed_files=[], unresolved=unresolved)
 
 
@@ -101,28 +100,44 @@ def blast_radius_for_diff(store: GraphStore, diff: str) -> BlastRadius:
     )
 
 
-def _impact_for(store: GraphStore, row: list) -> SymbolImpact:
-    name, kind, path, line, signature = row[:5]
-    callers = sorted(store.callers_of(name, path))
-    callees = sorted(store.callees_of(name, path))
-    tests = sorted(store.tests_covering(name, path))
-    importers = sorted(store.importers_of_module(_module_hint(path), path))
+def members_of(store: GraphStore, record: dict) -> list[dict]:
+    """A symbol plus, for a class, everything defined inside it (its methods)."""
+    if record["kind"] != "Class":
+        return [record]
+    prefix = record["qualname"] + "."
+    inner = [
+        s
+        for s in store.symbols_in_file(record["path"])
+        if s["qualname"].startswith(prefix) and record["line"] <= s["line"] <= record["end_line"]
+    ]
+    return [record, *inner]
+
+
+def _impact_for(store: GraphStore, record: dict) -> SymbolImpact:
+    targets = members_of(store, record)
+    own = {t["key"] for t in targets}
+    callers: set[tuple[str, str, str]] = set()
+    tests: set[tuple[str, str, str]] = set()
+    callees: set[tuple[str, str, str]] = set()
+    for target in targets:
+        for edge in store.incoming_calls(target["key"]):
+            caller = edge["caller"]
+            if caller["key"] in own:
+                continue
+            row = (caller["qualname"], caller["path"], edge["confidence"])
+            (tests if caller["is_test"] else callers).add(row)
+        for edge in store.outgoing_calls(target["key"]):
+            callee = edge["callee"]
+            if callee["key"] not in own:
+                callees.add((callee["qualname"], callee["path"], edge["confidence"]))
     return SymbolImpact(
-        name=name,
-        kind=kind,
-        path=path,
-        line=int(line),
-        signature=signature or "",
-        callers=callers,
-        callees=callees,
-        tests=tests,
-        importers=importers,
+        name=record["qualname"],
+        kind=record["kind"],
+        path=record["path"],
+        line=int(record["line"]),
+        signature=record["signature"] or "",
+        callers=sorted(callers),
+        callees=sorted(callees),
+        tests=sorted(tests),
+        importers=store.file_importers(record["path"]),
     )
-
-
-def _module_hint(path: str) -> str:
-    stem = path.rsplit("/", 1)[-1]
-    for suffix in (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java"):
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
-    return stem

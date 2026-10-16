@@ -1,9 +1,9 @@
 """Embedded graph store: pure Python, JSON on disk, zero Docker.
 
 Implements the same method surface as `graphora.store.GraphStore`, so every
-consumer (indexer, blast radius, review, CLI, MCP, benchmark)
-works unchanged. Data persists to `{data_dir}/{project}.json`
-(default `~/.graphora`, override with GRAPHORA_DATA_DIR).
+consumer (indexer, blast radius, review, CLI, MCP, benchmark) works
+unchanged. Data persists to `{data_dir}/{project}.json` (default
+`~/.graphora`, override with GRAPHORA_DATA_DIR).
 """
 
 from __future__ import annotations
@@ -11,11 +11,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
 
-from graphora.parser import AMBIGUOUS, INFERRED, ParsedFile
+from graphora.parser import ParsedFile
+from graphora.resolve import CallSite, FileRecord, SymbolRecord, records_for, resolve
 
-SCHEMA_VERSION = 1
+# 2: qualified-name symbol keys, raw call sites per file, resolved file imports.
+SCHEMA_VERSION = 2
 
 
 def default_data_dir() -> Path:
@@ -32,29 +35,43 @@ class EmbeddedGraphStore:
         self.data_dir = Path(data_dir) if data_dir else default_data_dir()
         self._path = self.data_dir / f"{project}.json"
         self._data = self._empty()
-        self._call_index: dict[tuple[str, str, int], dict] | None = None
+        self.stale_schema = False
         if self._path.exists():
             try:
                 loaded = json.loads(self._path.read_text(encoding="utf-8"))
                 if loaded.get("schema_version") == SCHEMA_VERSION:
                     self._data = loaded
+                else:
+                    self.stale_schema = True  # older Graphora layout: re-index to rebuild
             except (json.JSONDecodeError, OSError):
                 pass
+        self._reindex()
 
     @staticmethod
     def _empty() -> dict:
         return {
             "schema_version": SCHEMA_VERSION,
-            "files": {},        # path -> {language, is_test, content_hash, line_count, parser}
-            "symbols": {},      # stable_key -> {name, kind, path, line, signature, confidence,
-                                #                is_test, pending_calls}
-            "calls": [],        # {a, b, line, confidence} (a, b = stable keys)
-            "imports": [],      # {path, module, confidence}
-            "sessions": {},         # sid -> {summary, cwd, branch, created_at, updated_at, last_ask}
-            "session_repos": [],    # [sid, repo]
-            "session_files": [],    # {sid, path, tool}
-            "session_refs": [],     # [sid, kind, value]
+            "files": {},  # path -> {language, is_test, content_hash, line_count, parser, bindings, calls}
+            "symbols": {},  # key -> SymbolRecord fields
+            "calls": [],  # {a, b, line, confidence, candidates, reason} (a, b = symbol keys)
+            "imports": [],  # {path, module, confidence}
+            "file_imports": [],  # [importer path, imported path]
+            "sessions": {},  # sid -> {summary, cwd, branch, created_at, updated_at, last_ask}
+            "session_repos": [],  # [sid, repo]
+            "session_files": [],  # {sid, path, tool}
+            "session_refs": [],  # [sid, kind, value]
         }
+
+    def _reindex(self) -> None:
+        """Rebuild the in-memory adjacency indexes from the persisted edge lists."""
+        self._incoming: dict[str, list[dict]] = defaultdict(list)
+        self._outgoing: dict[str, list[dict]] = defaultdict(list)
+        for edge in self._data["calls"]:
+            self._incoming[edge["b"]].append(edge)
+            self._outgoing[edge["a"]].append(edge)
+        self._by_file: dict[str, list[str]] = defaultdict(list)
+        for key, symbol in self._data["symbols"].items():
+            self._by_file[symbol["path"]].append(key)
 
     @property
     def graph_name(self) -> str:
@@ -69,89 +86,65 @@ class EmbeddedGraphStore:
     # --- writes ---------------------------------------------------------
 
     def write_files(self, parsed_files: list[ParsedFile], save: bool = True) -> int:
+        """Store files, their symbols, and raw call sites. Call
+        link_cross_file_calls() afterwards to (re)build the CALLS edges."""
         for parsed in parsed_files:
             self._delete_file_no_save(parsed.path)
+            symbols, record = records_for(parsed)
             self._data["files"][parsed.path] = {
                 "language": parsed.language,
                 "is_test": parsed.is_test,
                 "content_hash": _hash(parsed.source_text),
-                "line_count": len(parsed.source_text.splitlines()),
+                "line_count": parsed.source_text.count("\n") + (0 if parsed.source_text.endswith("\n") else 1),
                 "parser": parsed.parser_used,
+                "bindings": [list(b) for b in record.bindings],
+                "calls": [[c.caller_key, c.callee, c.receiver, c.line] for c in record.calls],
             }
             for imp in parsed.imports:
-                self._data["imports"].append(
-                    {"path": parsed.path, "module": imp.name, "confidence": imp.confidence}
-                )
-            for symbol in parsed.symbols:
-                kind = "Function" if symbol.kind == "Function" else "Class"
-                key = f"{parsed.path}:{kind}:{symbol.qualname}"
-                self._data["symbols"][key] = {
-                    "name": symbol.name,
-                    "kind": kind,
-                    "path": parsed.path,
-                    "line": symbol.line,
-                    "signature": symbol.signature,
-                    "confidence": symbol.confidence,
-                    "is_test": parsed.is_test,
-                    "pending_calls": [],
-                }
-            local_functions = {s.name: s.qualname for s in parsed.symbols if s.kind == "Function"}
-            for call in parsed.calls:
-                caller_key = f"{parsed.path}:Function:{call.caller}"
-                if call.callee in local_functions:
-                    callee_key = f"{parsed.path}:Function:{local_functions[call.callee]}"
-                    self._merge_call(caller_key, callee_key, call.line, call.confidence)
-                elif caller_key in self._data["symbols"]:
-                    self._data["symbols"][caller_key]["pending_calls"].append(f"{call.callee}@{call.line}")
+                self._data["imports"].append({"path": parsed.path, "module": imp.name, "confidence": imp.confidence})
+            for symbol in symbols:
+                self._data["symbols"][symbol.key] = symbol.to_dict()
+                self._by_file[parsed.path].append(symbol.key)
         if save:
             self.save()
         return len(parsed_files)
 
     def link_cross_file_calls(self) -> int:
-        by_function_name: dict[str, list[str]] = {}
-        for key, sym in self._data["symbols"].items():
-            if sym["kind"] == "Function":
-                by_function_name.setdefault(sym["name"], []).append(key)
-        linked = 0
-        for key, sym in self._data["symbols"].items():
-            pending = sym.get("pending_calls") or []
-            if not pending:
-                continue
-            for entry in pending:
-                callee_name, line = entry.rsplit("@", 1)
-                candidates = by_function_name.get(callee_name, [])
-                if not candidates:
-                    continue
-                confidence = INFERRED if len(candidates) == 1 else AMBIGUOUS
-                for callee_key in candidates:
-                    if callee_key == key:
-                        continue
-                    self._merge_call(key, callee_key, int(line), confidence)
-                    linked += 1
-            sym["pending_calls"] = []
+        """Resolve every stored call site into CALLS edges (all files, so
+        callers in unchanged files relink to callees in changed ones)."""
+        result = resolve(self._symbol_records(), self._file_records())
+        self._data["calls"] = [dict(edge.__dict__) for edge in result.edges]
+        self._data["file_imports"] = [list(pair) for pair in result.file_imports]
+        self._reindex()
         self.save()
-        return linked
+        return len(result.edges)
 
-    def _merge_call(self, a: str, b: str, line: int, confidence: str) -> None:
-        if self._call_index is None:
-            self._call_index = {(e["a"], e["b"], e["line"]): e for e in self._data["calls"]}
-        edge = self._call_index.get((a, b, line))
-        if edge is not None:
-            edge["confidence"] = confidence
-            return
-        edge = {"a": a, "b": b, "line": line, "confidence": confidence}
-        self._data["calls"].append(edge)
-        self._call_index[(a, b, line)] = edge
+    def _symbol_records(self) -> list[SymbolRecord]:
+        return [SymbolRecord(**{k: v for k, v in s.items() if k != "key"}, key=key) for key, s in self._data["symbols"].items()]
+
+    def _file_records(self) -> list[FileRecord]:
+        return [
+            FileRecord(
+                path=path,
+                language=f["language"],
+                is_test=f["is_test"],
+                bindings=tuple(tuple(b) for b in f.get("bindings", [])),
+                calls=tuple(CallSite(*c) for c in f.get("calls", [])),
+            )
+            for path, f in self._data["files"].items()
+        ]
 
     def _delete_file_no_save(self, path: str) -> None:
-        self._data["files"].pop(path, None)
-        dead = {k for k, s in self._data["symbols"].items() if s["path"] == path}
+        if self._data["files"].pop(path, None) is None and path not in self._by_file:
+            return
+        dead = set(self._by_file.pop(path, []))
         for key in dead:
-            del self._data["symbols"][key]
+            self._data["symbols"].pop(key, None)
         if dead:
             self._data["calls"] = [e for e in self._data["calls"] if e["a"] not in dead and e["b"] not in dead]
-            self._call_index = None
+            self._reindex()
         self._data["imports"] = [i for i in self._data["imports"] if i["path"] != path]
+        self._data["file_imports"] = [p for p in self._data["file_imports"] if path not in p]
 
     def delete_file(self, path: str) -> None:
         self._delete_file_no_save(path)
@@ -159,12 +152,12 @@ class EmbeddedGraphStore:
 
     def clear(self) -> None:
         self._data = self._empty()
-        self._call_index = None
+        self._reindex()
         self.save()
 
     def delete_graph(self) -> None:
         self._data = self._empty()
-        self._call_index = None
+        self._reindex()
         try:
             self._path.unlink(missing_ok=True)
         except OSError:
@@ -183,6 +176,7 @@ class EmbeddedGraphStore:
             "calls": calls,
             "edges": calls
             + len(self._data["imports"])
+            + len(self._data["file_imports"])
             + len(self._data["symbols"]),  # DEFINED_IN
         }
 
@@ -234,73 +228,70 @@ class EmbeddedGraphStore:
                     if v == value or v.endswith(value)]
         return sorted(hits, key=lambda r: r[2], reverse=True)
 
-    def find_definitions(self, name: str) -> list[list]:
-        return [
-            [s["name"], s["kind"], s["path"], s["line"], s["signature"]]
-            for s in self._sorted_symbols()
-            if s["name"] == name
+    # --- named reads (shared surface with GraphStore) ----------------------
+
+    def find_symbols(self, name: str) -> list[dict]:
+        """Symbols whose name or qualified name is `name` (e.g. "save" or "Db.save")."""
+        hits = [
+            self._record(key)
+            for key, s in self._data["symbols"].items()
+            if s["name"] == name or s["qualname"] == name
         ]
+        return sorted(hits, key=lambda r: (r["path"], r["line"], r["key"]))
 
-    def callers_of(self, name: str, path: str) -> list[tuple[str, str, str]]:
-        return self._call_neighbors(name, path, direction="in", tests=False)
+    def get_symbol(self, key: str) -> dict | None:
+        return self._record(key) if key in self._data["symbols"] else None
 
-    def callees_of(self, name: str, path: str) -> list[tuple[str, str, str]]:
-        return self._call_neighbors(name, path, direction="out")
+    def symbols_in_file(self, path: str) -> list[dict]:
+        return sorted((self._record(k) for k in self._by_file.get(path, [])), key=lambda r: (r["line"], r["key"]))
 
-    def tests_covering(self, name: str, path: str) -> list[tuple[str, str, str]]:
-        return self._call_neighbors(name, path, direction="in", tests=True)
+    def incoming_calls(self, key: str) -> list[dict]:
+        return self._edges(self._incoming.get(key, []), "a", "caller")
 
-    def _call_neighbors(self, name: str, path: str, direction: str, tests: bool | None = None):
-        keys = {k for k, s in self._data["symbols"].items() if s["path"] == path and s["name"] == name}
-        seen: set[tuple[str, str, str]] = set()
-        out: list[tuple[str, str, str]] = []
-        for edge in self._data["calls"]:
-            other_key = None
-            if direction == "in" and edge["b"] in keys:
-                other_key = edge["a"]
-            elif direction == "out" and edge["a"] in keys:
-                other_key = edge["b"]
-            if other_key is None:
-                continue
-            other = self._data["symbols"].get(other_key)
-            if other is None or other["kind"] != "Function":
-                continue
-            if tests is not None and bool(other.get("is_test", False)) != tests:
-                continue
-            row = (other["name"], other["path"], edge["confidence"])
-            if row not in seen:
-                seen.add(row)
-                out.append(row)
-        return out
+    def outgoing_calls(self, key: str) -> list[dict]:
+        return self._edges(self._outgoing.get(key, []), "b", "callee")
 
-    def importers_of_module(self, module_hint: str, exclude_path: str) -> list[str]:
-        seen: set[str] = set()
-        out: list[str] = []
-        for imp in self._data["imports"]:
-            if imp["module"].endswith(module_hint) and imp["path"] != exclude_path and imp["path"] not in seen:
-                seen.add(imp["path"])
-                out.append(imp["path"])
-        return out
+    def call_site_targets(self, caller_key: str, line: int) -> list[dict]:
+        """Every target one call site resolved to (the alternatives of an AMBIGUOUS call)."""
+        keys = [e["b"] for e in self._outgoing.get(caller_key, []) if e["line"] == line]
+        return sorted((self._record(k) for k in dict.fromkeys(keys)), key=lambda r: (r["path"], r["line"]))
+
+    def file_importers(self, path: str) -> list[str]:
+        return sorted({a for a, b in self._data["file_imports"] if b == path})
 
     def top_connected_symbols(self, count: int = 3) -> list[str]:
         degree: dict[str, int] = {}
         for edge in self._data["calls"]:
             callee = self._data["symbols"].get(edge["b"])
-            if callee and callee["kind"] == "Function" and not callee.get("is_test", False):
-                degree[callee["name"]] = degree.get(callee["name"], 0) + 1
+            if callee and not callee.get("is_test", False):
+                degree[callee["qualname"]] = degree.get(callee["qualname"], 0) + 1
         ranked = sorted(degree.items(), key=lambda kv: (-kv[1], kv[0]))
         return [name for name, _ in ranked[:count]]
 
     def find_symbol(self, name: str) -> list[dict]:
         return [
-            {"name": s["name"], "kind": s["kind"], "path": s["path"],
-             "line": int(s["line"] or 0), "signature": s["signature"]}
-            for s in self._sorted_symbols()
-            if s["name"] == name
+            {"name": r["qualname"], "kind": r["kind"], "path": r["path"], "line": r["line"], "signature": r["signature"]}
+            for r in self.find_symbols(name)
         ]
 
-    def _sorted_symbols(self) -> list[dict]:
-        return [self._data["symbols"][k] for k in sorted(self._data["symbols"])]
+    def _record(self, key: str) -> dict:
+        return {"key": key, **self._data["symbols"][key]}
+
+    def _edges(self, edges: list[dict], end: str, label: str) -> list[dict]:
+        out = []
+        for edge in edges:
+            if edge[end] not in self._data["symbols"]:
+                continue
+            out.append(
+                {
+                    label: self._record(edge[end]),
+                    "line": edge["line"],
+                    "confidence": edge["confidence"],
+                    "candidates": edge.get("candidates", 1),
+                    "reason": edge.get("reason", ""),
+                }
+            )
+        return sorted(out, key=lambda e: (e[label]["path"], e[label]["line"], e["line"]))
 
 
 def _hash(text: str) -> str:

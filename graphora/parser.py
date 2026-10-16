@@ -705,6 +705,14 @@ def _python_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
 
 
 def _js_bindings(node: Any, content: bytes) -> list[ParsedBinding]:
+    if node.type == "export_statement" and any(child.type == "default" for child in node.children):
+        # Recorded on the exporting file as local "default" -> the exported name.
+        declaration = node.child_by_field_name("declaration")
+        value = node.child_by_field_name("value")
+        name = _node_text(declaration.child_by_field_name("name"), content) if declaration is not None else ""
+        if not name and value is not None and value.type == "identifier":
+            name = _node_text(value, content)
+        return [ParsedBinding("default", "", name)] if name else []
     if node.type == "import_statement":
         source = _node_text(node.child_by_field_name("source"), content).strip("\"'`")
         out = []

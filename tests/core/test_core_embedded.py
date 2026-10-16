@@ -134,3 +134,23 @@ def test_embedded_matches_falkordb_output(sample_repo: Path, tmp_path: Path):
         assert e_ctx == f_ctx
     finally:
         falkor.delete_graph()
+
+
+def test_incremental_update_keeps_callers_in_other_files(sample_repo: Path, store: EmbeddedGraphStore):
+    """Re-writing the callee's file must not drop edges from unchanged callers."""
+    (sample_repo / "pkg" / "core.py").write_text(
+        "def compute(x):\n    return x + 2\n\ndef pipeline(x):\n    return compute(x)\n"
+    )
+    update_files(sample_repo, ["pkg/core.py"], store=store)
+    callers = {c[0] for c in blast_radius(store, ["compute"]).symbols[0].callers}
+    assert callers == {"pipeline", "handler"}
+
+
+def test_incremental_update_relinks_new_callee(sample_repo: Path, store: EmbeddedGraphStore):
+    (sample_repo / "pkg" / "api.py").write_text(
+        "from pkg.core import compute\nfrom pkg.extra import boost\n\ndef handler(req):\n    return boost(compute(req))\n"
+    )
+    update_files(sample_repo, ["pkg/api.py"], store=store)
+    (sample_repo / "pkg" / "extra.py").write_text("def boost(x):\n    return x\n")
+    update_files(sample_repo, ["pkg/extra.py"], store=store)
+    assert {c[0] for c in blast_radius(store, ["boost"]).symbols[0].callers} == {"handler"}
