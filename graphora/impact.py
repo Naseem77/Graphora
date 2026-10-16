@@ -21,7 +21,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from graphora.blast import members_of
+from graphora.blast import members_of, select_symbols
 from graphora.parser import AMBIGUOUS, extract_symbols_from_diff
 
 if TYPE_CHECKING:
@@ -96,9 +96,10 @@ class WhatCouldBreak:
         names = [t["name"] for t in self.targets]
         repeated = sorted({n for n in names if names.count(n) > 1})
         if repeated:
+            example = next(t for t in self.targets if t["name"] == repeated[0])
             lines.append(
                 f"(several definitions are named {', '.join(f'`{n}`' for n in repeated)}; all are included."
-                " Pass a qualified name such as `Class.method` to pick one.)"
+                f" To pick one, pass its file too, e.g. `{example['path']}:{example['qualname']}`.)"
             )
         lines.append("")
         lines.append(f"Will break ({len(self.will_break)}):")
@@ -136,7 +137,7 @@ def what_could_break(store: GraphBackend, names: list[str], depth: int = DEFAULT
     targets: list[dict] = []
     unresolved: list[str] = []
     for name in names:
-        found = store.find_symbols(name)
+        found = select_symbols(store, name)
         if found:
             targets.extend(found)
         else:

@@ -247,7 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_breaks = sub.add_parser(
         "breaks", parents=[common], help="What could break if you change these symbols (or this diff)"
     )
-    p_breaks.add_argument("symbols", nargs="*", help="Names or qualified names (Class.method); omit to read a diff")
+    p_breaks.add_argument("symbols", nargs="*", help="Names, qualified names (Class.method), or path:Class.method; omit to read a diff")
     p_breaks.add_argument("--depth", type=_positive_int, default=2, help="Caller hops to follow (default: 2)")
     p_breaks.add_argument("--diff", help="Path to a unified diff file")
     p_breaks.add_argument("--git-range", help="Git range, e.g. main...HEAD")
