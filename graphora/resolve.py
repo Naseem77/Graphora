@@ -461,6 +461,16 @@ class _Resolver:
                 if not found and member:
                     # `from pkg import mod` imports a submodule, not a member.
                     found = self._top_level(self._module_files(record, _submodule(module, member)), name)
+                if not found and member:
+                    # Java `import static a.b.Util.trim`: a method of the class the module names.
+                    owner_name = re.split(r"\.|::|\\", module)[-1]
+                    found = [
+                        m
+                        for f in files
+                        for owner in self.by_file[f]
+                        if owner.kind == "Class" and owner.name == owner_name
+                        for m in self._methods_of(owner.qualname, member, owner.path)
+                    ]
                 found_all.extend(found)
             if found_all:
                 # Several bindings in one scope (try/except fallbacks): each is possible.
@@ -879,35 +889,46 @@ class _Resolver:
 
     def _rust_crate_module(self, path: str, module: str) -> list[str]:
         """Resolve `crate::a::b`, `my_crate::a::b`, `self::`/`super::` against Cargo crates;
-        any other first segment (std, tokio, ...) is an external crate."""
+        any other first segment (std, tokio, ...) is an external crate.
+
+        A module's file is `x.rs` or `x/mod.rs` (`lib.rs`/`main.rs` at the crate root),
+        and its child modules live in the directory `x/`.
+        """
         parts = [p for p in module.split("::") if p]
         if not parts:
             return []
-        own = next((root for root, _ in self.rust_crates if not root or path.startswith(root + "/")), None)
         first, rest = parts[0], parts[1:]
-        if first == "crate" and own is not None:
-            base = posixpath.join(own, "src") if own else "src"
-        elif first in {"self", "super"}:
-            # Modules live in a directory: `super` of a mod.rs/lib.rs climbs one level,
-            # `super` of a plain file module (a.rs) is its own directory.
-            base = posixpath.dirname(path)
-            if first == "super" and posixpath.basename(path) in {"mod.rs", "lib.rs", "main.rs"}:
-                base = posixpath.dirname(base)
+        name = posixpath.basename(path)
+        is_dir_module = name in {"mod.rs", "lib.rs", "main.rs"}
+        children = posixpath.dirname(path) if is_dir_module else posixpath.splitext(path)[0]
+        if first == "self":
+            base, base_file = children, [path]
+        elif first == "super":
+            parent = posixpath.dirname(posixpath.dirname(path)) if is_dir_module else posixpath.dirname(path)
+            base, base_file = parent, self._rust_module_file(parent)
         else:
-            root = next((r for r, crate in self.rust_crates if crate == first), None)
+            if first == "crate":
+                root = next((r for r, _ in self.rust_crates if not r or path.startswith(r + "/")), None)
+            else:
+                root = next((r for r, crate in self.rust_crates if crate == first), None)
             if root is None:
                 return []  # external crate
             base = posixpath.join(root, "src") if root else "src"
-        if not rest:
-            return self._exact(posixpath.join(base, "lib.rs"), posixpath.join(base, "main.rs"), path)[:1]
-        for depth in (len(rest), len(rest) - 1):
-            if depth < 1:
-                break
+            base_file = self._exact(posixpath.join(base, "lib.rs"), posixpath.join(base, "main.rs"))[:1]
+        for depth in range(len(rest), 0, -1):
             relative = posixpath.join(base, *rest[:depth])
             found = self._exact(f"{relative}.rs", f"{relative}/mod.rs")
             if found:
                 return found
-        return self._exact(posixpath.join(base, "lib.rs"), posixpath.join(base, "main.rs"))[:1]
+        return base_file
+
+    def _rust_module_file(self, directory: str) -> list[str]:
+        """The file of the module whose children live in `directory`."""
+        if not directory:
+            return self._exact("lib.rs", "main.rs", "mod.rs")[:1]
+        return self._exact(
+            f"{directory}/mod.rs", f"{directory}.rs", f"{directory}/lib.rs", f"{directory}/main.rs"
+        )[:1]
 
     def _c_module(self, path: str, module: str) -> list[str]:
         local = self._exact(posixpath.join(posixpath.dirname(path), module))

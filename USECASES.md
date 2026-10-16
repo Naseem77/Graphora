@@ -263,7 +263,7 @@ graph, so the MCP server exposes your work history to any agent for free.
 
 ## How it was tested <a name="how-it-was-tested"></a>
 
-251 tests (`python -m pytest tests -q`), run in CI against a live FalkorDB on mcp 1.x and 2.x;
+272 tests (`python -m pytest tests -q`), run in CI against a live FalkorDB on mcp 1.x and 2.x;
 the job fails if any test is skipped.
 
 | Area | What the tests pin down |
