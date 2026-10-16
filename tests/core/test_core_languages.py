@@ -123,7 +123,7 @@ def test_cpp_class_and_method():
     names = {(s.kind, s.name) for s in parsed.symbols}
     assert ("Class", "Point") in names
     assert ("Function", "area") in names  # qualified Point::area resolved to area
-    assert any(c.caller == "area" and c.callee == "helper" for c in parsed.calls)
+    assert any(c.caller == "Point.area" and c.callee == "helper" for c in parsed.calls)
 
 
 def test_ruby_symbols_and_require():
@@ -133,7 +133,7 @@ def test_ruby_symbols_and_require():
     assert ("Class", "Cart") in names
     assert ("Function", "total") in names
     assert any(i.name == "json" for i in parsed.imports)
-    assert any(c.caller == "total" and c.callee == "helper" for c in parsed.calls)
+    assert any(c.caller == "Cart.total" and c.callee == "helper" for c in parsed.calls)
 
 
 def test_php_symbols_use_and_calls():

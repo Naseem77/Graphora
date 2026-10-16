@@ -1,7 +1,6 @@
 """Phase 1 tests: deterministic parser with confidence tags."""
 
 from graphora.parser import (
-    AMBIGUOUS,
     EXTRACTED,
     INFERRED,
     extract_files_from_diff,

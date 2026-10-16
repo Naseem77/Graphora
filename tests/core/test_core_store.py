@@ -1,7 +1,5 @@
 """Phase 1 tests: FalkorDB store + indexer (integration, needs FalkorDB on :6379)."""
 
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -62,14 +60,14 @@ def test_index_builds_nodes_and_edges(store: GraphStore):
     assert stats["calls"] >= 3
 
 
-def test_cross_file_call_confidence_is_inferred(store: GraphStore):
+def test_cross_file_call_through_import_is_extracted(store: GraphStore):
     rows = store.query(
         """
         MATCH (a:Function {name: 'handler'})-[r:CALLS]->(b:Function {name: 'compute'})
         RETURN r.confidence
         """
     )
-    assert rows and rows[0][0] == "INFERRED"
+    assert rows and rows[0][0] == "EXTRACTED"
 
 
 def test_same_file_call_confidence_is_extracted(store: GraphStore):
@@ -97,3 +95,14 @@ def test_incremental_update_and_delete(sample_repo: Path, store: GraphStore):
     update_files(sample_repo, ["pkg/extra.py"], project="graphora-test", store=store)
     rows = store.query("MATCH (f:File {path: 'pkg/extra.py'}) RETURN f")
     assert not rows
+
+
+def test_incremental_update_keeps_cross_file_callers(sample_repo: Path, store: GraphStore):
+    from graphora.blast import blast_radius
+
+    (sample_repo / "pkg" / "core.py").write_text(
+        "def compute(x):\n    return x + 2\n\ndef pipeline(x):\n    return compute(x)\n"
+    )
+    update_files(sample_repo, ["pkg/core.py"], project="graphora-test", store=store)
+    callers = {c[0] for c in blast_radius(store, ["compute"]).symbols[0].callers}
+    assert callers == {"pipeline", "handler"}

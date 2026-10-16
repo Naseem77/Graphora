@@ -2,19 +2,16 @@
 
 # Graphora
 
-### The code knowledge graph that reviews your changes.
+### Know what breaks before you change it.
 
-**Deterministic indexing · Blast-radius analysis · Risk memory · Zero Docker required · $0 LLM cost to build**
+**Every function, method, and class in one code graph · What could break, split into certain and uncertain · Zero Docker · $0 LLM cost to build**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyPI](https://img.shields.io/pypi/v/graphora-kg?color=3775A9&logo=pypi&logoColor=white)](https://pypi.org/project/graphora-kg/)
 [![FalkorDB](https://img.shields.io/badge/FalkorDB-graph-FF4438?logo=redis&logoColor=white)](https://www.falkordb.com/)
 [![tree--sitter](https://img.shields.io/badge/tree--sitter-parsing-2C2C2C)](https://tree-sitter.github.io/tree-sitter/)
 [![MCP](https://img.shields.io/badge/MCP-server-6E56CF)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-80%20passing-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-
-<img src="https://raw.githubusercontent.com/Naseem77/Graphora/main/assets/banner.gif" alt="Graphora: source files flow into a live knowledge graph that powers blast radius, diff review with risk memory, and MCP tools for agents. 22,160 repo tokens shrink to 1,237." width="900" />
 
 `pip install` it as a library · run it as a CLI · plug it into any AI agent as an MCP server · or install the skill into 22 agents with one command
 
@@ -22,87 +19,125 @@
 
 ---
 
-> **TL;DR**: Graphora keeps a live structural graph of your codebase, built with tree-sitter and zero LLM calls, stored in FalkorDB or in a zero-setup embedded backend. When code changes, it reads the real blast radius (callers, callees, tests, importers) straight from the graph, remembers where the codebase broke before (risk memory mined from git history), and grounds every review claim in tagged, auditable facts. Measured result: **82 to 94% fewer prompt tokens** than repo dumping on real pinned OSS repos, with *more* accurate reviews.
+> **TL;DR**: Graphora parses a repository with tree-sitter (no LLM) into a graph of every
+> function, method, and class, and the calls between them. Ask it what could break if you
+> change something, and it answers in three parts: callers that **will** break, callers that
+> **might** break (with the alternatives spelled out: "this call is either X or Y"), and the
+> tests that reach the change. It never guesses silently.
 
 ## Why Graphora
 
-AI code review and AI coding agents share the same blind spot: they see text, not structure.
+AI coding agents and code review share the same blind spot: they see text, not structure. A
+one-line change to a shared function looks harmless in a diff; its callers live in other files.
+And when a tool *does* follow calls, it usually picks one target by name and presents the guess
+as fact.
 
-| Problem | What goes wrong |
+| Problem | What Graphora does |
 | --- | --- |
-| **Blind to blast radius** | A one-line change to a shared function looks harmless in isolation. Its callers, tests, and dependents live in other files, outside the diff. |
-| **Expensive to compensate** | The usual fix is stuffing more of the repo into the prompt. That burns tokens and still buries the signal in noise. |
-| **Hard to trust** | Without grounding, the model guesses. Reviewers cannot tell a grounded claim from a hallucination. |
-| **No memory of pain** | Every review starts from zero. The tool does not know that this exact function was hotfixed twice and reverted once. |
-
-Graphora fixes all four at the source:
-
-| Capability | How |
-| --- | --- |
-| **Live structural graph** | `File`, `Function`, `Class`, `Module` nodes; `CALLS`, `DEFINED_IN`, `IMPORTS` edges. Built deterministically with tree-sitter, updated incrementally. |
-| **Blast radius, not repo dumps** | Pure Cypher queries return exactly the callers, callees, covering tests, and importers of a change. Hundreds of tokens instead of tens of thousands. |
-| **Confidence tags on every fact** | `EXTRACTED` (explicit in source), `INFERRED` (single-candidate name resolution), `AMBIGUOUS` (multiple candidates, all linked and flagged). You always know what was read versus guessed. |
-| **Risk memory** | Git history mining links fix, hotfix, and revert commits to the exact symbols they touched. Each symbol carries `fix_count`, `last_broke_at`, and a `risk_score` that decays as the area stays quiet. Reviews warn on historically fragile code automatically. |
-| **Zero-setup or client-server** | Works instantly with an embedded pure-Python backend (JSON on disk, no Docker), or against a shared FalkorDB server for live Cypher and multi-project teams. Auto-detected. |
-| **11 languages** | Python, JavaScript, TypeScript (+JSX/TSX), Go, Java, Rust, C, C++, Ruby, PHP. Tree-sitter first, regex fallback. |
-| **$0 index cost** | No LLM, no embeddings, no network in the index path. Code never leaves your machine unless *you* enable the optional LLM review pass. |
+| Callers live outside the diff | Walks the call graph backwards (callers of callers, `--depth N`) from every changed function, method, or class. Edits inside a body count. |
+| Name matching guesses wrong | Resolves each call the way the language does: `self`/`this`, same file, imports (incl. re-exports and `src/` layouts), same Go package, declared types and return types. External library calls (`os.path.join`, `fmt.Println`) never link to your code. |
+| Guesses look like facts | When a call could mean several definitions, it says so: **"this `save(...)` call is either `Db.save` or `FileStore.save`, or a method outside this repository"**. |
+| Missing definitions | Every function, method, and class: 100% of the definitions Python's own `ast` finds, on every repo we measured (see [Benchmarks](#benchmarks)). |
+| Repo dumps cost tokens | The answer is a few hundred tokens of facts, not the files. |
 
 ## Quick start
 
 ```bash
-# 1. Install (no server, no Docker needed)
-pip install graphora-kg     # from PyPI, or: pip install -e . inside this repo
+pip install graphora-kg          # or: pip install -e . inside this repo
 
-# 2. Build the graph and the risk memory (both offline, both $0)
-graphora index /path/to/repo
-graphora risk mine /path/to/repo
+graphora index /path/to/repo     # build the graph (offline, $0)
+cd /path/to/repo
 
-# 3. Use it
-graphora blast my_function                 # who calls it, who tests it, did it break before
-graphora risk top                          # the riskiest symbols in the codebase
-graphora review --git-range main...HEAD --repo /path/to/repo
-graphora benchmark /path/to/repo           # reproduce the token-cost numbers yourself
+graphora breaks charge_card      # what could break if I change charge_card?
+graphora breaks Db.save --depth 3
+git diff | graphora breaks       # ... for everything my diff touches
 ```
 
-Zero configuration: without a FalkorDB server Graphora uses its embedded backend (pure Python, JSON at `~/.graphora`). For live Cypher queries and team-shared graphs, start FalkorDB and Graphora picks it up automatically:
+Without a FalkorDB server, Graphora uses its embedded backend (pure Python, JSON under
+`~/.graphora`). For a shared, queryable graph, start FalkorDB and Graphora picks it up:
 
 ```bash
 docker run -d --name graphora-falkordb -p 6379:6379 falkordb/falkordb:latest
 # force a backend anytime with --backend embedded|falkordb|auto
 ```
 
-## Four ways to consume it
+## What the answer looks like
+
+Real output, from Graphora indexing its own repository:
+
+```text
+$ graphora breaks EmbeddedGraphStore.find_symbols --depth 1
+
+What could break if you change `EmbeddedGraphStore.find_symbols` (graphora/embedded.py:233)
+
+Will break (1):
+  - `EmbeddedGraphStore.find_symbol` (graphora/embedded.py:277) calls `EmbeddedGraphStore.find_symbols` at line 280
+
+Might break (3): the call could mean something else
+  - `blast_radius` (graphora/blast.py:82) may call `EmbeddedGraphStore.find_symbols` at line 87
+      this `find_symbols(...)` call is either `EmbeddedGraphStore.find_symbols` (graphora/embedded.py:233)  <- the one you are changing
+      or `GraphStore.find_symbols` (graphora/store.py:267)
+      or a method outside this repository
+  ... (2 more: what_could_break, changed_symbols)
+
+Tests that reach it (0):
+  none found: consider adding one
+```
+
+With the default `--depth 2` the same question also reaches the CLI commands, the MCP tools,
+and 25 tests through those callers.
+
+`blast_radius` receives a store typed as either backend, so the graph cannot know which
+`find_symbols` runs; it shows both instead of picking one. Use `--json` for machine-readable
+output.
+
+### How certain is each link?
+
+Every `CALLS` edge carries a confidence tag and the rule that produced it:
+
+| Tag | Meaning | Examples |
+| --- | --- | --- |
+| `EXTRACTED` | The source names the target. | same-file call, `self.method()`, `from pkg.mod import f; f()`, `db = FalkorDB(); db.query()`, `def f(g: Graph): g.query()` |
+| `INFERRED` | A bare call whose name matches exactly one definition. | `compute()` with one `compute` in the repo and no import |
+| `AMBIGUOUS` | Several definitions match, or the receiver's type is unknown. All candidates are linked, and the answer lists them. | `store.save()` with `Db.save` and `FileStore.save` |
+
+"Will break" uses only `EXTRACTED`/`INFERRED` paths. A single `AMBIGUOUS` call on the path
+moves the caller to "might break".
+
+## Four ways to use it
 
 ### 1. CLI
 
 ```text
-graphora index PATH                 Build the graph for a repository (no LLM)
-graphora blast SYMBOL [...]         Blast radius: callers, callees, tests, risk
-graphora review [--diff F|--git-range R]   Grounded diff review (LLM optional via --llm)
-graphora risk mine PATH             Mine git fix/revert history into the graph
-graphora risk top                   Riskiest symbols, ranked
-graphora benchmark PATH             Reproducible token-cost benchmark
-graphora serve-mcp                  Serve the graph to AI agents over MCP
-graphora install-skill [all|AGENT]  Install the Graphora skill for 22 AI coding agents
-graphora stats                      Node and edge counts
+graphora index PATH [--include-generated]   Build the graph (no LLM; honours .gitignore, skips generated code)
+graphora breaks NAME... [--depth N]         What could break: will / might (X or Y) / tests
+graphora breaks --diff F | --git-range R    ... for every symbol a diff touches
+graphora review [--diff F|--git-range R]    Same facts as a review, plus missing-test warnings (LLM optional via --llm)
+graphora blast NAME...                      Raw callers / callees / tests / importers
+graphora stats                              Node and edge counts
+graphora benchmark PATH                     Accuracy + context-size benchmark
+graphora serve-mcp                          Serve the graph to AI agents over MCP
+graphora install-skill [all|AGENT]          Install the Graphora skill for 22 AI coding agents
+graphora sessions ingest|connected          Agent session-history graph (see below)
 ```
 
-Every graph command accepts `--backend auto|falkordb|embedded` (default: auto).
+Every graph command accepts `--project`, `--backend auto|falkordb|embedded`, `--host`, `--port`.
 
 ### 2. Python library
 
 ```python
-from graphora import GraphStore, index_repository, blast_radius
-from graphora.blast import blast_radius_for_diff
-from graphora.risk import mine_risk_memory, risk_report
+from graphora import index_repository, open_store
+from graphora.impact import what_could_break, what_could_break_for_diff
 
-store = index_repository("/path/to/repo")          # deterministic build
-mine_risk_memory(store, "/path/to/repo")           # teach it the history
+store = open_store("myrepo", backend="embedded")
+index_repository("/path/to/repo", project="myrepo", store=store)
 
-# CI gate: block changes to called-but-untested symbols, three lines
-radius = blast_radius_for_diff(store, pr_diff)
-untested = [s.name for s in radius.symbols if s.callers and not s.tests]
-assert not untested, f"Changed symbols with callers but no tests: {untested}"
+result = what_could_break(store, ["Db.save"], depth=2)
+print(result.to_text())            # or result.to_dict()
+
+# CI gate: fail when a PR changes code that certainly breaks callers and no test reaches it.
+impact = what_could_break_for_diff(store, pr_diff)
+assert impact.tests or not impact.will_break, impact.to_text()
 ```
 
 ### 3. MCP server (for AI agents)
@@ -111,126 +146,122 @@ assert not untested, f"Changed symbols with callers but no tests: {untested}"
 graphora serve-mcp --project myrepo
 ```
 
-Exposes `blast_radius`, `review_diff`, `risk_top`, `find_symbol`, and `graph_stats` to Copilot CLI, Claude Code, Cursor, or any MCP client. The server instructs agents to check the blast radius *before* editing a symbol, which turns Graphora into a guardrail for AI-generated changes.
+Tools: `what_could_break`, `what_could_break_for_diff`, `blast_radius`, `review_diff`,
+`find_symbol`, `graph_stats`. The server tells agents to call `what_could_break` before
+editing a symbol and to report uncertain callers as uncertain. Works with mcp 1.x and 2.x.
 
 ### 4. One-command skill install (22 agents)
 
 ```bash
-graphora install-skill all          # or: graphora install-skill claude-code cursor copilot
-graphora install-skill --list      # see all supported agents
+graphora install-skill all          # every supported agent, into the current repo
+graphora install-skill claude cursor copilot
+graphora install-skill --list       # see all supported agents
 ```
 
-Writes the Graphora workflow rule (check blast radius before editing, run a grounded review before committing, consult risk memory) into each agent's project config: `.claude/skills/`, `.cursor/rules/`, `.github/instructions/`, `AGENTS.md`, `GEMINI.md`, Windsurf, Cline, Roo, Continue, Amazon Q, Zed, Goose, Aider, and more. Idempotent; existing files are preserved, shared files get a marked block.
+Writes the Graphora workflow (ask what could break before editing, check the diff before
+committing) into each agent's project config: `.claude/skills/`, `.cursor/rules/`,
+`.github/instructions/`, `AGENTS.md`, `GEMINI.md`, Windsurf, Cline, Roo, Continue, Amazon Q,
+Zed, Goose, Aider, and more. Idempotent; existing files are preserved, shared files get a
+marked block.
 
-## Risk memory: the graph learns where the codebase breaks
+## What gets indexed
 
-Graphora mines git history (deterministically, zero LLM) for fix, hotfix, bugfix, and revert commits, and attributes each one to the exact functions and classes it touched, using both diff lines and hunk-header context.
+Python, JavaScript/JSX, TypeScript/TSX, Go, Java, Rust, C, C++, Ruby, PHP (tree-sitter,
+regex fallback). Per language this includes, for example: Python nested functions, lambdas,
+decorated and async defs; JS/TS arrow functions, class fields, object-literal methods,
+interfaces, enums; Go methods attached to their receiver type; Java constructors, records,
+enums, interfaces; Rust `impl` methods; C++ out-of-class `A::f` definitions and destructors;
+Ruby singleton methods; PHP traits and enums. Each symbol has a qualified name
+(`geo.Square.area`), a parent, and a line range.
 
-```
-risk_score = (1 - 0.7^fix_count) * 0.5^(months_since_last_fix / 6)
-```
-
-A symbol fixed often and recently scores near 1.0. A quiet area decays by half every 6 months. Reviews then carry findings no stateless tool can produce:
-
-> **risk-memory** `falkordb/asyncio/cluster.py:9`: `Is_Cluster` was involved in 2 past fix/revert commits (last: 2025-03-13), risk score 0.08, 2 callers. Review extra carefully.
-
-The longer Graphora runs on a repository, the smarter it gets. That compounds.
+Indexing honours `.gitignore` inside a git work tree and skips generated files (ANTLR,
+protobuf, `@generated`/`DO NOT EDIT` headers, minified JS) unless `--include-generated`.
 
 ## Agent session memory: graph your work, not just your code
 
 AI coding agents already record every session locally: GitHub Copilot CLI
 (`~/.copilot/session-store.db`), Claude Code (`~/.claude/projects/`), Codex CLI
 (`~/.codex/sessions/`). Graphora ingests them all into **one graph**, so sessions from
-different terminals · and different agents · become connected the moment they touch the
-same file, repo, or PR. Cross-agent memory: "which agent touched build.yml?"
+different terminals and different agents become connected the moment they touch the
+same file, repo, or PR.
 
 ```bash
 graphora sessions ingest --days 7             # all agents found (or --source copilot|claude|codex)
-
 graphora sessions connected file build.yml    # which windows/agents touched this file?
 graphora sessions connected ref 275           # which sessions relate to PR 275?
 graphora sessions connected repo org/proj     # everything that happened in one repo
-```
-
-No FalkorDB container? Same commands work with the embedded JSON backend:
-
-```bash
-graphora sessions ingest --days 7 --backend embedded
-graphora sessions connected file build.yml --backend embedded
-```
-
-Make it zero-effort: install the session-recall skill so your agents run these
-commands themselves when you ask "which sessions touched this file?":
-
-```bash
-graphora install-skill all --skill sessions   # or --skill all for code + sessions
+graphora install-skill all --skill sessions   # let agents run these themselves
 ```
 
 Read-only on the sources, no LLM, idempotent. See [use case 6](USECASES.md).
 
 ## Benchmarks
 
-Measured on real repositories, fully deterministic, zero network. Full methodology and reproduction commands in [BENCHMARKS.md](./BENCHMARKS.md).
+Measured on local checkouts with `graphora benchmark` (embedded backend, deterministic, no
+network). "Definitions found" compares the graph with Python's own `ast` parser; "certain"
+is the share of call edges tagged `EXTRACTED` or `INFERRED`.
 
-Public benchmark on pinned OSS commits, reproducible with `python3 scripts/public_benchmark.py`:
+| Repository | Commit | Files | Definitions found (vs `ast`) | Call edges | Certain | Context: repo → Graphora |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| [Shiftory](https://github.com/Naseem77/Shiftory) | `f4e1a03630` | 61 | 498/498 (100%) | 1,479 | 97% | 134,155 → 1,243 tokens |
+| [falkordb-py](https://github.com/FalkorDB/falkordb-py) | `e4230e1ce7` | 42 | 390/390 (100%) | 1,143 | 57% | 61,931 → 1,708 tokens |
+| [GraphRAG-SDK](https://github.com/FalkorDB/GraphRAG-SDK) | `93b760edd4` | 190 | 5,043/5,043 (100%) | 14,656 | 66% | 888,919 → 36,312 tokens |
 
-| Repository | Commit | Whole-repo dump | Relevant files | **Graphora blast radius** | Savings |
-| --- | --- | ---: | ---: | ---: | ---: |
-| flask | `36e4a824f3` | 147,390 tokens | 124,205 tokens | **21,534 tokens** | **85.4%** |
-| requests | `f361ead047` | 101,739 tokens | 80,360 tokens | **10,331 tokens** | **89.8%** |
-| click | `b67832c216` | 225,373 tokens | 190,236 tokens | **39,534 tokens** | **82.5%** |
-| falkordb-py | `971f1d124e` | 59,866 tokens | 40,638 tokens | **3,550 tokens** | **94.1%** |
-
-Graph build cost in LLM credits: **$0**, by construction. The "relevant files" column is the honest baseline: every file a reviewer would have to read to learn what the blast radius states directly.
-
-## Use cases
-
-Five real, captured scenarios in [USECASES.md](./USECASES.md):
-
-1. **Cross-file impact review with zero LLM**: a one-line diff, callers and covering tests read straight from the graph, ~197 tokens of context.
-2. **Risk hotspot mining on a real codebase**: 231 commits of falkordb-py history, the async cluster code correctly surfaced as the trouble spot.
-3. **AI agents over MCP**: a live stdio session calling `blast_radius`, `risk_top`, `find_symbol`.
-4. **A CI gate in three lines** of library code, plus incremental re-indexing.
-5. **Ambiguity honesty**: duplicate symbol names tagged `AMBIGUOUS` instead of silently guessed.
+The remaining ambiguous edges are mostly real polymorphism (several classes implement the
+same method) and values whose type the source never states (e.g. pytest fixtures); those are
+exactly the calls the answer lists as "X or Y". Indexing GraphRAG-SDK (190 files) takes 2.3 s
+embedded and 2.5 s on FalkorDB. Methodology and the pinned public benchmark (`scripts/public_benchmark.py`)
+are in [BENCHMARKS.md](./BENCHMARKS.md).
 
 ## Architecture
 
 ```text
-                        ┌────────────────────────────────────────────┐
-   source files ───────▶│  tree-sitter parse (deterministic, $0)     │
-   git history  ───────▶│  risk miner (fix/revert attribution, $0)   │
-                        └───────────────────┬────────────────────────┘
+   source files ──▶ tree-sitter parse: symbols (qualified names, ranges, return types),
+                    call sites (callee + receiver), import bindings, local type facts
+                                            │
                                             ▼
-                       code graph (FalkorDB or embedded)
-                 File · Function · Class · Module · FixCommit
-              CALLS / DEFINED_IN / IMPORTS / FIXED  (confidence-tagged)
+                    resolver (graphora/resolve.py): self → same file → imports →
+                    package → declared types → name; external imports dropped
+                                            │
+                                            ▼
+                       code graph (FalkorDB or embedded JSON)
+              File · Function · Class · Module  /  CALLS · DEFINED_IN · IMPORTS · IMPORTS_FILE
+                       (every CALLS edge: confidence, candidates, reason)
                                             │
               ┌──────────────┬──────────────┼───────────────┬─────────────┐
               ▼              ▼              ▼               ▼             ▼
-           CLI           library API     MCP server     benchmark    skill installer
-        (terminal)      (CI gates,      (AI agents)    (reproducible)  (22 agents)
-                         refactors)
+       what could break   library API     MCP server     benchmark    skill installer
+       (CLI, review)      (CI gates)      (AI agents)    (accuracy)   (22 agents)
 ```
 
-Graph model per project: `graphora:{project}` in FalkorDB, or `~/.graphora/{project}.json` embedded. Incremental updates re-parse only changed files. The optional LLM review pass (litellm, any provider) receives the diff plus the compact blast radius, never the repository.
+Both stores keep each file's raw call sites and re-resolve the whole graph after every
+write, so an incremental update (`update_files`) never drops callers in unchanged files.
 
 ## Enterprise notes
 
-- **Privacy**: the index path is fully local. No code, no metadata leaves the machine unless the optional `--llm` review is enabled, and then only the diff plus a few hundred tokens of graph facts are sent to *your* configured provider.
-- **Determinism**: identical input produces identical graphs, reviews, and benchmark numbers. No embeddings drift, no model version drift in the core.
-- **Multi-project**: one FalkorDB instance serves many project graphs (`graphora:{project}`), so a single shared server can back a whole team. Solo developers need no server at all (embedded backend).
-- **Auditability**: every review claim traces to a tagged graph fact; every risk score traces to specific commits (`FixCommit` nodes with sha, date, subject).
-- **Incremental cost**: re-index only changed files on push; risk mining is idempotent per commit.
+- **Privacy**: indexing and queries are fully local. Nothing leaves the machine unless the
+  optional `review --llm` is used, and then only the diff plus the graph facts go to *your*
+  configured provider.
+- **Determinism**: identical input produces identical graphs and answers. No embeddings, no
+  model drift in the core.
+- **Multi-project**: one FalkorDB instance serves many project graphs (`graphora:{project}`).
+  Solo developers need no server at all (embedded backend).
+- **Auditability**: every claim in an answer traces to a tagged edge with the rule that
+  produced it (`same-file`, `import`, `self`, `returns`, `name`, `receiver-unknown`, ...).
 
 ## Testing
 
-80 tests, all passing: parser (11 languages), FalkorDB store, embedded store (including backend-parity tests), blast radius, risk memory, CLI, MCP server, skill installer, and benchmarks. Integration tests run against a live FalkorDB and real scripted git repositories, and skip cleanly when FalkorDB is absent.
-
 ```bash
-python3 -m pytest tests -q        # 80 passed
+pip install -e ".[dev,mcp]"
+python -m pytest tests -q           # 200 tests
+ruff check graphora tests scripts && mypy graphora
 ```
 
-The test-per-phase methodology and the bugs the suite caught are documented in [USECASES.md](./USECASES.md#how-it-was-tested).
+The suite covers every language's definitions (exact sets, including no false definitions),
+each resolution rule, what-could-break (certain vs uncertain, depth, diffs, X-or-Y text), both
+backends with a parity test, incremental updates, the CLI, the MCP server on mcp 1.x and 2.x,
+the skill installer, and the benchmarks. CI runs it against a live FalkorDB and fails on any
+skipped test.
 
 ## Requirements
 
@@ -238,11 +269,9 @@ The test-per-phase methodology and the bugs the suite caught are documented in [
 | --- | --- | --- |
 | Python | 3.10+ | |
 | FalkorDB | optional | for the client-server backend; embedded backend needs nothing |
-| git | any | for risk memory mining |
+| git | any | `.gitignore` handling and `--git-range` |
 | litellm | optional | only for `review --llm` |
-| mcp | optional | only for `serve-mcp` |
-
-Languages indexed today: Python, JavaScript, TypeScript, Go, Java, Rust, C, C++, Ruby, PHP (tree-sitter grammars, regex fallback).
+| mcp | optional | only for `serve-mcp` (1.x or 2.x) |
 
 ## License
 

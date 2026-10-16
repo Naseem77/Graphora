@@ -41,6 +41,14 @@ def project(tmp_path: Path):
     GraphStore(name).delete_graph()
 
 
+def _text(result) -> str:
+    """First text block of a call_tool result, on mcp 1.x or 2.x."""
+    content = getattr(result, "content", None)  # mcp 2.x CallToolResult
+    if content is None:
+        content = result[0] if isinstance(result, tuple) else result  # mcp 1.x
+    return content[0].text
+
+
 @pytest.fixture()
 def server(project):
     return build_server(project)
@@ -50,13 +58,13 @@ def server(project):
 async def test_mcp_lists_all_tools(server):
     tools = await server.list_tools()
     names = {tool.name for tool in tools}
-    assert names == {"graph_stats", "blast_radius", "review_diff", "risk_top", "find_symbol"}
+    assert names == {"what_could_break", "what_could_break_for_diff", "graph_stats", "blast_radius", "review_diff", "find_symbol"}
 
 
 @pytest.mark.anyio
 async def test_mcp_blast_radius_tool(server):
     result = await server.call_tool("blast_radius", {"symbols": ["compute"]})
-    payload = json.loads(result[0][0].text)
+    payload = json.loads(_text(result))
     assert payload["symbols"][0]["name"] == "compute"
     assert any(c["name"] == "pipeline" for c in payload["symbols"][0]["callers"])
     assert any(t["name"] == "test_compute" for t in payload["symbols"][0]["tests"])
@@ -65,10 +73,10 @@ async def test_mcp_blast_radius_tool(server):
 @pytest.mark.anyio
 async def test_mcp_find_symbol_and_stats(server):
     result = await server.call_tool("find_symbol", {"name": "pipeline"})
-    hits = json.loads(result[0][0].text)
+    hits = json.loads(_text(result))
     assert hits[0]["path"] == "pkg/core.py"
     result = await server.call_tool("graph_stats", {})
-    stats = json.loads(result[0][0].text)
+    stats = json.loads(_text(result))
     assert stats["files"] == 2
 
 
@@ -76,11 +84,30 @@ async def test_mcp_find_symbol_and_stats(server):
 async def test_mcp_review_diff_tool(server):
     diff = "--- a/pkg/core.py\n+++ b/pkg/core.py\n@@ -1,2 +1,2 @@\n-def compute(x):\n+def compute(x, y=0):\n"
     result = await server.call_tool("review_diff", {"diff": diff})
-    text = result[0][0].text
+    text = _text(result)
     assert "# Graphora Review" in text
     assert "compute" in text
+
+
+def test_mcp_reports_graphora_version(server):
+    from graphora import __version__
+
+    low_level = getattr(server, "_mcp_server", None) or getattr(server, "_lowlevel_server", None)
+    assert low_level.version == __version__
 
 
 @pytest.fixture()
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_mcp_what_could_break(server):
+    text = _text(await server.call_tool("what_could_break", {"symbols": ["compute"]}))
+    assert "Will break (1)" in text and "`pipeline`" in text
+    assert "test_compute" in text
+    payload = json.loads(_text(await server.call_tool("what_could_break", {"symbols": ["compute"], "as_json": True})))
+    assert payload["will_break"][0]["name"] == "pipeline"
+    diff = "--- a/pkg/core.py\n+++ b/pkg/core.py\n@@ -2 +2 @@\n-    return x + 1\n+    return x + 2\n"
+    text = _text(await server.call_tool("what_could_break_for_diff", {"diff": diff}))
+    assert "`compute`" in text and "`pipeline`" in text

@@ -3,10 +3,10 @@
 Usage:
   graphora index PATH [--project NAME]
   graphora stats [--project NAME]
+  graphora breaks SYMBOL [SYMBOL...] [--depth N] [--json]
+  graphora breaks --diff FILE | --git-range RANGE [--repo PATH]
   graphora blast SYMBOL [SYMBOL...] [--project NAME] [--json]
   graphora review [--diff FILE | --git-range RANGE --repo PATH] [--project NAME] [--llm]
-  graphora risk mine PATH [--project NAME] [--since DATE]
-  graphora risk top [--project NAME] [--limit N]
   graphora benchmark PATH [--project NAME] [--symbols A,B]
   graphora serve-mcp [--project NAME]
 """
@@ -24,7 +24,16 @@ from graphora.store import open_store
 
 
 def _store(args: argparse.Namespace):
-    return open_store(args.project, backend=args.backend, host=args.host, port=args.port)
+    """Open the project graph for a read command, warning if nothing is indexed."""
+    store = open_store(args.project, backend=args.backend, host=args.host, port=args.port)
+    if not store.has_files():
+        print(
+            f"graphora: warning: graph {store.graph_name!r} ({store.backend}) is empty. "
+            f"Run 'graphora index <repo-path>' first, or pass --project "
+            f"(it defaults to the current directory name).",
+            file=sys.stderr,
+        )
+    return store
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -37,7 +46,9 @@ def cmd_index(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     project = args.project or root.name
     store = open_store(project, backend=args.backend, host=args.host, port=args.port)
-    index_repository(root, project=project, store=store, on_progress=progress)
+    index_repository(
+        root, project=project, store=store, on_progress=progress, include_generated=args.include_generated
+    )
     sys.stderr.write("\n")
     print(json.dumps({"project": project, "graph": store.graph_name, "backend": store.backend, **store.stats()}, indent=2))
     return 0
@@ -56,54 +67,43 @@ def cmd_blast(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_review(args: argparse.Namespace) -> int:
-    from graphora.review import review_diff
-
+def _read_diff(args: argparse.Namespace, allow_stdin: bool = True) -> str:
     if args.diff:
-        diff = Path(args.diff).read_text()
-    elif args.git_range:
+        return Path(args.diff).read_text()
+    if args.git_range:
         repo = Path(args.repo or ".").resolve()
-        diff = subprocess.run(
+        return subprocess.run(
             ["git", "--no-pager", "diff", args.git_range],
             cwd=repo, capture_output=True, text=True, check=True,
         ).stdout
+    return sys.stdin.read() if allow_stdin else ""
+
+
+def cmd_breaks(args: argparse.Namespace) -> int:
+    from graphora.impact import what_could_break, what_could_break_for_diff
+
+    store = _store(args)
+    if args.symbols:
+        result = what_could_break(store, args.symbols, depth=args.depth)
     else:
-        diff = sys.stdin.read()
+        diff = _read_diff(args)
+        if not diff.strip():
+            print("Give symbols, or a diff (--diff FILE, --git-range RANGE, or stdin).", file=sys.stderr)
+            return 1
+        result = what_could_break_for_diff(store, diff, depth=args.depth)
+    print(json.dumps(result.to_dict(), indent=2) if args.json else result.to_text())
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    from graphora.review import review_diff
+
+    diff = _read_diff(args)
     if not diff.strip():
         print("No diff provided (use --diff FILE, --git-range RANGE, or stdin).", file=sys.stderr)
         return 1
     review = review_diff(_store(args), diff, model=args.model, use_llm=args.llm)
     print(review.render())
-    return 0
-
-
-def cmd_risk_mine(args: argparse.Namespace) -> int:
-    from graphora.risk import mine_risk_memory
-
-    root = Path(args.path).resolve()
-    project = args.project or root.name
-    store = open_store(project, backend=args.backend, host=args.host, port=args.port)
-    stats = mine_risk_memory(store, root, since=args.since, max_commits=args.max_commits)
-    print(json.dumps(stats.__dict__, indent=2))
-    return 0
-
-
-def cmd_risk_top(args: argparse.Namespace) -> int:
-    from graphora.risk import risk_report
-
-    report = risk_report(_store(args), limit=args.limit)
-    if args.json:
-        print(json.dumps(report, indent=2))
-        return 0
-    if not report:
-        print("No risk memory yet. Run: graphora risk mine <repo-path>")
-        return 0
-    print(f"{'RISK':>6}  {'FIXES':>5}  {'CALLERS':>7}  {'LAST BROKE':<12} SYMBOL")
-    for row in report:
-        print(
-            f"{row['risk_score']:>6.2f}  {row['fix_count']:>5}  {row['caller_count']:>7}  "
-            f"{row['last_broke_at'][:10]:<12} {row['name']}  ({row['path']}:{row['line']})"
-        )
     return 0
 
 
@@ -188,14 +188,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Graph storage: FalkorDB server, embedded JSON (no Docker), or auto-detect (default)",
     )
 
+    # Nested subcommands re-declare the common flags so they work after the
+    # sub-subcommand too; SUPPRESS keeps their defaults from overwriting values
+    # already given before it (argparse applies the inner parser's defaults last).
+    nested_common = argparse.ArgumentParser(add_help=False)
+    for action in common._actions:
+        options: dict = {"dest": action.dest, "help": action.help, "default": argparse.SUPPRESS}
+        if action.type is not None:
+            options["type"] = action.type
+        if action.choices is not None:
+            options["choices"] = action.choices
+        nested_common.add_argument(*action.option_strings, **options)
+
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_index = sub.add_parser("index", parents=[common], help="Index a repository into the graph (no LLM)")
     p_index.add_argument("path")
+    p_index.add_argument(
+        "--include-generated",
+        action="store_true",
+        help="Also index generated files (ANTLR/protobuf output, '@generated', minified JS)",
+    )
     p_index.set_defaults(func=cmd_index)
 
     p_stats = sub.add_parser("stats", parents=[common], help="Show graph stats")
     p_stats.set_defaults(func=cmd_stats, project_required=True)
+
+    p_breaks = sub.add_parser(
+        "breaks", parents=[common], help="What could break if you change these symbols (or this diff)"
+    )
+    p_breaks.add_argument("symbols", nargs="*", help="Names or qualified names (Class.method); omit to read a diff")
+    p_breaks.add_argument("--depth", type=int, default=2, help="Caller hops to follow (default: 2)")
+    p_breaks.add_argument("--diff", help="Path to a unified diff file")
+    p_breaks.add_argument("--git-range", help="Git range, e.g. main...HEAD")
+    p_breaks.add_argument("--repo", help="Repo path for --git-range (default: cwd)")
+    p_breaks.add_argument("--json", action="store_true")
+    p_breaks.set_defaults(func=cmd_breaks)
 
     p_blast = sub.add_parser("blast", parents=[common], help="Blast radius for symbols")
     p_blast.add_argument("symbols", nargs="+")
@@ -210,18 +238,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument("--model", default=None)
     p_review.set_defaults(func=cmd_review)
 
-    p_risk = sub.add_parser("risk", parents=[common], help="Risk memory commands")
-    risk_sub = p_risk.add_subparsers(dest="risk_command", required=True)
-    p_mine = risk_sub.add_parser("mine", parents=[common], help="Mine git fix/revert history into the graph")
-    p_mine.add_argument("path")
-    p_mine.add_argument("--since", default=None, help="e.g. '2 years ago'")
-    p_mine.add_argument("--max-commits", type=int, default=2000)
-    p_mine.set_defaults(func=cmd_risk_mine)
-    p_top = risk_sub.add_parser("top", parents=[common], help="Riskiest symbols")
-    p_top.add_argument("--limit", type=int, default=15)
-    p_top.add_argument("--json", action="store_true")
-    p_top.set_defaults(func=cmd_risk_top)
-
     p_bench = sub.add_parser("benchmark", parents=[common], help="Reproducible token-cost benchmark")
     p_bench.add_argument("path")
     p_bench.add_argument("--symbols", help="Comma-separated symbols to query (default: auto-pick)")
@@ -233,7 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sess = sub.add_parser("sessions", parents=[common], help="Agent session-history graph commands")
     sess_sub = p_sess.add_subparsers(dest="sessions_command", required=True)
-    p_si = sess_sub.add_parser("ingest", parents=[common], help="Ingest agent session stores into the graph")
+    p_si = sess_sub.add_parser("ingest", parents=[nested_common], help="Ingest agent session stores into the graph")
     p_si.add_argument("--source", choices=["all", "copilot", "claude", "codex"], default="all",
                       help="Which agent's sessions to ingest (default: all found)")
     p_si.add_argument("--db", default=None, help="Copilot session-store.db path (default: ~/.copilot/session-store.db)")
@@ -241,7 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_si.add_argument("--codex-root", default=None, help="Codex CLI sessions dir (default: ~/.codex/sessions)")
     p_si.add_argument("--days", type=int, default=30, help="Only sessions updated in the last N days")
     p_si.set_defaults(func=cmd_sessions_ingest)
-    p_sc = sess_sub.add_parser("connected", parents=[common], help="Sessions connected to a file, repo, or PR/issue/commit")
+    p_sc = sess_sub.add_parser("connected", parents=[nested_common], help="Sessions connected to a file, repo, or PR/issue/commit")
     p_sc.add_argument("kind", choices=["file", "repo", "ref"])
     p_sc.add_argument("value")
     p_sc.set_defaults(func=cmd_sessions_connected)
@@ -260,10 +276,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if getattr(args, "project", None) is None and args.command not in {"index", "benchmark"}:
-        if args.command == "review" and args.repo:
+        if args.command in {"review", "breaks"} and getattr(args, "repo", None):
             args.project = Path(args.repo).resolve().name
-        elif args.command == "risk" and getattr(args, "path", None):
-            args.project = Path(args.path).resolve().name
         elif args.command == "sessions":
             args.project = "agent-sessions"
         else:

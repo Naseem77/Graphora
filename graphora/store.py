@@ -1,17 +1,38 @@
 """FalkorDB graph store. Deterministic Cypher writes, no LLM, no embeddings.
 
-Every relationship carries a `confidence` property:
-- EXTRACTED: explicit in the source (import statement, definition, same-file call)
-- INFERRED: resolved by name matching with exactly one candidate
-- AMBIGUOUS: name matched multiple candidates; all are linked and tagged
+Every CALLS relationship carries `confidence` (see graphora.resolve):
+- EXTRACTED: the source names the target (same file, self, import)
+- INFERRED: a bare call whose name matches exactly one definition
+- AMBIGUOUS: several candidates (all linked) or an unknown receiver type
+plus `candidates`, the number of targets its call site resolved to.
 """
 
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+import json
+from typing import TYPE_CHECKING, Any, Union
 
-from graphora.parser import AMBIGUOUS, EXTRACTED, INFERRED, ParsedFile
+from graphora.parser import EXTRACTED, ParsedFile
+from graphora.resolve import CallSite, FileRecord, SymbolRecord, records_for, resolve
+
+_BATCH = 2000
+_SYMBOL_FIELDS = (
+    "name", "qualname", "kind", "path", "line", "end_line", "signature", "parent", "parent_kind", "is_test", "confidence",
+    "returns",
+)
+_INDEXES = (
+    ("File", "path"),
+    ("Function", "stable_key"),
+    ("Function", "name"),
+    ("Function", "qualname"),
+    ("Function", "path"),
+    ("Class", "stable_key"),
+    ("Class", "name"),
+    ("Class", "qualname"),
+    ("Class", "path"),
+    ("Module", "name"),
+)
 
 
 class GraphStore:
@@ -29,6 +50,7 @@ class GraphStore:
             except ImportError as exc:  # pragma: no cover
                 raise RuntimeError("The 'falkordb' package is required: pip install falkordb") from exc
             self._graph = FalkorDB(host=host, port=port).select_graph(self.graph_name)
+        self._indexed = False
 
     @property
     def graph_name(self) -> str:
@@ -38,63 +60,126 @@ class GraphStore:
         result = self._graph.query(cypher, params or {})
         return getattr(result, "result_set", result) or []
 
+    def _ensure_indexes(self) -> None:
+        if self._indexed:
+            return
+        for label, prop in _INDEXES:
+            try:
+                self.query(f"CREATE INDEX FOR (n:{label}) ON (n.{prop})")
+            except Exception:  # noqa: BLE001 - already exists
+                pass
+        self._indexed = True
+
     # --- writes ---------------------------------------------------------
 
-    def write_files(self, parsed_files: list[ParsedFile]) -> int:
+    def write_files(self, parsed_files: list[ParsedFile], save: bool = True) -> int:
+        """Store files, their symbols, and raw call sites (batched per file).
+
+        `save` is accepted for parity with the embedded store; FalkorDB
+        writes are persistent immediately. Call link_cross_file_calls()
+        afterwards to (re)build the CALLS edges.
+        """
+        self._ensure_indexes()
         for parsed in parsed_files:
             self.delete_file(parsed.path)
-            self._write_file_node(parsed)
-            self._write_imports(parsed)
-            self._write_symbols(parsed)
-            self._write_local_calls(parsed)
+            symbols, record = records_for(parsed)
+            self.query(
+                """
+                CREATE (f:File {path: $path})
+                SET f.language = $language, f.is_test = $is_test, f.content_hash = $content_hash,
+                    f.line_count = $line_count, f.parser = $parser,
+                    f.bindings = $bindings, f.raw_calls = $raw_calls
+                """,
+                {
+                    "path": parsed.path,
+                    "language": parsed.language,
+                    "is_test": parsed.is_test,
+                    "content_hash": _hash(parsed.source_text),
+                    "line_count": parsed.source_text.count("\n") + (0 if parsed.source_text.endswith("\n") else 1),
+                    "parser": parsed.parser_used,
+                    "bindings": json.dumps([list(b) for b in record.bindings]),
+                    "raw_calls": json.dumps([[c.caller_key, c.callee, c.receiver, c.line] for c in record.calls]),
+                },
+            )
+            for label in ("Function", "Class"):
+                rows = [_symbol_row(s) for s in symbols if s.kind == label]
+                for start in range(0, len(rows), _BATCH):
+                    self.query(
+                        f"""
+                        MATCH (f:File {{path: $path}})
+                        UNWIND $rows AS row
+                        CREATE (s:{label} {{stable_key: row.key}})
+                        SET s += row.props, s.signature_hash = row.signature_hash
+                        CREATE (s)-[:DEFINED_IN {{confidence: '{EXTRACTED}'}}]->(f)
+                        """,
+                        {"path": parsed.path, "rows": rows[start : start + _BATCH]},
+                    )
+            if parsed.imports:
+                self.query(
+                    """
+                    MATCH (f:File {path: $path})
+                    UNWIND $rows AS row
+                    MERGE (m:Module {name: row.name})
+                    MERGE (f)-[r:IMPORTS]->(m)
+                    SET r.confidence = row.confidence
+                    """,
+                    {"path": parsed.path, "rows": [{"name": i.name, "confidence": i.confidence} for i in parsed.imports]},
+                )
         return len(parsed_files)
 
     def link_cross_file_calls(self) -> int:
-        """Second pass: resolve calls whose callee lives in another file.
-
-        A single definition match is INFERRED; multiple matches are AMBIGUOUS.
-        """
-        rows = self.query(
-            """
-            MATCH (caller:Function)
-            WHERE caller.pending_calls IS NOT NULL AND size(caller.pending_calls) > 0
-            RETURN caller.stable_key, caller.pending_calls
-            """
-        )
-        linked = 0
-        for stable_key, pending in rows:
-            for entry in pending or []:
-                callee_name, line = entry.rsplit("@", 1)
-                candidates = self.query(
-                    "MATCH (f:Function {name: $name}) RETURN f.stable_key",
-                    {"name": callee_name},
-                )
-                if not candidates:
-                    continue
-                confidence = INFERRED if len(candidates) == 1 else AMBIGUOUS
-                for (callee_key,) in candidates:
-                    if callee_key == stable_key:
-                        continue
-                    self.query(
-                        """
-                        MATCH (a:Function {stable_key: $a}), (b:Function {stable_key: $b})
-                        MERGE (a)-[r:CALLS {line: $line}]->(b)
-                        SET r.confidence = $confidence
-                        """,
-                        {"a": stable_key, "b": callee_key, "line": int(line), "confidence": confidence},
-                    )
-                    linked += 1
-            self.query(
-                "MATCH (f:Function {stable_key: $key}) SET f.pending_calls = NULL",
-                {"key": stable_key},
+        """Resolve every stored call site into CALLS edges (all files, so
+        callers in unchanged files relink to callees in changed ones)."""
+        self._ensure_indexes()
+        symbols = [
+            SymbolRecord(key=row[0], **dict(zip(_SYMBOL_FIELDS, row[1:])))
+            for row in self.query(
+                "MATCH (s) WHERE s:Function OR s:Class RETURN s.stable_key, "
+                + ", ".join(f"s.{f}" for f in _SYMBOL_FIELDS)
             )
-        return linked
+        ]
+        files = [
+            FileRecord(
+                path=path,
+                language=language,
+                is_test=bool(is_test),
+                bindings=tuple(tuple(b) for b in json.loads(bindings or "[]")),
+                calls=tuple(CallSite(*c) for c in json.loads(raw_calls or "[]")),
+            )
+            for path, language, is_test, bindings, raw_calls in self.query(
+                "MATCH (f:File) RETURN f.path, f.language, f.is_test, f.bindings, f.raw_calls"
+            )
+        ]
+        result = resolve(symbols, files)
+        self.query("MATCH ()-[r:CALLS]->() DELETE r")
+        self.query("MATCH ()-[r:IMPORTS_FILE]->() DELETE r")
+        kinds = {s.key: s.kind for s in symbols}
+        for label in ("Function", "Class"):
+            rows = [dict(edge.__dict__) for edge in result.edges if kinds.get(edge.b) == label]
+            for start in range(0, len(rows), _BATCH):
+                self.query(
+                    f"""
+                    UNWIND $rows AS row
+                    MATCH (a:Function {{stable_key: row.a}}), (b:{label} {{stable_key: row.b}})
+                    CREATE (a)-[:CALLS {{line: row.line, confidence: row.confidence,
+                                         candidates: row.candidates, reason: row.reason}}]->(b)
+                    """,
+                    {"rows": rows[start : start + _BATCH]},
+                )
+        pairs = [{"a": a, "b": b} for a, b in result.file_imports]
+        for start in range(0, len(pairs), _BATCH):
+            self.query(
+                """
+                UNWIND $rows AS row
+                MATCH (a:File {path: row.a}), (b:File {path: row.b})
+                CREATE (a)-[:IMPORTS_FILE]->(b)
+                """,
+                {"rows": pairs[start : start + _BATCH]},
+            )
+        return len(result.edges)
 
     def delete_file(self, path: str) -> None:
-        self.query(
-            "MATCH (s)-[:DEFINED_IN]->(f:File {path: $path}) DETACH DELETE s",
-            {"path": path},
-        )
+        self.query("MATCH (s)-[:DEFINED_IN]->(f:File {path: $path}) DETACH DELETE s", {"path": path})
         self.query("MATCH (f:File {path: $path}) DETACH DELETE f", {"path": path})
 
     def clear(self) -> None:
@@ -177,76 +262,72 @@ class GraphStore:
 
     # --- named reads (shared surface with EmbeddedGraphStore) ---------------
 
-    def find_definitions(self, name: str) -> list[list]:
-        return self.query(
-            """
-            MATCH (s)
-            WHERE (s:Function OR s:Class) AND s.name = $name
-            RETURN s.name, labels(s)[0], s.path, s.line, s.signature,
-                   coalesce(s.risk_score, 0.0), coalesce(s.fix_count, 0),
-                   coalesce(s.last_broke_at, '')
-            """,
+    _RECORD = "s.stable_key, " + ", ".join(f"s.{f}" for f in _SYMBOL_FIELDS)
+
+    def find_symbols(self, name: str) -> list[dict]:
+        """Symbols whose name or qualified name is `name` (e.g. "save" or "Db.save")."""
+        rows = self.query(
+            f"MATCH (s:Function) WHERE s.name = $name OR s.qualname = $name RETURN {self._RECORD} "
+            f"UNION ALL MATCH (s:Class) WHERE s.name = $name OR s.qualname = $name RETURN {self._RECORD}",
             {"name": name},
         )
+        return sorted((_record(r) for r in rows), key=lambda r: (r["path"], r["line"], r["key"]))
 
-    def callers_of(self, name: str, path: str) -> list[tuple[str, str, str]]:
-        return [
-            (r[0], r[1], r[2])
-            for r in self.query(
-                """
-                MATCH (caller:Function)-[r:CALLS]->(s:Function {name: $name, path: $path})
-                WHERE coalesce(caller.is_test, false) = false
-                RETURN DISTINCT caller.name, caller.path, r.confidence
-                """,
-                {"name": name, "path": path},
-            )
-        ]
+    def get_symbol(self, key: str) -> dict | None:
+        rows = self.query(
+            f"MATCH (s:Function {{stable_key: $key}}) RETURN {self._RECORD} "
+            f"UNION ALL MATCH (s:Class {{stable_key: $key}}) RETURN {self._RECORD}",
+            {"key": key},
+        )
+        return _record(rows[0]) if rows else None
 
-    def callees_of(self, name: str, path: str) -> list[tuple[str, str, str]]:
-        return [
-            (r[0], r[1], r[2])
-            for r in self.query(
-                """
-                MATCH (s:Function {name: $name, path: $path})-[r:CALLS]->(callee:Function)
-                RETURN DISTINCT callee.name, callee.path, r.confidence
-                """,
-                {"name": name, "path": path},
-            )
-        ]
+    def symbols_in_file(self, path: str) -> list[dict]:
+        rows = self.query(
+            f"MATCH (s)-[:DEFINED_IN]->(:File {{path: $path}}) RETURN {self._RECORD}",
+            {"path": path},
+        )
+        return sorted((_record(r) for r in rows), key=lambda r: (r["line"], r["key"]))
 
-    def tests_covering(self, name: str, path: str) -> list[tuple[str, str, str]]:
-        return [
-            (r[0], r[1], r[2])
-            for r in self.query(
-                """
-                MATCH (t:Function {is_test: true})-[r:CALLS]->(s:Function {name: $name, path: $path})
-                RETURN DISTINCT t.name, t.path, r.confidence
-                """,
-                {"name": name, "path": path},
-            )
-        ]
+    def incoming_calls(self, key: str) -> list[dict]:
+        return self._edges(
+            "MATCH (c:Function)-[r:CALLS]->(t {stable_key: $key}) "
+            "RETURN " + self._RECORD.replace("s.", "c.") + ", r.line, r.confidence, r.candidates, r.reason",
+            key,
+            "caller",
+        )
 
-    def importers_of_module(self, module_hint: str, exclude_path: str) -> list[str]:
-        return [
-            r[0]
-            for r in self.query(
-                """
-                MATCH (f:File)-[:IMPORTS]->(m:Module)
-                WHERE m.name ENDS WITH $module_hint AND f.path <> $path
-                RETURN DISTINCT f.path
-                """,
-                {"module_hint": module_hint, "path": exclude_path},
-            )
-        ]
+    def outgoing_calls(self, key: str) -> list[dict]:
+        return self._edges(
+            "MATCH (f:Function {stable_key: $key})-[r:CALLS]->(c) "
+            "RETURN " + self._RECORD.replace("s.", "c.") + ", r.line, r.confidence, r.candidates, r.reason",
+            key,
+            "callee",
+        )
+
+    def call_site_targets(self, caller_key: str, line: int) -> list[dict]:
+        """Every target one call site resolved to (the alternatives of an AMBIGUOUS call)."""
+        rows = self.query(
+            "MATCH (f:Function {stable_key: $key})-[r:CALLS {line: $line}]->(s) RETURN DISTINCT " + self._RECORD,
+            {"key": caller_key, "line": line},
+        )
+        return sorted((_record(r) for r in rows), key=lambda r: (r["path"], r["line"]))
+
+    def file_importers(self, path: str) -> list[str]:
+        rows = self.query("MATCH (a:File)-[:IMPORTS_FILE]->(:File {path: $path}) RETURN DISTINCT a.path", {"path": path})
+        return sorted(r[0] for r in rows)
+
+    def call_confidence_counts(self) -> dict[str, int]:
+        rows = self.query("MATCH ()-[r:CALLS]->() RETURN r.confidence, count(r)")
+        return {str(confidence): int(count) for confidence, count in rows}
 
     def top_connected_symbols(self, count: int = 3) -> list[str]:
         rows = self.query(
             """
-            MATCH (caller:Function)-[:CALLS]->(s:Function)
+            MATCH (:Function)-[:CALLS]->(s)
             WHERE coalesce(s.is_test, false) = false
-            WITH s.name AS name, count(caller) AS degree
-            WITH name, sum(degree) AS total_degree
-            ORDER BY total_degree DESC, name ASC
+            WITH s.qualname AS name, count(*) AS degree
+            WITH name, sum(degree) AS total
+            ORDER BY total DESC, name ASC
             RETURN name LIMIT $count
             """,
             {"count": count},
@@ -254,180 +335,47 @@ class GraphStore:
         return [r[0] for r in rows]
 
     def find_symbol(self, name: str) -> list[dict]:
-        rows = self.query(
-            """
-            MATCH (s) WHERE (s:Function OR s:Class) AND s.name = $name
-            RETURN s.name, labels(s)[0], s.path, s.line, s.signature
-            """,
-            {"name": name},
-        )
         return [
-            {"name": r[0], "kind": r[1], "path": r[2], "line": int(r[3] or 0), "signature": r[4]}
-            for r in rows
+            {"name": r["qualname"], "kind": r["kind"], "path": r["path"], "line": r["line"], "signature": r["signature"]}
+            for r in self.find_symbols(name)
         ]
 
-    # --- risk memory surface -------------------------------------------------
-
-    def known_fix_shas(self) -> set[str]:
-        return {row[0] for row in self.query("MATCH (c:FixCommit) RETURN c.sha")}
-
-    def upsert_fix_commit(self, sha: str, date: str, subject: str, kind: str) -> None:
-        self.query(
-            "MERGE (c:FixCommit {sha: $sha}) SET c.date = $date, c.subject = $subject, c.kind = $kind",
-            {"sha": sha, "date": date, "subject": subject[:300], "kind": kind},
-        )
-
-    def touch_file(self, sha: str, path: str) -> int:
-        rows = self.query(
-            """
-            MATCH (f:File {path: $path}), (c:FixCommit {sha: $sha})
-            MERGE (c)-[:TOUCHED]->(f)
-            RETURN f.path
-            """,
-            {"path": path, "sha": sha},
-        )
-        return len(rows)
-
-    def record_symbol_fix(self, path: str, name: str, sha: str, date: str) -> int:
-        rows = self.query(
-            """
-            MATCH (s {path: $path, name: $name}), (c:FixCommit {sha: $sha})
-            WHERE s:Function OR s:Class
-            MERGE (c)-[:FIXED]->(s)
-            SET s.fix_count = coalesce(s.fix_count, 0) + 1,
-                s.last_broke_at =
-                    CASE WHEN coalesce(s.last_broke_at, '') < $date THEN $date
-                         ELSE s.last_broke_at END
-            RETURN s.name
-            """,
-            {"path": path, "name": name, "sha": sha, "date": date},
-        )
-        return len(rows)
-
-    def risky_symbols(self, limit: int = 15) -> list[list]:
-        return self.query(
-            """
-            MATCH (s)
-            WHERE (s:Function OR s:Class) AND coalesce(s.fix_count, 0) > 0
-            OPTIONAL MATCH (caller:Function)-[:CALLS]->(s)
-            WITH s, count(DISTINCT caller) AS caller_count
-            RETURN s.name, s.path, s.line, coalesce(s.fix_count, 0),
-                   coalesce(s.last_broke_at, ''), coalesce(s.risk_score, 0.0), caller_count
-            ORDER BY coalesce(s.risk_score, 0.0) DESC, coalesce(s.fix_count, 0) DESC
-            LIMIT $limit
-            """,
-            {"limit": limit},
-        )
-
-    def symbols_with_fixes(self) -> list[list]:
-        return self.query(
-            """
-            MATCH (s)
-            WHERE (s:Function OR s:Class) AND coalesce(s.fix_count, 0) > 0
-            RETURN s.path, s.name, s.fix_count, coalesce(s.last_broke_at, '')
-            """
-        )
-
-    def set_risk_score(self, path: str, name: str, score: float) -> None:
-        self.query(
-            """
-            MATCH (s {path: $path, name: $name})
-            WHERE s:Function OR s:Class
-            SET s.risk_score = $score
-            """,
-            {"path": path, "name": name, "score": score},
-        )
-
-    # --- internals ----------------------------------------------------------
-
-    def _write_file_node(self, parsed: ParsedFile) -> None:
-        self.query(
-            """
-            MERGE (f:File {path: $path})
-            SET f.language = $language,
-                f.is_test = $is_test,
-                f.content_hash = $content_hash,
-                f.line_count = $line_count,
-                f.parser = $parser
-            """,
-            {
-                "path": parsed.path,
-                "language": parsed.language,
-                "is_test": parsed.is_test,
-                "content_hash": _hash(parsed.source_text),
-                "line_count": len(parsed.source_text.splitlines()),
-                "parser": parsed.parser_used,
-            },
-        )
-
-    def _write_imports(self, parsed: ParsedFile) -> None:
-        for imp in parsed.imports:
-            self.query(
-                """
-                MATCH (f:File {path: $path})
-                MERGE (m:Module {name: $name})
-                MERGE (f)-[r:IMPORTS]->(m)
-                SET r.confidence = $confidence
-                """,
-                {"path": parsed.path, "name": imp.name, "confidence": imp.confidence},
-            )
-
-    def _write_symbols(self, parsed: ParsedFile) -> None:
-        for symbol in parsed.symbols:
-            label = "Function" if symbol.kind == "Function" else "Class"
-            stable_key = f"{parsed.path}:{symbol.kind}:{symbol.name}"
-            self.query(
-                f"""
-                MATCH (f:File {{path: $path}})
-                MERGE (s:{label} {{stable_key: $stable_key}})
-                SET s.name = $name,
-                    s.path = $path,
-                    s.line = $line,
-                    s.signature = $signature,
-                    s.signature_hash = $signature_hash,
-                    s.confidence = $confidence,
-                    s.is_test = $is_test
-                MERGE (s)-[r:DEFINED_IN]->(f)
-                SET r.confidence = $edge_confidence
-                """,
+    def _edges(self, cypher: str, key: str, label: str) -> list[dict]:
+        out = []
+        for row in self.query(cypher, {"key": key}):
+            width = len(_SYMBOL_FIELDS) + 1
+            line, confidence, candidates, reason = row[width:]
+            out.append(
                 {
-                    "path": parsed.path,
-                    "stable_key": stable_key,
-                    "name": symbol.name,
-                    "line": symbol.line,
-                    "signature": symbol.signature,
-                    "signature_hash": _hash(symbol.signature),
-                    "confidence": symbol.confidence,
-                    "is_test": parsed.is_test,
-                    "edge_confidence": EXTRACTED,
-                },
+                    label: _record(row[:width]),
+                    "line": int(line),
+                    "confidence": confidence,
+                    "candidates": int(candidates or 1),
+                    "reason": reason or "",
+                }
             )
+        return sorted(out, key=lambda e: (e[label]["path"], e[label]["line"], e["line"]))
 
-    def _write_local_calls(self, parsed: ParsedFile) -> None:
-        local_functions = {s.name for s in parsed.symbols if s.kind == "Function"}
-        pending: dict[str, list[str]] = {}
-        for call in parsed.calls:
-            if call.callee in local_functions:
-                self.query(
-                    """
-                    MATCH (a:Function {stable_key: $a}), (b:Function {stable_key: $b})
-                    MERGE (a)-[r:CALLS {line: $line}]->(b)
-                    SET r.confidence = $confidence
-                    """,
-                    {
-                        "a": f"{parsed.path}:Function:{call.caller}",
-                        "b": f"{parsed.path}:Function:{call.callee}",
-                        "line": call.line,
-                        "confidence": call.confidence,
-                    },
-                )
-            else:
-                pending.setdefault(call.caller, []).append(f"{call.callee}@{call.line}")
-        for caller, entries in pending.items():
-            self.query(
-                "MATCH (f:Function {stable_key: $key}) SET f.pending_calls = $entries",
-                {"key": f"{parsed.path}:Function:{caller}", "entries": entries},
-            )
+
+if TYPE_CHECKING:
+    from graphora.embedded import EmbeddedGraphStore
+
+    # Either backend: they implement the same method surface.
+    GraphBackend = Union[GraphStore, EmbeddedGraphStore]
+
+
+def _symbol_row(symbol: SymbolRecord) -> dict:
+    props = {f: getattr(symbol, f) for f in _SYMBOL_FIELDS}
+    return {"key": symbol.key, "props": props, "signature_hash": _hash(symbol.signature)}
+
+
+def _record(row: list) -> dict:
+    record = {"key": row[0], **dict(zip(_SYMBOL_FIELDS, row[1:]))}
+    record["line"] = int(record["line"] or 0)
+    record["end_line"] = int(record["end_line"] or record["line"])
+    record["is_test"] = bool(record["is_test"])
+    record["returns"] = record.get("returns") or ""
+    return record
 
 
 def _hash(text: str) -> str:

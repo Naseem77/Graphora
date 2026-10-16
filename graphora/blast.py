@@ -9,9 +9,12 @@ confidence it came from.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from graphora.parser import extract_files_from_diff, extract_symbols_from_diff
-from graphora.store import GraphStore
+from graphora.parser import extract_files_from_diff
+
+if TYPE_CHECKING:
+    from graphora.store import GraphBackend
 
 
 @dataclass(frozen=True)
@@ -21,9 +24,6 @@ class SymbolImpact:
     path: str
     line: int
     signature: str
-    risk_score: float
-    fix_count: int
-    last_broke_at: str
     callers: list[tuple[str, str, str]] = field(default_factory=list)  # (name, path, confidence)
     callees: list[tuple[str, str, str]] = field(default_factory=list)
     tests: list[tuple[str, str, str]] = field(default_factory=list)
@@ -47,11 +47,6 @@ class BlastRadius:
             lines.append(_relation_line("tests", impact.tests))
             if impact.importers:
                 lines.append(f"- imported by ({len(impact.importers)}): {', '.join(impact.importers)}")
-            if impact.fix_count:
-                lines.append(
-                    f"- RISK MEMORY: involved in {impact.fix_count} fix/revert commits"
-                    f" (last: {impact.last_broke_at}), risk score {impact.risk_score:.2f}"
-                )
         if self.unresolved:
             lines.append(f"\nSymbols not found in graph: {', '.join(self.unresolved)}")
         return "\n".join(lines)
@@ -67,9 +62,6 @@ class BlastRadius:
                     "path": s.path,
                     "line": s.line,
                     "signature": s.signature,
-                    "risk_score": s.risk_score,
-                    "fix_count": s.fix_count,
-                    "last_broke_at": s.last_broke_at,
                     "callers": [{"name": n, "path": p, "confidence": c} for n, p, c in s.callers],
                     "callees": [{"name": n, "path": p, "confidence": c} for n, p, c in s.callees],
                     "tests": [{"name": n, "path": p, "confidence": c} for n, p, c in s.tests],
@@ -87,56 +79,70 @@ def _relation_line(label: str, rows: list[tuple[str, str, str]]) -> str:
     return f"- {label} ({len(rows)}): {rendered}"
 
 
-def blast_radius(store: GraphStore, symbol_names: list[str]) -> BlastRadius:
-    """Compute the blast radius for a list of symbol names."""
+def blast_radius(store: GraphBackend, symbol_names: list[str]) -> BlastRadius:
+    """Compute the blast radius for symbol names (plain or qualified, e.g. "Db.save")."""
     impacts: list[SymbolImpact] = []
     unresolved: list[str] = []
     for name in symbol_names:
-        definitions = store.find_definitions(name)
-        if not definitions:
+        records = store.find_symbols(name)
+        if not records:
             unresolved.append(name)
             continue
-        for row in definitions:
-            impacts.append(_impact_for(store, row))
+        impacts.extend(_impact_for(store, record) for record in records)
     return BlastRadius(symbols=impacts, changed_files=[], unresolved=unresolved)
 
 
-def blast_radius_for_diff(store: GraphStore, diff: str) -> BlastRadius:
-    """Compute the blast radius for a unified diff."""
-    symbols = extract_symbols_from_diff(diff)
-    radius = blast_radius(store, symbols)
+def blast_radius_for_diff(store: GraphBackend, diff: str) -> BlastRadius:
+    """Compute the blast radius for a unified diff: every symbol a hunk touches,
+    including edits inside a body (not only changed definition lines)."""
+    from graphora.impact import changed_symbols
+
+    records, unresolved = changed_symbols(store, diff)
     return BlastRadius(
-        symbols=radius.symbols,
+        symbols=[_impact_for(store, record) for record in records],
         changed_files=extract_files_from_diff(diff),
-        unresolved=radius.unresolved,
+        unresolved=unresolved,
     )
 
 
-def _impact_for(store: GraphStore, row: list) -> SymbolImpact:
-    name, kind, path, line, signature, risk_score, fix_count, last_broke_at = row
-    callers = sorted(store.callers_of(name, path))
-    callees = sorted(store.callees_of(name, path))
-    tests = sorted(store.tests_covering(name, path))
-    importers = sorted(store.importers_of_module(_module_hint(path), path))
+def members_of(store: GraphBackend, record: dict) -> list[dict]:
+    """A symbol plus, for a class, everything defined inside it (its methods)."""
+    if record["kind"] != "Class":
+        return [record]
+    prefix = record["qualname"] + "."
+    inner = [
+        s
+        for s in store.symbols_in_file(record["path"])
+        if s["qualname"].startswith(prefix) and record["line"] <= s["line"] <= record["end_line"]
+    ]
+    return [record, *inner]
+
+
+def _impact_for(store: GraphBackend, record: dict) -> SymbolImpact:
+    targets = members_of(store, record)
+    own = {t["key"] for t in targets}
+    callers: set[tuple[str, str, str]] = set()
+    tests: set[tuple[str, str, str]] = set()
+    callees: set[tuple[str, str, str]] = set()
+    for target in targets:
+        for edge in store.incoming_calls(target["key"]):
+            caller = edge["caller"]
+            if caller["key"] in own:
+                continue
+            row = (caller["qualname"], caller["path"], edge["confidence"])
+            (tests if caller["is_test"] else callers).add(row)
+        for edge in store.outgoing_calls(target["key"]):
+            callee = edge["callee"]
+            if callee["key"] not in own:
+                callees.add((callee["qualname"], callee["path"], edge["confidence"]))
     return SymbolImpact(
-        name=name,
-        kind=kind,
-        path=path,
-        line=int(line),
-        signature=signature or "",
-        risk_score=float(risk_score or 0.0),
-        fix_count=int(fix_count or 0),
-        last_broke_at=str(last_broke_at or ""),
-        callers=callers,
-        callees=callees,
-        tests=tests,
-        importers=importers,
+        name=record["qualname"],
+        kind=record["kind"],
+        path=record["path"],
+        line=int(record["line"]),
+        signature=record["signature"] or "",
+        callers=sorted(callers),
+        callees=sorted(callees),
+        tests=sorted(tests),
+        importers=store.file_importers(record["path"]),
     )
-
-
-def _module_hint(path: str) -> str:
-    stem = path.rsplit("/", 1)[-1]
-    for suffix in (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java"):
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
-    return stem

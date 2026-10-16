@@ -1,146 +1,100 @@
 # Graphora Benchmarks
 
-Token-cost and grounding benchmarks for Graphora's blast-radius context versus the
-alternatives an AI reviewer actually has. Every number below is deterministic and
-reproducible on any machine: no LLM, no network, no tokenizer dependency.
+Accuracy and context-size benchmarks for Graphora. Every number is deterministic and
+reproducible: no LLM, no network, no tokenizer dependency.
 
-Last updated: 2026-07-14. Environment: macOS, Python 3.11, FalkorDB (Docker `falkordb/falkordb:latest`).
+Last updated: 2026-10-16. Environment: macOS (arm64), Python 3.12, embedded backend, plus
+FalkorDB (`falkordb/falkordb:latest`) for the backend timing.
 
-## Summary
+## What is measured
 
-- **82 to 94% fewer prompt tokens** than a whole-repo dump on 4 pinned real OSS repos (flask, requests, click, falkordb-py), reproducible with one script.
-- **79 to 92% fewer tokens** even against the honest baseline of reading only the relevant files.
-- **$0 LLM credits to build the graph**, on every run, by construction: the index path is tree-sitter plus Cypher, nothing else.
-- The blast-radius context is not just smaller, it is *more* informative: caller counts, covering tests, and risk history are stated as explicit facts instead of left for the model to infer from raw text.
+`graphora benchmark PATH` reports, for an indexed repository:
 
-## Methodology
+1. **Definition coverage.** Python's own `ast` module lists every `def`, `async def`, and
+   `class` in the repository's `.py` files, with qualified names (`Outer.Inner.method`,
+   `func.nested`). Coverage is the share of those that exist as graph nodes with the same
+   qualified name in the same file. A missing definition is a function whose callers Graphora
+   can never report.
+2. **Call-edge certainty.** The share of `CALLS` edges tagged `EXTRACTED` (the source names the
+   target: same file, `self`, an import, a declared or constructed type), `INFERRED` (a bare call
+   whose name matches exactly one definition), and `AMBIGUOUS` (several candidates, or an unknown
+   receiver type). "Certain" below means `EXTRACTED` + `INFERRED`. Ambiguous edges are not
+   errors: they are the calls Graphora reports as "X or Y" instead of guessing.
+3. **Context size.** For a few query symbols (the most-connected non-test functions, chosen
+   deterministically; pin them with `--symbols`), the prompt tokens an AI reviewer needs under
+   three strategies, at a fixed 4 characters per token:
+   - *whole-repo dump*: every indexed file;
+   - *relevant files*: the files holding the symbols, their callers, and their tests, which is
+     what a reviewer must read to learn the same facts;
+   - *Graphora*: the blast-radius facts as text.
 
-For a set of query symbols, the benchmark compares the prompt context an AI reviewer
-would need under three strategies:
-
-| Strategy | What it represents |
-| --- | --- |
-| **Whole-repo dump** | The context-stuffing anti-pattern: paste everything and hope the model finds the signal. |
-| **Relevant files** | The honest baseline. The changed files *plus every file containing a caller or covering test*: exactly what a reviewer (human or LLM) must read to learn what the blast radius states directly. |
-| **Graphora blast radius** | Definition, callers, callees, covering tests, importers, and risk memory for the query symbols, read from the graph as compact text. |
-
-Rules that keep it fair and reproducible:
-
-- **Fixed token heuristic**: 4 characters per token, identical for every strategy. No tokenizer dependency, so runs are byte-for-byte reproducible.
-- **Deterministic symbol selection**: by default the benchmark picks the most-connected non-test functions from the graph (stable ordering: degree desc, name asc). You can pin symbols with `--symbols` for exact reproduction.
-- **Same source of truth**: all three strategies read the same indexed file set, with the same ignore rules.
-- **Zero LLM, zero network**: the benchmark never calls a model. It measures context size and grounded-fact counts only.
-- **Determinism is tested**: the suite asserts two consecutive runs produce identical results (`tests/core/test_core_benchmark.py::test_benchmark_is_deterministic`).
+Context size measures cost, not correctness; accuracy is what items 1 and 2 are for.
 
 ## Results
 
-### Public benchmark: pinned OSS repositories (reproducible by anyone)
-
-Run on real open-source repos at exact pinned commits, embedded backend
-(no server), symbols auto-picked deterministically. Two consecutive runs
-produce byte-identical reports.
+Local checkouts at the listed commits:
 
 ```bash
-python3 scripts/public_benchmark.py
+graphora index PATH --project NAME --backend embedded
+graphora benchmark PATH --project NAME --backend embedded
 ```
 
-| Repository | Commit | Files | Whole repo | Relevant files | Blast radius | Savings vs repo | vs relevant |
+| Repository | Commit | Files | Definitions found (vs `ast`) | EXTRACTED | INFERRED | AMBIGUOUS | Certain |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| flask | `36e4a824f3` | 83 | 147,390 | 124,205 | **21,534** | **85.4%** | 82.7% |
-| requests | `f361ead047` | 37 | 101,739 | 80,360 | **10,331** | **89.8%** | 87.1% |
-| click | `b67832c216` | 76 | 225,373 | 190,236 | **39,534** | **82.5%** | 79.2% |
-| falkordb-py | `971f1d124e` | 40 | 59,866 | 40,638 | **3,550** | **94.1%** | 91.3% |
+| Shiftory | `f4e1a03630` | 61 | 498/498 (100%) | 1,367 | 73 | 39 | 97% |
+| falkordb-py | `e4230e1ce7` | 42 | 390/390 (100%) | 657 | 0 | 486 | 57% |
+| GraphRAG-SDK | `93b760edd4` | 190 | 5,043/5,043 (100%) | 9,415 | 241 | 5,000 | 66% |
 
-Symbols queried: flask `get, route, register_blueprint` · requests `get, post, prepare` · click `invoke, command, echo` · falkordb-py `query, select_graph, list_indices`.
+| Repository | Whole repo | Relevant files | Graphora | Saving vs repo | vs relevant files |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Shiftory | 134,155 | 45,491 | **1,243** | 99.1% | 97.3% |
+| falkordb-py | 61,931 | 38,988 | **1,708** | 97.2% | 95.6% |
+| GraphRAG-SDK | 888,919 | 692,757 | **36,312** | 95.9% | 94.8% |
 
-### falkordb-py (real client library: 39 files, 310 functions, 943 call edges)
+### Where the ambiguity comes from
 
-```bash
-graphora index . --project falkordb-py
-graphora benchmark . --project falkordb-py --symbols query,select_graph,delete
-```
+- **falkordb-py** ships a sync and an async twin of most classes (`FalkorDB`/`asyncio.FalkorDB`,
+  `Graph`/`AsyncGraph`). Calls are resolved to the right twin when the code states the type
+  (`db = FalkorDB(...)`, an import, a parameter annotation, a declared return type such as
+  `select_graph() -> Graph`). Most remaining ambiguous calls are made on pytest fixtures, whose
+  types are injected at runtime and never written down.
+- **GraphRAG-SDK** is built around interchangeable providers (LLMs, embedders, stores) that
+  implement the same methods: a call through the base type genuinely could run any of them.
 
-| Context strategy | Prompt tokens | Relative |
-| --- | ---: | ---: |
-| Whole-repo dump | 52,432 | 100% |
-| Relevant files (changed + callers + tests) | 34,224 | 65.3% |
-| **Graphora blast radius** | **3,439** | **6.56%** |
+### Correctness spot checks (Shiftory, against the source)
 
-Savings: **93.4%** vs whole-repo dump, **90.0%** vs relevant files.
-
-Grounded facts stated explicitly in the blast-radius context: 8 caller relationships,
-4 callee relationships, 248 covering tests identified.
-
-### Graphora itself (17 files, 148 functions, 251 call edges)
-
-```bash
-graphora index . --project graphora
-graphora benchmark . --project graphora --symbols query,blast_radius,render
-```
-
-| Context strategy | Prompt tokens | Relative |
-| --- | ---: | ---: |
-| Whole-repo dump | 22,160 | 100% |
-| Relevant files (changed + callers + tests) | 16,603 | 74.9% |
-| **Graphora blast radius** | **1,237** | **5.58%** |
-
-Savings: **94.4%** vs whole-repo dump, **92.5%** vs relevant files.
-
-Grounded facts stated explicitly in the blast-radius context: 27 caller relationships,
-3 callee relationships, 28 covering tests identified.
-
-### Single-change review (the flagship scenario)
-
-A one-line diff adding a parameter to `compute_risk_score()` in this repository:
-
-| Approach | Context to the model |
-| --- | ---: |
-| Whole-repo dump | ~22,200 tokens |
-| **Graphora** (diff + blast radius) | **~197 tokens** |
-
-That 197-token context contained everything a correct review needed: the single caller
-identified by name and file, the covering test, and 3 importing files, each fact
-confidence-tagged. The review claims were *read* from the graph, not guessed.
-See [USECASES.md](./USECASES.md#use-case-1) for the full output.
-
-## Why the "relevant files" baseline matters
-
-Most published token-savings numbers compare against repo dumping, which flatters any
-tool. The fair question is: *what would it cost to learn the same facts without the graph?*
-The answer is reading every file that contains a caller or a covering test. Graphora beats
-that baseline by 90 to 92% because the graph states relationships in one line each
-("callers (3): a, b, c") that otherwise hide across thousands of lines of source.
-
-The baseline also *understates* Graphora's advantage: a file dump still leaves the model
-to infer the relationships, while the blast radius asserts them with confidence tags. And
-none of the alternatives carry risk memory at all, at any token price.
-
-## Cost economics
-
-| Cost | Graphora | Typical LLM-ingest systems |
+| Question | Graphora | Ground truth (grep/AST) |
 | --- | --- | --- |
-| Graph build | **$0** (tree-sitter + Cypher) | per-document LLM extraction |
-| Embeddings | **none** (no vector store) | per-chunk embedding calls |
-| Re-index on push | only changed files | often full re-ingest |
-| Review context | ~200 to ~3,500 tokens | 30,000+ tokens or external context services |
-| Risk memory build | **$0** (git log parsing) | not available |
+| Who calls `build_evidence`? | `analyze` + 1 test | same |
+| Who calls `analyze`? | 2 callers + 12 tests | same (14 distinct callers) |
+| Who calls `cli.main` / `worker.main`? | 2 tests / 1 test | same |
+| Call edges into the 8 functions named `main` | 14, all `EXTRACTED`, each to the right `main` | 14 call sites (before import resolution: 112 edges, 98 of them false) |
 
-## Reproducing
+### Indexing time (GraphRAG-SDK, 190 files)
+
+| Backend | 0.2.1 | 0.3.0 |
+| --- | ---: | ---: |
+| Embedded | 5.6 s | 2.3 s |
+| FalkorDB | 26.5 s | 2.5 s |
+
+The old cost was a per-symbol `splitlines()` (quadratic on large files), a linear edge scan per
+call, one JSON rewrite per file, and one Cypher round-trip per row with no indexes. Large files
+make the difference much bigger: a 6.6 MB generated parser took 74% of a 126 s index.
+
+## Public benchmark (pinned OSS repositories)
+
+`scripts/public_benchmark.py` clones flask, requests, click, and falkordb-py at pinned commits
+and prints the same accuracy and context columns for each, so anyone can reproduce them:
 
 ```bash
-# infra
-docker run -d --name graphora-falkordb -p 6379:6379 falkordb/falkordb:latest
-
-# install
-pip install graphora-kg
-
-# any repository
-graphora index /path/to/repo --project myrepo
-graphora benchmark /path/to/repo --project myrepo --output benchmark-report.md
-
-# pin symbols for exact reproduction of the tables above
-graphora benchmark . --project falkordb-py --symbols query,select_graph,delete
+python3 scripts/public_benchmark.py --output public-benchmark.md
 ```
 
-The benchmark is also covered by the test suite (5 dedicated tests, including a
-determinism assertion): `python3 -m pytest tests/core/test_core_benchmark.py -q`.
+It needs network access to clone the repositories.
+
+## Determinism
+
+The suite asserts two consecutive benchmark runs are identical
+(`tests/core/test_core_benchmark.py::test_benchmark_is_deterministic`), and that the embedded
+and FalkorDB backends produce the same blast radius
+(`tests/core/test_core_embedded.py::test_embedded_matches_falkordb_output`).
