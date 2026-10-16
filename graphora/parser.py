@@ -446,9 +446,31 @@ def _parse_with_tree_sitter(path: str, content: str, language: str) -> ParsedFil
 _BASE_NODES = {"class_heritage", "extends_clause", "superclass", "base_clause", "base_class_clause"}
 
 
+def _union_members(language: str, node: Any | None, content: bytes) -> list[str]:
+    """Members of a union type expression (Union[A, B], A | B), else []."""
+    if node is None:
+        return []
+    is_union = (
+        (language == "python" and node.type == "subscript"
+         and _node_text(node.child_by_field_name("value"), content) in {"Union", "typing.Union"})
+        or (language == "python" and node.type == "binary_operator" and "|" in _node_text(node, content))
+        or (language == "typescript" and node.type == "union_type")
+    )
+    if not is_union:
+        return []
+    names = _type_name(_node_text(node, content))
+    members = [m for m in names.split("|") if m] if names else []
+    return members if len(members) > 1 and all(m.rsplit(".", 1)[-1][:1].isupper() for m in members) else []
+
+
 def _base_classes(language: str, node: Any, content: bytes) -> list[str]:
-    """Base classes named in a class definition: Foo(Base), extends B, < B, : public B."""
+    """Base classes named in a class definition: Foo(Base), extends B, < B, : public B.
+    For a union type alias, its members (a call on it may run any of them)."""
     found: list[str] = []
+    if language == "python" and node.type == "assignment":
+        return _union_members(language, node.child_by_field_name("right"), content)
+    if language == "typescript" and node.type == "type_alias_declaration":
+        return _union_members(language, node.child_by_field_name("value"), content)
     if language == "python":
         supers = node.child_by_field_name("superclasses")
         for child in supers.named_children if supers is not None else []:
@@ -745,6 +767,8 @@ def _python_definition(node: Any, content: bytes) -> _Definition | None:
         left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
         if left is not None and right is not None and left.type == "identifier" and right.type == "lambda":
             return _named("Function", node, content, field_name="left")
+        if left is not None and left.type == "identifier" and _union_members("python", right, content):
+            return _named("Class", node, content, field_name="left")  # Backend = Union[A, B]: a type alias
     return None
 
 
@@ -803,6 +827,8 @@ def _js_definition(node: Any, content: bytes) -> _Definition | None:
         return _Definition("Class", f"anonymous_{_point_row(node.start_point) + 1}", emit=False)
     if kind in {"internal_module", "module"}:
         return _named("Namespace", node, content, emit=False)
+    if kind == "type_alias_declaration" and _union_members("typescript", node.child_by_field_name("value"), content):
+        return _named("Class", node, content)  # type AorB = A | B: a type alias
     value = node.child_by_field_name("value")
     if value is None:
         return None

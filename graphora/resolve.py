@@ -513,6 +513,7 @@ class _Resolver:
         receiver_bindings = self._bindings_for(record, caller, receiver) or (
             self._bindings_for(record, caller, parts[0]) if len(parts) > 1 else []
         )
+        bound_in_repo = False
         for local_name, module, member, _ in receiver_bindings:
             if local_name == "*":
                 continue
@@ -542,6 +543,7 @@ class _Resolver:
             found = [m for owner in owners for m in self._methods_of(owner.qualname, name, owner.path)]
             if found:
                 return found, EXTRACTED, "import"
+            bound_in_repo = True  # imported from a repo module: not a library type
             break
 
         # Receiver names a class: `Foo.create()`, `Foo::new()`.
@@ -573,7 +575,7 @@ class _Resolver:
 
         # A type name that is not defined anywhere in the repository (`String::new()`,
         # `Math.max()`, `Path.home()`): a library type, so not your code.
-        if _TYPE_LIKE.match(class_name) and not classes:
+        if _TYPE_LIKE.match(class_name) and not classes and not bound_in_repo:
             self.result.external += 1
             return [], EXTRACTED, "external"
 

@@ -434,3 +434,32 @@ def test_inherited_methods_resolve_through_base_classes():
     assert _targets(edges, "Foo.run") == {("base.py", "Base.save")}
     assert edges[("Foo.run", "base.py", "Base.save")][0] == EXTRACTED
     assert _targets(edges, "Db.run") == {("web/base.ts", "Store.save")}
+
+
+def test_type_aliases_defined_in_the_repo_are_not_external():
+    edges, _ = _resolve(
+        {
+            "stores.py": (
+                "from typing import Union\n\n"
+                "class FalkorStore:\n    def find(self, n):\n        return n\n\n"
+                "class JsonStore:\n    def find(self, n):\n        return n\n\n"
+                "Backend = Union[FalkorStore, JsonStore]\n"
+                "Either = FalkorStore | JsonStore\n"
+            ),
+            "use.py": (
+                "from stores import Backend, Either\n\n"
+                "def lookup(store: Backend):\n    return store.find('x')\n\n"
+                "def other(store: Either):\n    return store.find('y')\n"
+            ),
+            "web/types.ts": (
+                "export class A { run() { return 1; } }\nexport class B { run() { return 2; } }\n"
+                "export type AorB = A | B;\n"
+            ),
+            "web/use.ts": "import { AorB } from './types';\nexport function go(x: AorB) { return x.run(); }\n",
+        }
+    )
+    both = {("stores.py", "FalkorStore.find"), ("stores.py", "JsonStore.find")}
+    assert _targets(edges, "lookup") == both
+    assert _targets(edges, "other") == both
+    assert {edges[("lookup", p, q)][0] for p, q in both} == {AMBIGUOUS}
+    assert _targets(edges, "go") == {("web/types.ts", "A.run"), ("web/types.ts", "B.run")}
