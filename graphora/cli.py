@@ -46,9 +46,13 @@ def cmd_index(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     project = args.project or root.name
     store = open_store(project, backend=args.backend, host=args.host, port=args.port)
-    index_repository(
-        root, project=project, store=store, on_progress=progress, include_generated=args.include_generated
-    )
+    try:
+        index_repository(
+            root, project=project, store=store, on_progress=progress, include_generated=args.include_generated
+        )
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        print(f"graphora: error: {exc}", file=sys.stderr)
+        return 1
     sys.stderr.write("\n")
     print(json.dumps({"project": project, "graph": store.graph_name, "backend": store.backend, **store.stats()}, indent=2))
     return 0
