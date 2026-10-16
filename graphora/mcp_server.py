@@ -26,10 +26,29 @@ _INSTRUCTIONS = (
 )
 
 
-def build_server(project: str, host: str = "localhost", port: int = 6379, backend: str = "auto"):
-    from mcp.server.fastmcp import FastMCP
+def _new_server():
+    """Create the MCP server object on either SDK major version.
 
-    mcp = FastMCP("graphora", instructions=_INSTRUCTIONS)
+    mcp 2.x renamed FastMCP to MCPServer; mcp 1.x only has FastMCP.
+    """
+    from graphora import __version__
+
+    try:
+        from mcp.server.mcpserver import MCPServer
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP
+
+        server = FastMCP("graphora", instructions=_INSTRUCTIONS)
+        # FastMCP 1.x has no version argument; report Graphora's, not the SDK's.
+        low_level = getattr(server, "_mcp_server", None)
+        if low_level is not None and hasattr(low_level, "version"):
+            low_level.version = __version__
+        return server
+    return MCPServer("graphora", instructions=_INSTRUCTIONS, version=__version__)
+
+
+def build_server(project: str, host: str = "localhost", port: int = 6379, backend: str = "auto"):
+    mcp = _new_server()
     store = open_store(project, backend=backend, host=host, port=port)
 
     @mcp.tool()

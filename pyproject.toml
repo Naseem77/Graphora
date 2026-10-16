@@ -46,7 +46,7 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = ["litellm>=1.40"]
-mcp = ["mcp>=1.0"]
+mcp = ["mcp>=1.0,<3"]
 dev = ["pytest>=8"]
 
 [project.urls]
