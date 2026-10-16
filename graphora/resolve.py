@@ -62,6 +62,8 @@ _SELF_RECEIVERS = {
 # Languages where a bare call `f()` inside a method may call a sibling method.
 _IMPLICIT_SELF = {"java", "c", "ruby"}
 _CONSTRUCTOR_NAMES = ("__init__", "constructor", "initialize", "__construct")
+# Rules that pick candidates by name rather than by what the source names.
+_GUESSED = {"name", "receiver-unknown", "self-inherited", "class"}
 _JS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 _C_SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx")
 
@@ -216,6 +218,8 @@ class _Resolver:
                     continue
                 targets, confidence, reason = self._resolve_call(record, caller, call)
                 targets = [t for t in dict.fromkeys(targets) if t.key != caller.key]
+                if not caller.is_test and reason in _GUESSED and any(not t.is_test for t in targets):
+                    targets = [t for t in targets if not t.is_test]  # production code never calls test doubles
                 if not targets:
                     continue
                 if len(targets) > MAX_CANDIDATES:

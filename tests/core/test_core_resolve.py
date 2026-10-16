@@ -217,3 +217,18 @@ def test_file_import_edges():
         }
     )
     assert ("pkg/api.py", "pkg/core.py") in result.file_imports
+
+
+def test_production_code_does_not_resolve_to_test_doubles():
+    edges, _ = _resolve(
+        {
+            "app/provider.py": "class Provider:\n    def enrich(self):\n        return 1\n",
+            "app/run.py": "def run(p):\n    return p.enrich()\n",
+            "tests/test_run.py": "class FakeProvider:\n    def enrich(self):\n        return 0\n\ndef test_run():\n    FakeProvider().enrich()\n",
+        }
+    )
+    assert _targets(edges, "run") == {("app/provider.py", "Provider.enrich")}
+    assert _targets(edges, "test_run") == {
+        ("tests/test_run.py", "FakeProvider"),  # the construction
+        ("tests/test_run.py", "FakeProvider.enrich"),
+    }

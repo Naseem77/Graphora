@@ -26,7 +26,7 @@ def test_install_all_writes_every_target(tmp_path: Path):
     assert set(written) == unique_paths
     for rel in written:
         text = (tmp_path / rel).read_text()
-        assert "graphora blast" in text
+        assert "graphora breaks" in text
         assert "graphora review" in text
 
 

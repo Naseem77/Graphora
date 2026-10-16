@@ -143,14 +143,28 @@ def parse_code_file(path: str, content: str) -> ParsedFile:
 
 
 def extract_symbols_from_diff(diff: str) -> list[str]:
-    """Names of top-level symbols that appear on added/removed diff lines."""
+    """Names of symbols defined on added/removed diff lines.
+
+    Each line is matched only with the definition patterns of its file's
+    language (from the ---/+++ headers); C's patterns used to read Python's
+    `return len(` as a definition of `len`.
+    """
     symbols: list[str] = []
     seen: set[str] = set()
+    languages: tuple[str, ...] = REGEX_LANGUAGES
     for line in diff.splitlines():
-        if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
+        if line.startswith(("+++ ", "--- ")):
+            target = line[4:].strip()
+            if target != "/dev/null":
+                language = language_for_path(target.removeprefix("a/").removeprefix("b/"))
+                languages = ("typescript",) if language == "javascript" else (language,)
+                if language == "text":
+                    languages = REGEX_LANGUAGES
+            continue
+        if not line.startswith(("+", "-")):
             continue
         stripped = line[1:].strip()
-        for language in REGEX_LANGUAGES:
+        for language in languages:
             for _, name in _extract_symbols(language, stripped):
                 if name not in seen:
                     seen.add(name)
@@ -653,6 +667,10 @@ def _split_callee(function: Any | None, content: bytes, member: tuple[str, str, 
     return None
 
 
+# A capitalized constructor call used as a receiver; the name says its type.
+_CONSTRUCTED_RECEIVER = re.compile(r"^(?:new\s+)?((?:[A-Za-z_]\w*(?:\.|::))*[A-Z]\w*)\s*\([^()]*\)$")
+
+
 def _bare(name: str) -> tuple[str, str] | None:
     return _with_receiver(name, "")
 
@@ -664,6 +682,9 @@ def _with_receiver(name: str, receiver: str) -> tuple[str, str] | None:
     receiver = " ".join(receiver.split())
     if receiver.startswith("$"):
         receiver = receiver[1:]  # PHP $this / $obj
+    constructed = _CONSTRUCTED_RECEIVER.match(receiver)
+    if constructed:
+        receiver = constructed.group(1)  # `Db().save()` / `new Db().save()`: the receiver is a Db
     if any(ch in receiver for ch in "()[]{}\"'") or len(receiver) > 120:
         receiver = "<expr>"  # call chains, subscripts: receiver type is unknown
     return name, receiver

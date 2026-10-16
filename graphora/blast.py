@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from graphora.parser import extract_files_from_diff, extract_symbols_from_diff
+from graphora.parser import extract_files_from_diff
 from graphora.store import GraphStore
 
 
@@ -90,13 +90,15 @@ def blast_radius(store: GraphStore, symbol_names: list[str]) -> BlastRadius:
 
 
 def blast_radius_for_diff(store: GraphStore, diff: str) -> BlastRadius:
-    """Compute the blast radius for a unified diff."""
-    symbols = extract_symbols_from_diff(diff)
-    radius = blast_radius(store, symbols)
+    """Compute the blast radius for a unified diff: every symbol a hunk touches,
+    including edits inside a body (not only changed definition lines)."""
+    from graphora.impact import changed_symbols
+
+    records, unresolved = changed_symbols(store, diff)
     return BlastRadius(
-        symbols=radius.symbols,
+        symbols=[_impact_for(store, record) for record in records],
         changed_files=extract_files_from_diff(diff),
-        unresolved=radius.unresolved,
+        unresolved=unresolved,
     )
 
 

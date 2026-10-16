@@ -3,6 +3,8 @@
 Usage:
   graphora index PATH [--project NAME]
   graphora stats [--project NAME]
+  graphora breaks SYMBOL [SYMBOL...] [--depth N] [--json]
+  graphora breaks --diff FILE | --git-range RANGE [--repo PATH]
   graphora blast SYMBOL [SYMBOL...] [--project NAME] [--json]
   graphora review [--diff FILE | --git-range RANGE --repo PATH] [--project NAME] [--llm]
   graphora benchmark PATH [--project NAME] [--symbols A,B]
@@ -65,19 +67,38 @@ def cmd_blast(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_review(args: argparse.Namespace) -> int:
-    from graphora.review import review_diff
-
+def _read_diff(args: argparse.Namespace, allow_stdin: bool = True) -> str:
     if args.diff:
-        diff = Path(args.diff).read_text()
-    elif args.git_range:
+        return Path(args.diff).read_text()
+    if args.git_range:
         repo = Path(args.repo or ".").resolve()
-        diff = subprocess.run(
+        return subprocess.run(
             ["git", "--no-pager", "diff", args.git_range],
             cwd=repo, capture_output=True, text=True, check=True,
         ).stdout
+    return sys.stdin.read() if allow_stdin else ""
+
+
+def cmd_breaks(args: argparse.Namespace) -> int:
+    from graphora.impact import what_could_break, what_could_break_for_diff
+
+    store = _store(args)
+    if args.symbols:
+        result = what_could_break(store, args.symbols, depth=args.depth)
     else:
-        diff = sys.stdin.read()
+        diff = _read_diff(args)
+        if not diff.strip():
+            print("Give symbols, or a diff (--diff FILE, --git-range RANGE, or stdin).", file=sys.stderr)
+            return 1
+        result = what_could_break_for_diff(store, diff, depth=args.depth)
+    print(json.dumps(result.to_dict(), indent=2) if args.json else result.to_text())
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    from graphora.review import review_diff
+
+    diff = _read_diff(args)
     if not diff.strip():
         print("No diff provided (use --diff FILE, --git-range RANGE, or stdin).", file=sys.stderr)
         return 1
@@ -195,6 +216,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats = sub.add_parser("stats", parents=[common], help="Show graph stats")
     p_stats.set_defaults(func=cmd_stats, project_required=True)
 
+    p_breaks = sub.add_parser(
+        "breaks", parents=[common], help="What could break if you change these symbols (or this diff)"
+    )
+    p_breaks.add_argument("symbols", nargs="*", help="Names or qualified names (Class.method); omit to read a diff")
+    p_breaks.add_argument("--depth", type=int, default=2, help="Caller hops to follow (default: 2)")
+    p_breaks.add_argument("--diff", help="Path to a unified diff file")
+    p_breaks.add_argument("--git-range", help="Git range, e.g. main...HEAD")
+    p_breaks.add_argument("--repo", help="Repo path for --git-range (default: cwd)")
+    p_breaks.add_argument("--json", action="store_true")
+    p_breaks.set_defaults(func=cmd_breaks)
+
     p_blast = sub.add_parser("blast", parents=[common], help="Blast radius for symbols")
     p_blast.add_argument("symbols", nargs="+")
     p_blast.add_argument("--json", action="store_true")
@@ -246,7 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if getattr(args, "project", None) is None and args.command not in {"index", "benchmark"}:
-        if args.command == "review" and args.repo:
+        if args.command in {"review", "breaks"} and getattr(args, "repo", None):
             args.project = Path(args.repo).resolve().name
         elif args.command == "sessions":
             args.project = "agent-sessions"

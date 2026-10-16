@@ -58,7 +58,7 @@ def server(project):
 async def test_mcp_lists_all_tools(server):
     tools = await server.list_tools()
     names = {tool.name for tool in tools}
-    assert names == {"graph_stats", "blast_radius", "review_diff", "find_symbol"}
+    assert names == {"what_could_break", "what_could_break_for_diff", "graph_stats", "blast_radius", "review_diff", "find_symbol"}
 
 
 @pytest.mark.anyio
@@ -99,3 +99,15 @@ def test_mcp_reports_graphora_version(server):
 @pytest.fixture()
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_mcp_what_could_break(server):
+    text = _text(await server.call_tool("what_could_break", {"symbols": ["compute"]}))
+    assert "Will break (1)" in text and "`pipeline`" in text
+    assert "test_compute" in text
+    payload = json.loads(_text(await server.call_tool("what_could_break", {"symbols": ["compute"], "as_json": True})))
+    assert payload["will_break"][0]["name"] == "pipeline"
+    diff = "--- a/pkg/core.py\n+++ b/pkg/core.py\n@@ -2 +2 @@\n-    return x + 1\n+    return x + 2\n"
+    text = _text(await server.call_tool("what_could_break_for_diff", {"diff": diff}))
+    assert "`compute`" in text and "`pipeline`" in text

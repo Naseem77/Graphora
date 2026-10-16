@@ -2,7 +2,7 @@
 
 `graphora install-skill all` writes a small rule/skill file into each
 agent's project-level config location. The rule tells the agent to check
-the blast radius before editing a symbol and to run a grounded review
+what could break before editing a symbol and to run a grounded review
 before committing. One command, 20+ agents.
 """
 
@@ -17,31 +17,34 @@ SESSIONS_MARK_START = "<!-- graphora-sessions:start -->"
 SESSIONS_MARK_END = "<!-- graphora-sessions:end -->"
 
 SKILL_BODY = """\
-# Graphora: code graph and blast radius
+# Graphora: what could break
 
-This repository is indexed by Graphora, a deterministic code knowledge graph
-(tree-sitter + graph storage, zero LLM to build). Use it before you edit, and
-before you commit.
+This repository is indexed by Graphora, a deterministic code graph of every
+function, method, and class (tree-sitter + graph storage, zero LLM to build).
+Use it before you edit, and before you commit.
 
 ## Workflow
 
-1. **Before editing a function or class**, check who depends on it:
-   `graphora blast <symbol>` shows callers, callees, covering tests, and
-   importers, each tagged EXTRACTED, INFERRED, or AMBIGUOUS.
-2. **Before committing**, run a grounded review of your diff:
-   `git diff | graphora review` flags changed symbols that have callers but
-   no covering tests.
-3. **Keep the graph fresh** after adding or deleting files:
-   `graphora index .`
+1. **Before changing a function, method, or class**, ask what could break:
+   `graphora breaks <name>` (or `Class.method`). The answer has three parts:
+   - **Will break**: callers whose every call on the path is certain.
+   - **Might break**: a call on the path is ambiguous. Each entry lists what
+     that call could mean ("X or Y", possibly a method outside the repo).
+     Check those call sites yourself; say they are uncertain, do not guess.
+   - **Tests that reach it**: run these after the change.
+2. **Before committing**, check the whole diff:
+   `git diff | graphora breaks` (every symbol whose body changed), or
+   `git diff | graphora review` for the same facts plus missing-test warnings.
+3. **Keep the graph fresh** after editing: `graphora index .`
 
 ## Notes
 
 - Works with zero setup: without a FalkorDB server, Graphora automatically
   uses its embedded backend (`--backend embedded` to force it).
-- Prefer facts from the graph over guessing: a blast radius answer is read
-  from real structure, not inferred from text.
-- MCP alternative: `graphora serve-mcp` exposes blast_radius, review_diff,
-  find_symbol, and graph_stats as MCP tools.
+- `--depth N` follows callers of callers N hops (default 2).
+- MCP alternative: `graphora serve-mcp` exposes what_could_break,
+  what_could_break_for_diff, blast_radius, review_diff, find_symbol, and
+  graph_stats as MCP tools.
 """
 
 SESSIONS_SKILL_BODY = """\
@@ -96,7 +99,7 @@ SKILL_TARGETS: list[SkillTarget] = [
         frontmatter=(
             "---\n"
             "name: graphora\n"
-            "description: Check the Graphora code graph (blast radius, grounded review) before editing or committing code in this repository.\n"
+            "description: Check the Graphora code graph (what could break, grounded review) before editing or committing code in this repository.\n"
             "---\n\n"
         ),
     ),
@@ -106,7 +109,7 @@ SKILL_TARGETS: list[SkillTarget] = [
         "file",
         frontmatter=(
             "---\n"
-            "description: Graphora code graph workflow (blast radius, grounded review)\n"
+            "description: Graphora code graph workflow (what could break, grounded review)\n"
             "alwaysApply: true\n"
             "---\n\n"
         ),
@@ -148,7 +151,7 @@ SKILL_KINDS = {
         "body": SKILL_BODY,
         "marks": (MARK_START, MARK_END),
         "slug": "graphora",
-        "description": "Check the Graphora code graph (blast radius, grounded review) before editing or committing code in this repository.",
+        "description": "Check the Graphora code graph (what could break, grounded review) before editing or committing code in this repository.",
     },
     "sessions": {
         "body": SESSIONS_SKILL_BODY,
