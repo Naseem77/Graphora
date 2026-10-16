@@ -82,7 +82,7 @@ graphora benchmark PATH --project NAME --backend embedded
 
 ### Indexing time (GraphRAG-SDK, 190 files)
 
-| Backend | 0.2.1 | 0.3.0 |
+| Backend | 0.2.1 | 0.3.1 |
 | --- | ---: | ---: |
 | Embedded | 2.6 s | 1.7 s |
 | FalkorDB | 23.4 s | 2.5 s |
